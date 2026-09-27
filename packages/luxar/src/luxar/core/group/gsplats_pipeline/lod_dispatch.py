@@ -262,7 +262,7 @@ def add_gsplats_multi_lod_impl(
             # NaN/Infinity token the viewer's strict JSON.parse rejects. Skip
             # any key whose value is not strictly JSON-safe (do not fabricate).
             src_stats = result.substitutive_levels[0].stats
-            for key in ("reference_energy", "quality", "energy_kind"):
+            for key in ("reference_energy", "quality", "energy_kind", "median_footprint", "footprint_dims"):
                 if key in src_stats:
                     ok, safe = json_safe_value(src_stats[key])
                     if ok:
