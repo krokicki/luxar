@@ -57,7 +57,14 @@
           },
           "minItems": 3,
           "maxItems": 3,
-          "description": "Camera up vector."
+          "description": "Camera up vector (non-zero).",
+          "not": {
+            "const": [
+              0,
+              0,
+              0
+            ]
+          }
         },
         "isOrtho": {
           "type": "boolean",

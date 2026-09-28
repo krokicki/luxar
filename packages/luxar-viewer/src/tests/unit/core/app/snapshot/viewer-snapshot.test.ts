@@ -201,6 +201,11 @@ describe('restoreSnapshot', () => {
     const forward = sm.camera.getWorldDirection(new THREE.Vector3());
     const toTarget = new THREE.Vector3(9, 8, 7).sub(sm.camera.position).normalize();
     expect(forward.dot(toTarget)).toBeCloseTo(1, 6);
+    // ...and the roll: the camera's world up lies in the plane of the
+    // restored up and the view axis, on the same side as the restored up.
+    const worldUp = new THREE.Vector3(0, 1, 0).applyQuaternion(sm.camera.quaternion);
+    const restoredUp = new THREE.Vector3(0, 0, 1).projectOnPlane(forward).normalize();
+    expect(worldUp.dot(restoredUp)).toBeCloseTo(1, 6);
     expect(sm.controls.reinitialize).toHaveBeenCalledOnce();
     // The programmatic path must fire the same CONTROLS 'change' event an
     // interactive camera move produces — it wakes the render loop (per-frame

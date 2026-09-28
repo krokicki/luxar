@@ -4,6 +4,8 @@
  * fragment clear on dataset switch, and the debounced URL writer.
  */
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import type { CameraSnapshot } from '../../../core/app/snapshot/viewer-snapshot';
 import {
@@ -61,12 +63,55 @@ describe('parseViewState', () => {
     ['{"version":1,"layers":{"c0":{"colormap":3}}}', 'colormap'],
     ['{"version":1,"layers":{"c0":{"bogus":1}}}', "'c0'.bogus"],
     ['{"version":1,"camera":[]}', '"camera"'],
-    ['{"version":1,"camera":{"position":[1,2],"target":[0,0,0],"up":[0,1,0],"isOrtho":false,"near":1,"far":2}}', 'camera.position'],
-    ['{"version":1,"camera":{"position":[1,2,3],"target":[0,0,0],"up":[0,1,0],"isOrtho":"no","near":1,"far":2}}', 'camera.isOrtho'],
-    ['{"version":1,"camera":{"position":[1,2,3],"target":[0,0,0],"up":[0,1,0],"isOrtho":false,"near":1}}', 'camera.far'],
-    ['{"version":1,"camera":{"position":[1,2,3],"target":[0,0,0],"up":[0,1,0],"isOrtho":false,"near":1,"far":2,"fov":"x"}}', 'camera.fov'],
+    [
+      '{"version":1,"camera":{"position":[1,2],"target":[0,0,0],"up":[0,1,0],"isOrtho":false,"near":1,"far":2}}',
+      'camera.position',
+    ],
+    [
+      '{"version":1,"camera":{"position":[1,2,3],"target":[0,0,0],"up":[0,1,0],"isOrtho":"no","near":1,"far":2}}',
+      'camera.isOrtho',
+    ],
+    [
+      '{"version":1,"camera":{"position":[1,2,3],"target":[0,0,0],"up":[0,1,0],"isOrtho":false,"near":1}}',
+      'camera.far',
+    ],
+    [
+      '{"version":1,"camera":{"position":[1,2,3],"target":[0,0,0],"up":[0,1,0],"isOrtho":false,"near":1,"far":2,"fov":"x"}}',
+      'camera.fov',
+    ],
   ])('rejects %s', (text, fragment) => {
     expect(() => parseViewState(text)).toThrow(fragment);
+  });
+
+  it('rejects a zero up vector', () => {
+    const doc = { version: 1, camera: { ...CAMERA, up: [0, 0, 0] } };
+    expect(() => parseViewState(JSON.stringify(doc))).toThrow('camera.up');
+  });
+
+  it('enforces the camera bounds the schema publishes', () => {
+    const schema = JSON.parse(
+      readFileSync(resolve(__dirname, '../../../../schemas/view-state.v1.schema.json'), 'utf8')
+    );
+    const props = schema.properties.camera.properties as Record<string, Record<string, unknown>>;
+    const ok = (key: string, value: number): boolean => {
+      try {
+        parseViewState(JSON.stringify({ version: 1, camera: { ...CAMERA, [key]: value } }));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (const [key, prop] of Object.entries(props)) {
+      if (prop.type !== 'number') continue;
+      const { exclusiveMinimum: lo, exclusiveMaximum: hi } = prop as Record<string, number>;
+      expect(lo, `camera.${key} has no lower bound`).toBeDefined();
+      expect(ok(key, lo), `camera.${key} = exclusiveMinimum`).toBe(false);
+      expect(ok(key, lo + 1e-6), `camera.${key} > exclusiveMinimum`).toBe(true);
+      if (hi !== undefined) {
+        expect(ok(key, hi), `camera.${key} = exclusiveMaximum`).toBe(false);
+        expect(ok(key, hi - 1e-6), `camera.${key} < exclusiveMaximum`).toBe(true);
+      }
+    }
   });
 });
 
@@ -162,6 +207,44 @@ describe('startViewStateUrlSync', () => {
       listeners.forEach((l) => l());
       vi.advanceTimersByTime(300);
       expect(win.history.replaceState).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still writes at least every maxWaitMs while changes never stop (auto-rotate)', () => {
+    vi.useFakeTimers();
+    try {
+      let listener = (): void => {};
+      let frame = 0;
+      const win = {
+        location: { pathname: '/', search: '', hash: '' },
+        history: {
+          replaceState: vi.fn((_s: unknown, _t: string, url: string) => {
+            win.location.hash = url.slice(url.indexOf('#'));
+          }),
+        },
+      };
+      const stop = startViewStateUrlSync(
+        {
+          onChange: (l) => {
+            listener = l;
+            return () => {};
+          },
+          getViewState: () => ({ version: 1, camera: { ...CAMERA, position: [frame, 0, 0] } }),
+        },
+        win,
+        300,
+        1000
+      );
+      // One camera notification per 16 ms frame for 10 s.
+      for (frame = 1; frame <= 625; frame++) {
+        listener();
+        vi.advanceTimersByTime(16);
+      }
+      expect(win.history.replaceState.mock.calls.length).toBeGreaterThanOrEqual(9);
+      expect(win.history.replaceState.mock.calls.length).toBeLessThanOrEqual(11);
+      stop();
     } finally {
       vi.useRealTimers();
     }

@@ -248,7 +248,7 @@ sound gain) the address bar is updated with the camera pose and the layer fields
 that differ from the scene's authored defaults, so copying the URL shares exactly
 what you see. On load the fragment is applied after the scene is set up, so it
 overrides the authored camera; layers it names that the scene lacks are skipped.
-Switching datasets from the browser drops it. The same document can be copied,
+Switching datasets (from the browser or through the API) drops it. The same document can be copied,
 downloaded as `view-state.json`, or loaded from a file through the Layers panel
 header's right-click menu (**Copy / Download / Load view state**); its shape is
 published as `packages/luxar-viewer/schemas/view-state.v1.schema.json`.

@@ -1388,6 +1388,102 @@ describe('LuxarApp', () => {
       expect(panel.setViewStatePort).toHaveBeenCalledOnce();
       expect(panel.onChange).not.toHaveBeenCalled();
     });
+
+    describe('a #! fragment present at init', () => {
+      const FRAGMENT_CAMERA = {
+        position: [7, 8, 9],
+        target: [1, 1, 1],
+        up: [0, -1, 0],
+        isOrtho: false,
+        near: 0.1,
+        far: 100,
+      };
+      const hash = `#!${encodeURIComponent(
+        JSON.stringify({ version: 1, layers: { c0: { gamma: 2 } }, camera: FRAGMENT_CAMERA })
+      )}`;
+      const loc = window.location as unknown as { hash?: string };
+
+      beforeEach(() => {
+        loc.hash = hash;
+        // The address bar the fragment lives in: replaceState rewrites it.
+        mockReplaceState.mockImplementation((_s: unknown, _t: string, url: string) => {
+          const i = url.indexOf('#');
+          loc.hash = i < 0 ? '' : url.slice(i);
+        });
+        vi.mocked(LayersPanel.prototype.applyLayerPatches).mockReturnValue([]);
+        mockSceneManager.camera = {
+          position: { x: 0, y: 0, z: 10, set: vi.fn() },
+          up: { x: 0, y: 1, z: 0, set: vi.fn() },
+          near: 0.1,
+          far: 100,
+          updateProjectionMatrix: vi.fn(),
+          lookAt: vi.fn(),
+          updateMatrixWorld: vi.fn(),
+        };
+        mockFetch.mockResolvedValue({ ok: true });
+      });
+
+      afterEach(() => {
+        delete loc.hash;
+        mockReplaceState.mockReset();
+        sceneDimsManager.reset();
+      });
+
+      it('is applied after the load: layer patches without a reset, camera over the waypoint snap', async () => {
+        mockSceneManager.getSceneViewerConfig.mockReturnValue({
+          waypoints: [{ when: { story: 0 }, camera: { position: [0, 0, 5] } }],
+        });
+        const dimensions = ['x', 'y', 'z', 'story'].map((name, i) => ({
+          name,
+          unit: '',
+          range: [0, 3] as [number, number],
+          step: 1,
+          display: i < 3,
+        }));
+        sceneDimsManager.initFromScene({
+          userData: { sceneDimensions: { dimensions } },
+          children: [],
+          getObjectByName: () => undefined,
+        } as unknown as Parameters<typeof sceneDimsManager.initFromScene>[0]);
+        sceneDimsManager.setDimensionValue(3, 0);
+
+        await app.init({
+          canvas: mockCanvas,
+          src: 'http://example.com/data.zarr',
+          updateBrowserUrl: true,
+        });
+
+        const panel = (LayersPanel as any).mock.instances.at(-1);
+        expect(panel.applyLayerPatches).toHaveBeenCalledExactlyOnceWith({
+          version: 1,
+          layers: { c0: { gamma: 2 } },
+        });
+        expect(panel.applyLayerSettings).not.toHaveBeenCalled();
+        // The waypoint snapped first; the shared link's camera lands last.
+        const moves = mockSceneManager.camera.position.set.mock.calls;
+        expect(moves).toContainEqual([0, 0, 5]);
+        expect(moves.at(-1)).toEqual([7, 8, 9]);
+      });
+
+      it('is dropped by switchDataset, so the next scene starts from its authored state', async () => {
+        await app.init({
+          canvas: mockCanvas,
+          src: 'http://example.com/data.zarr',
+          updateBrowserUrl: true,
+        });
+        const panel = (LayersPanel as any).mock.instances.at(-1);
+        expect(panel.applyLayerPatches).toHaveBeenCalledOnce();
+        const moves = mockSceneManager.camera.position.set.mock.calls.length;
+
+        await app.switchDataset('http://example.com/other.zarr');
+
+        expect(loc.hash).toBe('');
+        expect(panel.applyLayerPatches).toHaveBeenCalledOnce();
+        expect(mockSceneManager.camera.position.set.mock.calls.slice(moves)).not.toContainEqual([
+          7, 8, 9,
+        ]);
+      });
+    });
   });
 
   describe('debug interface', () => {
@@ -1617,6 +1713,8 @@ describe('LuxarApp', () => {
         near: 0.1,
         far: 100,
         updateProjectionMatrix: vi.fn(),
+        lookAt: vi.fn(),
+        updateMatrixWorld: vi.fn(),
       };
       mockSceneManager.getSceneViewerConfig.mockReturnValue({
         waypoints: [
@@ -1693,6 +1791,8 @@ describe('LuxarApp', () => {
         near: 0.1,
         far: 100,
         updateProjectionMatrix: vi.fn(),
+        lookAt: vi.fn(),
+        updateMatrixWorld: vi.fn(),
       };
       const dimensions = ['x', 'y', 'z', 'story'].map((name, index) => ({
         name,

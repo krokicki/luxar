@@ -4822,12 +4822,92 @@ describe('LayersPanel layer-settings document (getLayerSettings / applyLayerSett
       document.querySelectorAll('.luxar-context-menu [role="menuitem"]')
     ).map((el) => el.textContent?.trim());
     expect(labels).toEqual(
-      expect.arrayContaining([
-        'Copy view state',
-        'Download view state…',
-        'Load view state…',
-      ])
+      expect.arrayContaining(['Copy view state', 'Download view state…', 'Load view state…'])
     );
     panel.dispose();
+  });
+
+  describe('Load view state…', () => {
+    /** Pick "Load view state…" and hand its file input a file holding `text`. */
+    async function loadFile(text: string): Promise<void> {
+      let input: HTMLInputElement | undefined;
+      const click = vi.spyOn(HTMLInputElement.prototype, 'click').mockImplementation(function (
+        this: HTMLInputElement
+      ) {
+        input = this;
+      });
+      try {
+        const closeBtn = container.querySelector<HTMLElement>('.luxar-layers-panel__close')!;
+        closeBtn.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+        Array.from(document.querySelectorAll<HTMLElement>('.luxar-context-menu [role="menuitem"]'))
+          .find((el) => el.textContent?.trim() === 'Load view state…')!
+          .click();
+      } finally {
+        click.mockRestore();
+      }
+      const file = { name: 'view-state.json', text: () => Promise.resolve(text) };
+      Object.defineProperty(input!, 'files', { value: [file] });
+      input!.dispatchEvent(new Event('change'));
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+
+    beforeEach(() => showToastMock.mockClear());
+
+    it('resets to authored, applies the file, and toasts the skipped count', async () => {
+      const panel = openPanel();
+      const authoredGamma = panel.layerState.getLayer('/cloud')!.gamma;
+      panel.setLayer('/cloud', { gamma: authoredGamma + 1 });
+
+      await loadFile(
+        JSON.stringify({
+          version: 1,
+          layers: { '/cloud': { opacity: 0.5 }, '/ghost': { gamma: 3 }, '/ghost2': {} },
+        })
+      );
+
+      const live = panel.layerState.getLayer('/cloud')!;
+      expect(live.gamma).toBe(authoredGamma);
+      expect(live.opacity).toBe(0.5);
+      expect(showToastMock).toHaveBeenCalledWith('View state loaded (2 unknown layers skipped)');
+      panel.dispose();
+    });
+
+    it('hands the whole document to the app port when bound', async () => {
+      const panel = openPanel();
+      const apply = vi.fn(() => []);
+      panel.setViewStatePort({ get: () => ({ version: 1 }), apply });
+      const doc = {
+        version: 1,
+        camera: {
+          position: [1, 2, 3],
+          target: [0, 0, 0],
+          up: [0, 1, 0],
+          isOrtho: false,
+          near: 0.1,
+          far: 10,
+        },
+      };
+
+      await loadFile(JSON.stringify(doc));
+
+      expect(apply).toHaveBeenCalledExactlyOnceWith(doc);
+      expect(showToastMock).toHaveBeenCalledWith('View state loaded');
+      panel.dispose();
+    });
+
+    it('rejects an invalid file with the validator message and changes nothing', async () => {
+      const panel = openPanel();
+      const apply = vi.fn(() => []);
+      panel.setViewStatePort({ get: () => ({ version: 1 }), apply });
+
+      await loadFile('{"version":1,"layers":{"/cloud":{"opacity":-3}}}');
+
+      expect(apply).not.toHaveBeenCalled();
+      expect(showToastMock).toHaveBeenCalledWith(
+        "Layer settings: '/cloud'.opacity has an invalid value"
+      );
+      panel.dispose();
+    });
   });
 });

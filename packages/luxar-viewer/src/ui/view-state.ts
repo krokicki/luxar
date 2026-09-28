@@ -42,21 +42,37 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 }
 
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const positive = (v: unknown): v is number => finite(v) && v > 0;
 const vec3 = (v: unknown): v is [number, number, number] =>
   Array.isArray(v) && v.length === 3 && v.every(finite);
+
+/**
+ * Camera scalar fields: whether they are required, their check, and the error
+ * text. Bounds match `schemas/view-state.v1.schema.json`; the parity test
+ * probes them.
+ */
+const CAMERA_NUMBERS: [key: string, required: boolean, ok: (v: unknown) => boolean, is: string][] =
+  [
+    ['near', true, positive, 'a positive number'],
+    ['far', true, positive, 'a positive number'],
+    ['fov', false, (v) => positive(v) && v < 180, 'in (0, 180)'],
+    ['zoom', false, positive, 'a positive number'],
+  ];
 
 function validateCamera(cam: unknown): CameraSnapshot {
   if (!isRecord(cam)) throw new Error('View state: "camera" is not an object');
   for (const key of ['position', 'target', 'up'] as const) {
     if (!vec3(cam[key])) throw new Error(`View state: camera.${key} is not a 3-vector`);
   }
-  if (typeof cam.isOrtho !== 'boolean') throw new Error('View state: camera.isOrtho is not a boolean');
-  for (const key of ['near', 'far'] as const) {
-    if (!finite(cam[key])) throw new Error(`View state: camera.${key} is not a number`);
+  if ((cam.up as number[]).every((c) => c === 0)) {
+    throw new Error('View state: camera.up is the zero vector');
   }
-  for (const key of ['fov', 'zoom'] as const) {
-    if (cam[key] !== undefined && !finite(cam[key])) {
-      throw new Error(`View state: camera.${key} is not a number`);
+  if (typeof cam.isOrtho !== 'boolean') {
+    throw new Error('View state: camera.isOrtho is not a boolean');
+  }
+  for (const [key, required, ok, is] of CAMERA_NUMBERS) {
+    if ((required || cam[key] !== undefined) && !ok(cam[key])) {
+      throw new Error(`View state: camera.${key} is not ${is}`);
     }
   }
   return cam as unknown as CameraSnapshot;
@@ -136,22 +152,27 @@ export function clearViewStateHash(win: ViewStateUrlWindow): void {
 /**
  * Keep the fragment in step with the source. Writes `delayMs` after the last
  * change (a slider drag or an orbit notifies per tick, and browsers rate-limit
- * `replaceState`) and skips writes that would not change the URL. Returns a
- * stop function.
+ * `replaceState`), but at least every `maxWaitMs` while changes keep coming —
+ * auto-rotate notifies every frame, and a pure debounce would never write.
+ * Skips writes that would not change the URL. Returns a stop function.
  */
 export function startViewStateUrlSync(
   source: ViewStateSource,
   win: ViewStateUrlWindow,
-  delayMs = 300
+  delayMs = 300,
+  maxWaitMs = 1000
 ): () => void {
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let deadline = 0;
   const write = (): void => {
     timer = null;
     replaceHash(win, writeViewStateHash(source.getViewState()));
   };
   const off = source.onChange(() => {
-    if (timer !== null) clearTimeout(timer);
-    timer = setTimeout(write, delayMs);
+    const now = Date.now();
+    if (timer === null) deadline = now + maxWaitMs;
+    else clearTimeout(timer);
+    timer = setTimeout(write, Math.max(0, Math.min(delayMs, deadline - now)));
   });
   return () => {
     off();

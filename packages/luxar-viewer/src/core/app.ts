@@ -11,6 +11,7 @@ import {
 import { LAYER_SETTINGS_VERSION, type LayerSettingsDoc } from '../ui/layers/layer-settings';
 import {
   VIEW_STATE_VERSION,
+  clearViewStateHash,
   readViewStateHash,
   startViewStateUrlSync,
   type ViewStateDoc,
@@ -1220,6 +1221,10 @@ export class LuxarApp {
     }
     // A flight aimed at the outgoing scene has nothing to land on.
     this.cameraFlight?.cancel();
+    // Nor does its #! view state: layer edits and the camera belong to the
+    // scene they were made in, and loadDataset reads the fragment. Every
+    // switch (dataset browser, RPC, embedder) routes through here.
+    if (this.viewStateWindow) clearViewStateHash(this.viewStateWindow);
     this.options.src = src;
     // Re-title the tab for the incoming scene BEFORE the load. Neither of the
     // two things that could be naming it survives a switch: `?title=` names

@@ -40,7 +40,7 @@ import { LayerControls } from './layer-controls';
 import { ALWAYS_GLOBAL_KEYS } from '../help-overlay/type-to-filter';
 import { SceneLoaderManager } from '../../data/scene-loader-manager';
 import { LAYER_SETTINGS_VERSION, diffLayerSettings, type LayerSettingsDoc } from './layer-settings';
-import { parseViewState, type ViewStateDoc } from '../view-state';
+import { VIEW_STATE_VERSION, parseViewState, type ViewStateDoc } from '../view-state';
 import { downloadBlob } from '../recording-panel/screenshot-exporter';
 
 /**
@@ -656,7 +656,9 @@ export class LayersPanel {
   private viewState(): ViewStateDoc {
     if (this.viewStatePort) return this.viewStatePort.get();
     const { layers } = this.getLayerSettings();
-    return Object.keys(layers).length > 0 ? { version: 1, layers } : { version: 1 };
+    return Object.keys(layers).length > 0
+      ? { version: VIEW_STATE_VERSION, layers }
+      : { version: VIEW_STATE_VERSION };
   }
 
   /** Pretty JSON of {@link viewState}, the form users copy or download. */
@@ -714,11 +716,10 @@ export class LayersPanel {
    * The user's changes as a {@link LayerSettingsDoc}: only the fields that
    * differ from the authored scene, so an untouched scene encodes to nothing.
    * The authored baseline is rebuilt from the scene graph on every call — the
-   * same scratch-manager idiom `resetLayer` uses.
+   * same scratch-manager idiom `resetLayer` uses. That is O(scene graph), paid
+   * once per debounced URL write, not per frame.
    */
   getLayerSettings(): LayerSettingsDoc {
-    // ponytail: re-deriving the baseline is O(scene graph) per call; cache it
-    // per initFromScene if a large scene ever makes the debounced URL write slow.
     return diffLayerSettings(
       this.getLayerSummaries(),
       this.authoredLayers().map((l) => this.summarize(l))

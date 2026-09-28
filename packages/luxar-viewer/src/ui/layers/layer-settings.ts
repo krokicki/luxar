@@ -28,18 +28,26 @@ export interface LayerSettingsDoc {
 
 type FieldCheck = (value: unknown) => boolean;
 const finite: FieldCheck = (v) => typeof v === 'number' && Number.isFinite(v);
+/** Finite and in `[lo, hi]` — the schema's `minimum` / `maximum`. */
+const within =
+  (lo: number, hi = Infinity): FieldCheck =>
+  (v) =>
+    finite(v) && (v as number) >= lo && (v as number) <= hi;
+/** Finite and `> 0` — the schema's `exclusiveMinimum: 0`. */
+const positive: FieldCheck = (v) => finite(v) && (v as number) > 0;
 
 /**
  * One value check per {@link LayerPatch} field. Typed exhaustively so adding
  * a field to `LayerPatch` fails to compile until it is described here — and
  * the schema-parity test then fails until the JSON schema lists it too.
+ * Numeric bounds are the schema's; the parity test probes them.
  */
 export const LAYER_PATCH_FIELDS: Record<keyof LayerPatch, FieldCheck> = {
   visible: (v) => typeof v === 'boolean',
-  opacity: finite,
-  gamma: finite,
-  absorption: finite,
-  gain: finite,
+  opacity: within(0, 1),
+  gamma: positive,
+  absorption: within(0),
+  gain: within(0, 2),
   displayRange: (v) => Array.isArray(v) && v.length === 2 && v.every(finite),
   colormap: (v) => v === null || typeof v === 'string',
   blendingMode: (v) => (BLENDING_MODES as readonly unknown[]).includes(v),

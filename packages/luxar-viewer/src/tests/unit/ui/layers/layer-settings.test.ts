@@ -87,4 +87,27 @@ describe('JSON schema parity', () => {
     expect(schema.required).toEqual(['version']);
     expect(Object.keys(schema.properties).sort()).toEqual(['camera', 'layers', 'version']);
   });
+
+  it('enforces the numeric bounds the schema publishes', () => {
+    const props = schema.$defs.layer.properties as Record<string, Record<string, unknown>>;
+    for (const [key, prop] of Object.entries(props)) {
+      if (prop.type !== 'number') continue;
+      const check = LAYER_PATCH_FIELDS[key as keyof typeof LAYER_PATCH_FIELDS];
+      const { minimum, maximum, exclusiveMinimum } = prop as Record<string, number | undefined>;
+      if (minimum !== undefined) {
+        expect(check(minimum), `${key} = minimum`).toBe(true);
+        expect(check(minimum - 1e-9), `${key} < minimum`).toBe(false);
+      }
+      if (maximum !== undefined) {
+        expect(check(maximum), `${key} = maximum`).toBe(true);
+        expect(check(maximum + 1e-9), `${key} > maximum`).toBe(false);
+      }
+      if (exclusiveMinimum !== undefined) {
+        expect(check(exclusiveMinimum), `${key} = exclusiveMinimum`).toBe(false);
+        expect(check(exclusiveMinimum + 1e-9), `${key} > exclusiveMinimum`).toBe(true);
+      }
+      // Every numeric field is bounded below; a new one must say how.
+      expect(minimum ?? exclusiveMinimum, `${key} has no lower bound`).toBeDefined();
+    }
+  });
 });

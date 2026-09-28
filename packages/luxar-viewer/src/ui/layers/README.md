@@ -410,19 +410,19 @@ control.
 
 ## Files
 
-| File                                       | Purpose                                                                                                                          |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| `layer-state.ts`                           | `LayerStateManager`, selection logic; re-exports `computeUniforms` / `computeDisplayRange` (now in `rendering/display-range.ts`) |
-| `layers-panel.ts`                          | `LayersPanel` class — panel/list DOM + lifecycle; facade over controls + apply                                                   |
-| `layer-controls.ts`                        | `LayerControls` — controls-section DOM (sliders, selects, live LOD readout)                                                      |
-| `layer-apply.ts`                           | `LayerApplyEngine` — attr composition + material application per data-leaf                                                       |
-| `luxar-material.ts`                        | `LuxarMaterial` interface, `isColormapActive` / `applyColorAdjustments` routing                                                  |
-| `range-slider.ts`                          | `RangeSlider` — dual-thumb input component with editable / scrollable bound labels                                               |
-| `labeled-slider.ts`                        | `LabeledSlider` — single-thumb labeled input component (gamma, opacity, absorption); `linear` or `log` track                     |
-| `absorption-range.ts`                      | `absorptionSliderRange` / `formatAbsorption` — κ track bounds (fixed log span, widened onto authored κ) + readout format         |
-| `attrs-utils.ts`                           | `clampGamma`, `getBlendingState`, `liveLayerAttrs` — pure helpers (no DOM)                                                       |
-| `layer-settings.ts`                        | `LayerSettingsDoc` — only-what-changed diff and per-layer patch validation; the `layers` block of `../view-state.ts` (no DOM)     |
-| `../view-state.ts`                         | `ViewStateDoc` (layers + camera) — JSON parse/validate, `#!` hash codec, debounced URL writer (no DOM)                          |
-| `../../../schemas/view-state.v1.schema.json` | Published JSON Schema of the document                                                                                      |
-| `../layers.ts`                             | Public entrypoint — re-exports `LayersPanel`                                                                                     |
-| `../../styles/components/layers-panel.css` | Themed CSS styles                                                                                                                |
+| File                                         | Purpose                                                                                                                          |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `layer-state.ts`                             | `LayerStateManager`, selection logic; re-exports `computeUniforms` / `computeDisplayRange` (now in `rendering/display-range.ts`) |
+| `layers-panel.ts`                            | `LayersPanel` class — panel/list DOM + lifecycle; facade over controls + apply                                                   |
+| `layer-controls.ts`                          | `LayerControls` — controls-section DOM (sliders, selects, live LOD readout)                                                      |
+| `layer-apply.ts`                             | `LayerApplyEngine` — attr composition + material application per data-leaf                                                       |
+| `luxar-material.ts`                          | `LuxarMaterial` interface, `isColormapActive` / `applyColorAdjustments` routing                                                  |
+| `range-slider.ts`                            | `RangeSlider` — dual-thumb input component with editable / scrollable bound labels                                               |
+| `labeled-slider.ts`                          | `LabeledSlider` — single-thumb labeled input component (gamma, opacity, absorption); `linear` or `log` track                     |
+| `absorption-range.ts`                        | `absorptionSliderRange` / `formatAbsorption` — κ track bounds (fixed log span, widened onto authored κ) + readout format         |
+| `attrs-utils.ts`                             | `clampGamma`, `getBlendingState`, `liveLayerAttrs` — pure helpers (no DOM)                                                       |
+| `layer-settings.ts`                          | `LayerSettingsDoc` — only-what-changed diff and per-layer patch validation; the `layers` block of `../view-state.ts` (no DOM)    |
+| `../view-state.ts`                           | `ViewStateDoc` (layers + camera) — JSON parse/validate, `#!` hash codec, debounced URL writer (no DOM)                           |
+| `../../../schemas/view-state.v1.schema.json` | Published JSON Schema of the document                                                                                            |
+| `../layers.ts`                               | Public entrypoint — re-exports `LayersPanel`                                                                                     |
+| `../../styles/components/layers-panel.css`   | Themed CSS styles                                                                                                                |
