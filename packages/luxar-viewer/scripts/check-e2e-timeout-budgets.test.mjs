@@ -981,6 +981,97 @@ export async function outer(page) { await renamed(page); }`,
     ).toThrow(/re-export/);
   });
 
+  it('follows a helper imported and then exported by another helper module', () => {
+    const source = `
+      import { test } from '@playwright/test';
+      import { waitForReady } from './helpers';
+
+      test('uses the forwarded helper', async ({ page }) => {
+        await waitForReady(page);
+      });
+    `;
+    const helperSources = new Map([
+      ['./helpers', "import { wait } from './helpers/inner'; export { wait as waitForReady };"],
+      [
+        './helpers/inner',
+        'export async function wait(page) { await page.waitForTimeout(45_000); }',
+      ],
+    ]);
+
+    expect(
+      analyzeSpec(source, 'src/tests/e2e/example.spec.ts', 30_000, 60_000, helperSources)
+    ).toEqual([
+      {
+        deadlineMs: 45_000,
+        file: 'src/tests/e2e/example.spec.ts',
+        line: 5,
+        test: 'uses the forwarded helper',
+      },
+    ]);
+  });
+
+  it('fails closed when a shared-helper export names an unresolved binding', () => {
+    expect(() =>
+      analyzeSpec(
+        "import { missing } from './helpers';",
+        'src/tests/e2e/example.spec.ts',
+        30_000,
+        60_000,
+        new Map([['./helpers', 'export { missing };']])
+      )
+    ).toThrow('Shared helper module ./helpers exports missing, which is not declared or imported.');
+  });
+
+  it('ignores a clause export of a local non-helper', () => {
+    const source =
+      "import { go } from './helpers';\ntest('local constant', async ({ page }) => { await go(page); });";
+    const helpers = new Map([
+      [
+        './helpers',
+        'const LIMIT = 5_000; class Page {} export async function go(page) { await page.waitForTimeout(45_000); } export { LIMIT, Page };',
+      ],
+    ]);
+
+    expect(analyzeSpec(source, 'example.spec.ts', 30_000, 60_000, helpers)).toEqual([
+      { deadlineMs: 45_000, file: 'example.spec.ts', line: 2, test: 'local constant' },
+    ]);
+  });
+
+  it('forwards a helper beside an imported non-helper', () => {
+    const source =
+      "import { go } from './helpers';\ntest('mixed exports', async ({ page }) => { await go(page); });";
+    const helpers = new Map([
+      ['./helpers', "import { LIMIT, go } from './helpers/inner'; export { LIMIT, go };"],
+      [
+        './helpers/inner',
+        'export const LIMIT = 5_000; export async function go(page) { await page.waitForTimeout(45_000); }',
+      ],
+    ]);
+
+    expect(analyzeSpec(source, 'example.spec.ts', 30_000, 60_000, helpers)).toEqual([
+      { deadlineMs: 45_000, file: 'example.spec.ts', line: 2, test: 'mixed exports' },
+    ]);
+  });
+
+  it('publishes local clause exports before resolving a helper import cycle', () => {
+    const source =
+      "import { go } from './helpers';\ntest('cycle', async ({ page }) => { await go(page); });";
+    const helpers = new Map([
+      [
+        './helpers',
+        "import { go } from './helpers/inner'; async function w(page) { await page.waitForTimeout(45_000); } export { w, go };",
+      ],
+      [
+        './helpers/inner',
+        "import { w } from '../helpers'; export async function go(page) { await w(page); }",
+      ],
+    ]);
+
+    expect(analyzeSpec(source, 'example.spec.ts', 30_000, 60_000, helpers)).toEqual([
+      { deadlineMs: 45_000, file: 'example.spec.ts', line: 2, test: 'cycle' },
+    ]);
+  });
+
   it('ignores type-only shared-helper imports and re-exports', () => {
     const runtimeImport = `
       import { test } from '@playwright/test';

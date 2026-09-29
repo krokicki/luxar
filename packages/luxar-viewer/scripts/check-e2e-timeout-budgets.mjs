@@ -97,6 +97,45 @@ function helperDefinition(node, constants) {
   };
 }
 
+function addBindingNames(name, names) {
+  if (ts.isIdentifier(name)) {
+    names.add(name.text);
+  } else {
+    for (const element of name.elements) {
+      if (ts.isBindingElement(element)) addBindingNames(element.name, names);
+    }
+  }
+}
+
+function declaredNames(sourceFile) {
+  const names = new Set();
+  for (const statement of sourceFile.statements) {
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        addBindingNames(declaration.name, names);
+      }
+    } else if (ts.isImportDeclaration(statement)) {
+      const clause = statement.importClause;
+      if (clause?.name) names.add(clause.name.text);
+      const bindings = clause?.namedBindings;
+      if (bindings && ts.isNamespaceImport(bindings)) names.add(bindings.name.text);
+      if (bindings && ts.isNamedImports(bindings)) {
+        for (const element of bindings.elements) names.add(element.name.text);
+      }
+    } else if (
+      (ts.isFunctionDeclaration(statement) ||
+        ts.isClassDeclaration(statement) ||
+        ts.isEnumDeclaration(statement) ||
+        ts.isInterfaceDeclaration(statement) ||
+        ts.isTypeAliasDeclaration(statement)) &&
+      statement.name
+    ) {
+      names.add(statement.name.text);
+    }
+  }
+  return names;
+}
+
 function parsedSource(source, file) {
   return typeof source === 'string'
     ? ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
@@ -110,7 +149,9 @@ function exportedHelpers(source, file, cache, helperSources) {
   if (cached) return cached;
   const constants = constantDeclarations(sourceFile);
   const helpers = localHelpers(sourceFile, constants);
+  const bindings = declaredNames(sourceFile);
   const exported = new Map();
+  const deferredExports = [];
   for (const statement of sourceFile.statements) {
     if (ts.isExportDeclaration(statement)) {
       const elements =
@@ -129,6 +170,7 @@ function exportedHelpers(source, file, cache, helperSources) {
         const localName = element.propertyName?.text ?? element.name.text;
         const helper = helpers.get(localName);
         if (helper) exported.set(element.name.text, helper);
+        else deferredExports.push(element);
       }
       continue;
     }
@@ -144,10 +186,24 @@ function exportedHelpers(source, file, cache, helperSources) {
       }
     }
   }
+  // Imports forwarded through a cycle may still be absent from this early cache entry.
   cache.set(cacheKey, exported);
   try {
     for (const [name, helper] of importedHelpers(sourceFile, helperSources, cache, file)) {
       helpers.set(name, helper);
+    }
+    for (const element of deferredExports) {
+      const localName = element.propertyName?.text ?? element.name.text;
+      const helper = helpers.get(localName);
+      if (!helper) {
+        if (!bindings.has(localName)) {
+          throw new Error(
+            `Shared helper module ${file} exports ${localName}, which is not declared or imported.`
+          );
+        }
+        continue;
+      }
+      exported.set(element.name.text, helper);
     }
   } catch (error) {
     cache.delete(cacheKey);
