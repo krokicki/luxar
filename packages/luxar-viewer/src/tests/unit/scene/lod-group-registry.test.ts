@@ -19,6 +19,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
+import { failedLoadsVersion } from '../../../utils/failed-loads-version';
 
 import {
   FILL_FACTOR,
@@ -565,6 +566,41 @@ function residentModel(children: readonly LODGroupChild[], perLevel = 100): () =
 }
 
 describe('LODGroupRegistry — registration', () => {
+  it('versions pre-failed children and replacement of a failed entry', () => {
+    const reg = makeRegistry();
+    const failed = makeChild(0);
+    failed.nodePath = '/g/level';
+    failed.permanentlyFailed = true;
+    failed.failureReason = 'archive fault';
+    const before = failedLoadsVersion();
+    reg.register(makeEntry([failed], 0, '/g'));
+    expect(failedLoadsVersion()).toBeGreaterThan(before);
+    expect(reg.getFailedLazyChildPaths()).toEqual(['/g/level']);
+
+    const latched = failedLoadsVersion();
+    reg.register(makeEntry([makeChild(0)], 0, '/g'));
+    expect(failedLoadsVersion()).toBeGreaterThan(latched);
+    expect(reg.getFailedLazyChildPaths()).toEqual([]);
+  });
+
+  it('versions removal of failed entries through unregister and clear', () => {
+    const reg = makeRegistry();
+    const failed = makeChild(0);
+    failed.nodePath = '/g/level';
+    failed.permanentlyFailed = true;
+    reg.register(makeEntry([failed], 0, '/g'));
+    const beforeUnregister = failedLoadsVersion();
+    reg.unregister('/g');
+    expect(reg.getFailedLazyChildPaths()).toEqual([]);
+    expect(failedLoadsVersion()).toBe(beforeUnregister + 1);
+
+    reg.register(makeEntry([failed], 0, '/g'));
+    const beforeClear = failedLoadsVersion();
+    reg.clear();
+    expect(reg.getFailedLazyChildPaths()).toEqual([]);
+    expect(failedLoadsVersion()).toBe(beforeClear + 1);
+  });
+
   it('hides all children except the active one on register', () => {
     const reg = makeRegistry();
     const children = [makeChild(0), makeChild(0.5), makeChild(1.0)];
@@ -3296,13 +3332,18 @@ describe('LODGroupRegistry — retryLazyChildByNodePath', () => {
     child.failed = true;
     child.failedTick = 42;
     child.permanentlyFailed = true;
+    child.failureReason = 'archive fault';
     reg.register(makeEntry([makeChild(0), child], 0, '/g'));
 
+    const beforeRetry = failedLoadsVersion();
     expect(reg.retryLazyChildByNodePath('/g/child_1')).toBe(true);
     expect(ensureLoaded).toHaveBeenCalledTimes(1);
     expect(child.failed).toBe(false);
     expect(child.failedTick).toBeUndefined();
     expect(child.permanentlyFailed).toBe(false);
+    expect(child.failureReason).toBeUndefined();
+    expect(reg.getFailedLazyChildPaths()).toEqual([]);
+    expect(failedLoadsVersion()).toBe(beforeRetry + 1);
     expect(child.loading).toBe(true);
   });
 

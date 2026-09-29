@@ -64,6 +64,8 @@
  * @module scene/lod-group-registry
  */
 
+import { bumpFailedLoadsVersion } from '../utils/failed-loads-version';
+import { clearChildFailure } from '../utils/lod-child-failure';
 import * as THREE from 'three';
 
 import type { BoundingBox } from './scene-manager/clipping/bounds-math';
@@ -952,6 +954,18 @@ export interface LODGroupRegistryDeps {
   registerMaterial?: (material: THREE.Material) => void;
 }
 
+function bumpForFailedEntryReplacement(
+  previous: LODGroupEntry | undefined,
+  next: LODGroupEntry
+): void {
+  if (
+    previous?.children.some((child) => child.permanentlyFailed) ||
+    next.children.some((child) => child.permanentlyFailed)
+  ) {
+    bumpFailedLoadsVersion();
+  }
+}
+
 /**
  * Tracks loaded ``lod_group`` and ``kind=partition`` nodes in a scene;
  * evaluates per-frame to pick the active LOD and frustum-visible parts.
@@ -1040,6 +1054,7 @@ export class LODGroupRegistry {
   /** Register a newly-loaded lod_group (called by the scene loader). */
   register(entry: LODGroupEntry): void {
     const footprintDims = entry.children[0]?.footprintDims;
+    bumpForFailedEntryReplacement(this.entries.get(entry.path), entry);
     this.entries.set(entry.path, entry);
     this.caches.set(entry.path, {
       thresholds: entry.children.map((c) => c.coverageFraction),
@@ -1158,6 +1173,9 @@ export class LODGroupRegistry {
     const partition = this.partitionEntries.get(path);
     if (partition) this.restorePartitionChildren(partition);
     this.partitionResyncPending.delete(path);
+    if (this.entries.get(path)?.children.some((child) => child.permanentlyFailed)) {
+      bumpFailedLoadsVersion();
+    }
     this.entries.delete(path);
     this.caches.delete(path);
     this.partitionEntries.delete(path);
@@ -1170,6 +1188,13 @@ export class LODGroupRegistry {
   clear(): void {
     for (const partition of this.partitionEntries.values()) {
       this.restorePartitionChildren(partition);
+    }
+    if (
+      [...this.entries.values()].some((entry) =>
+        entry.children.some((child) => child.permanentlyFailed)
+      )
+    ) {
+      bumpFailedLoadsVersion();
     }
     this.entries.clear();
     this.caches.clear();
@@ -2638,8 +2663,7 @@ export class LODGroupRegistry {
       }
     }
     if (explicitRetry) {
-      child.permanentlyFailed = false;
-      child.failureReason = undefined;
+      clearChildFailure(child);
     }
     child.loading = true;
     child.ensureLoaded();
