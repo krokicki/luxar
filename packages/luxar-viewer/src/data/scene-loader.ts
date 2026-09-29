@@ -162,6 +162,8 @@ import type {
 import { clearCommittedData } from '../types/committed-data';
 import { releaseDepthSortNode } from '../rendering/depth-sort-coordinator';
 import { GPUBufferPool } from '../rendering/gpu-buffer-pool';
+import { createEmptyMeshGeometry } from '../rendering/mesh-geometry';
+import { invalidateRenderObjectFor } from './scene-loader/commit/invalidate-render-object';
 import { getGpuByteBudget } from '../rendering/gpu-byte-budget';
 import { NodeFactory } from '../rendering/node-factory';
 import { UpdateProfiler, type UpdateSession } from '../profiling/update-profiler';
@@ -2058,9 +2060,9 @@ export class SceneLoader {
   /**
    * Commit mesh geometry (synchronous).
    *
-   * Implementation lives in `scene-loader/commit/commit-mesh-geometry.ts`. Takes no
-   * GPU buffer pool: a mesh's vertex buffers are uploaded once per `displayDims`
-   * epoch and never resized, so there is nothing for the pool to recycle.
+   * Implementation lives in `scene-loader/commit/commit-mesh-geometry.ts`. Mesh
+   * buffers are not pooled, but each commit registers their resident bytes for
+   * the shared GPU budget.
    */
   private commitMeshGeometry(
     staged: StagedMeshCommit,
@@ -2069,7 +2071,11 @@ export class SceneLoader {
   ): void {
     this.lodGroupRegistry?.invalidatePartitionFootprint(staged.path);
     commitMeshGeometryHelper(
-      { rootGroup: this.rootGroup, currentVersion: this._updateVersion },
+      {
+        rootGroup: this.rootGroup,
+        currentVersion: this._updateVersion,
+        gpuBufferPool: this._gpuBufferPool,
+      },
       staged,
       session,
       loadedViewVersion
@@ -2133,17 +2139,23 @@ export class SceneLoader {
         if (mesh) releaseDepthSortNode(mesh as THREE.Mesh);
       },
       releaseLazyMesh: (path) => {
-        // Mesh demotion hygiene. NO pool release: a mesh is `pooled: false`, so
-        // unlike the three above there is no evictable buffer to hand back — the
-        // level keeps its geometry until the node is disposed, the same lifetime
-        // a non-LOD mesh already has. The depth-sort release IS shared, and is
-        // why this callback exists at all: mesh became `depthSortable` in #1347,
-        // so without it a demoted level pins its coordinator state and (up to
-        // millions of floats of) worker-side centroids for something no longer
-        // drawn — precisely the memory a ladder exists to avoid holding.
         this.clearCommittedDataStamp(path);
         const mesh = this.rootGroup?.getObjectByName(path);
-        if (mesh) releaseDepthSortNode(mesh as THREE.Mesh);
+        if (mesh) {
+          const level = mesh as THREE.Mesh;
+          // Mesh is depthSortable (#1347); demotion must drop coordinator
+          // state and worker-side centroids along with its geometry.
+          releaseDepthSortNode(level);
+          level.geometry.dispose();
+          // The geometry owns the uploaded texture's disposal hook. Forget its
+          // cached identity so the next commit creates a live texture again.
+          // Materials retain the disposed texture while this level is hidden;
+          // recommit replaces it before the level can be shown again.
+          delete level.userData.meshTexture;
+          delete level.userData.meshTextureSource;
+          level.geometry = createEmptyMeshGeometry(level.userData.attrs as MeshMetadata);
+          invalidateRenderObjectFor(level);
+        }
       },
       applyEffectiveAttrs: (node) => this.applyEffectiveAttrs(node),
       deriveNodeViewState: (path, attrs, opts) => this.deriveNodeViewState(path, attrs, opts),
