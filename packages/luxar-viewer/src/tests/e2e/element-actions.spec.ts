@@ -27,6 +27,15 @@ const LABEL = 'Linked point';
 /** The space in the label is percent-encoded — that is the point of the space. */
 const EXPECTED_URL = 'https://example.org/entry/Linked%20point';
 
+let requestedUrls: string[];
+test.beforeEach(async ({ context }) => {
+  requestedUrls = [];
+  await context.route('https://example.org/**', async (route) => {
+    requestedUrls.push(route.request().url());
+    await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html>ok' });
+  });
+});
+
 /** Viewport centre of the canvas, where the fixture's single point sits. */
 async function canvasCentre(page: Page): Promise<{ x: number; y: number }> {
   return await page.evaluate(() => {
@@ -92,8 +101,10 @@ test.describe('element actions — click to open a link', () => {
     await page.mouse.up();
     const popup = await popupPromise;
 
-    // Percent-encoded, proving the value went through encodeURIComponent
-    // rather than being interpolated raw into the template.
+    // The request and popup reach the resolved link. The element-click payload
+    // assertion below checks encoding before the browser normalizes the URL.
+    await expect.poll(() => requestedUrls).toEqual([EXPECTED_URL]);
+    await popup.waitForURL(EXPECTED_URL);
     expect(popup.url()).toBe(EXPECTED_URL);
     await popup.close();
   });
