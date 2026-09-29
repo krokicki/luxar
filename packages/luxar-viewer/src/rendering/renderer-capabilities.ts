@@ -65,8 +65,7 @@ export interface RendererCapabilities {
    *
    * Treat this as "which method-signature contract should I follow?",
    * not as "which physical GPU backend is running?". Probing the
-   * physical backend requires inspecting `renderer.backend` and is
-   * intentionally not exposed here.
+   * physical backend is captured separately in `readbackYDown`.
    */
   readonly apiSurface: 'webgl2' | 'webgpu';
   /**
@@ -76,7 +75,7 @@ export interface RendererCapabilities {
    * normalises to match real WebGPU). False when row 0 is at the
    * **bottom** (`THREE.WebGLRenderer`).
    *
-   * This is the canonical seam for every Y-orientation decision in the
+   * This is the canonical seam for shader-sampling Y orientation in the
    * viewer:
    *
    * - `createFullscreenTriangleGeometry` emits V-inverted UVs when this
@@ -86,19 +85,21 @@ export interface RendererCapabilities {
    *   bottom-up framebuffer. Either way the resulting `vUv` resolves
    *   to the canvas-relative UV at every fragment.
    * - `readPixelsCompactAsync` returns rows in canonical top-down order;
-   *   when this is `false`, the primitive inverts rows on the way out.
+   *   its readback conversion follows `readbackYDown` separately.
    *
    * Disambiguates from `apiSurface`: in practice both fields move
    * together today (every WebGPURenderer reports
    * `framebufferYDown=true`), but they answer different questions.
    * `apiSurface` is the *method-signature* contract (e.g.
    * `readRenderTargetPixelsAsync`'s shape); this field is the
-   * *framebuffer memory layout*. Future Three.js versions could
-   * conceivably introduce a `WebGPURenderer` configuration whose
+   * *sampling convention*, not readback memory layout. Future Three.js
+   * versions could conceivably introduce a `WebGPURenderer` configuration whose
    * effective Y differs, which is why we keep this as a separate
    * capability rather than aliasing `apiSurface`.
    */
   readonly framebufferYDown: boolean;
+  /** True when the running backend reads target rows and region Y from the top. */
+  readonly readbackYDown: boolean;
   /** HDR / wide-gamut / float-texture detection. */
   readonly hdr: HDRCapabilities;
   /** Maximum MSAA sample count the GPU supports (0 if unsupported). */
@@ -269,6 +270,7 @@ export function createRendererCapabilities(
     return {
       apiSurface: 'webgl2',
       framebufferYDown,
+      readbackYDown: false,
       hdr,
       maxMSAASamples,
       maxTextureSize,
@@ -318,13 +320,13 @@ export function createRendererCapabilities(
   const backend = (
     renderer as unknown as {
       backend?: {
+        isWebGPUBackend?: boolean;
         device?: { limits?: { maxTextureDimension2D?: number } };
         gl?: WebGL2RenderingContext;
       };
     }
   ).backend;
-  let maxTextureSize = 8192;
-  let maxRenderbufferSize = 8192;
+  let [maxTextureSize, maxRenderbufferSize] = [8192, 8192];
   const maxTextureDimension2D = backend?.device?.limits?.maxTextureDimension2D;
   if (typeof maxTextureDimension2D === 'number' && maxTextureDimension2D > 0) {
     maxTextureSize = maxTextureDimension2D;
@@ -348,6 +350,7 @@ export function createRendererCapabilities(
   return {
     apiSurface: 'webgpu',
     framebufferYDown,
+    readbackYDown: backend?.isWebGPUBackend === true,
     hdr,
     maxMSAASamples: 4, // WebGPU adapters guarantee at least 4× MSAA
     maxTextureSize,
