@@ -151,6 +151,14 @@ between rounds. Each arm records:
     `ScriptDuration`;
   - `rendersPerFrame`: `postProcessing.render` calls per frame. A frame that
     renders twice costs twice.
+- **`wakeRenders`, `wakeBlockMs`**: waking a stopped loop the way an input
+  handler does (`startAnimation()` after two idle frames), repeated nine times.
+  `wakeRenders` counts renders from the wake up to and including the first
+  animation frame after it (one is the minimum; a wake that also renders inside
+  the handler costs two). `wakeBlockMs` is how long the call blocked its caller:
+  input latency added to the handler. Chrome coarsens `performance.now()` to
+  100 µs here, so `wakeBlockMs` differences within 0.2 ms are never judged (a
+  0/0 or x/0 ratio would otherwise decide the verdict).
 
 A metric fails when its point ratio `median(candidate) / median(baseline)`
 exceeds `1 + floor`, and is reported as a win below `1 − floor`. `floor` is the
@@ -171,3 +179,14 @@ cost. Keep the two apart when reading a result.
 - **INCOMPLETE** (exit 3): no failure, but some views were excluded as
   nondeterministic. Fix the nondeterminism or remove the case; do not ignore it.
 - exit 2: the harness itself crashed (build failure, server port in use).
+
+A browser that dies mid-run (a GPU-process crash, or the OOM killer on a busy
+host) is relaunched, and the case it interrupted is retried once; the report
+header then says how many relaunches happened. A case that kills the browser a
+second time is reported as an error. On a laptop, run the gate under
+`caffeinate -dims` (macOS): a machine that sleeps stalls the run without
+failing it.
+
+`report.json` is written before `report.md`. To rewrite the markdown from a
+saved run without measuring again, pass
+`--from-json <dir>/report.json`.

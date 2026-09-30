@@ -276,8 +276,12 @@ export class CameraFlight {
       };
       this.attachCancelListeners();
       // Register + start: registration alone never starts a stopped loop.
+      // The `camera` phase: the step moves the camera before clipping, depth
+      // sort and LOD read it, so each flight frame renders with its own
+      // near/far rather than the previous frame's.
       this.deps.animationController.addPerFrameCallback(FLIGHT_CALLBACK_ID, () => this.step(), {
         continuous: true,
+        phase: 'camera',
       });
       this.deps.animationController.startAnimation();
     });
@@ -330,11 +334,9 @@ export class CameraFlight {
 
     camera.position.copy(vec3(pose.position));
     camera.up.copy(vec3(pose.up));
-    // Same rule as restoreCamera: under dynamic clipping the per-frame
-    // updater owns near/far. It runs BEFORE this callback each frame (it was
-    // registered at init), so writing the interpolated planes here overrode
-    // it every frame — geometry clipped away during the flight and came back
-    // on landing (reported on the stories demo).
+    // Same rule as restoreCamera: under dynamic clipping the view-phase
+    // updater owns near/far and runs after this camera-phase callback, so it
+    // sees this frame's pose.
     if (!dynamicClippingActive(sceneManager)) {
       camera.near = pose.near;
       camera.far = pose.far;
@@ -346,7 +348,10 @@ export class CameraFlight {
 
     sceneManager.controls.setTarget(target);
     sceneManager.controls.reinitialize();
-    sceneManager.controls.dispatchEvent({ type: 'change' });
+    // Also brings the world matrices up to date: this runs AFTER the frame's
+    // controls.update(), so without it the view-phase callbacks (LOD, depth
+    // sort) read the previous frame's view matrix.
+    sceneManager.commitCameraChange();
   }
 
   private finish(completed: boolean): void {

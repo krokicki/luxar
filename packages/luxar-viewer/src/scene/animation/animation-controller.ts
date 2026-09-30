@@ -1,8 +1,8 @@
 // Animation loop management for the Luxar scene player
 //
 // This module handles the core animation loop that drives 3D rendering:
-// - RequestAnimationFrame-based rendering loop for smooth 60fps
-// - Frame pacing that yields the main thread back between very slow frames
+// - The per-frame work (`tick()`): controls, per-frame callbacks, render
+// - Scheduling via RafDriver: requestAnimationFrame plus frame pacing
 // - Intelligent pause/resume system to conserve CPU/GPU when idle
 // - Performance monitoring integration for real-time metrics
 // - Proper cleanup and resource management
@@ -12,80 +12,46 @@ import { config } from '../../config';
 import { PostProcessingManager } from '../../rendering';
 import { AdaptiveDPRManager } from '../../rendering/adaptive-dpr-manager';
 import { eventBus } from '../../utils/cross-layer/event-bus';
+import { log, Modules } from '../../utils/log';
+import { RafDriver } from './raf-driver';
 
 /**
- * Fraction of a slow frame's own cost inserted as a cooldown before the
- * next frame.
+ * The phases of a frame's per-frame callbacks, run in this order after
+ * `controls.update()`:
  *
- * Deliberately a FRACTION of the cost rather than a constant, over the band
- * where the fraction is what decides the gap: from
- * `config.animation.pacing.slowFrameMs` (250 ms) up to 1 s, above which
- * `config.animation.pacing.maxCooldownMs` (250 ms) clamps it flat. Across
- * that band the gap tracks the cost — at 0.25 it is a quarter of the frame,
- * so about a fifth of wall-clock (`0.25 / 1.25`) is yielded — whereas a flat
- * gap cannot: a fixed 100 ms over-yields at the bottom of the band and
- * under-yields at the top (after a 1 s frame it is 9 % of wall-clock against
- * the fraction's 20 %).
+ * - `camera`: callbacks that MOVE the camera (a flight, the recording
+ *   turntable, the offline capture's orbit step). They run first so that
+ *   everything reading the camera this frame reads its final pose.
+ * - `view`: callbacks that DERIVE state from the camera and the scene
+ *   (dynamic clipping planes, depth sort, projected density, LOD selection,
+ *   dimension playback). The default.
+ * - `pre-render`: work that needs the frame's final view state (the
+ *   scene-captured environment).
+ * - `ui`: read-only overlays (scale bar, Layers-panel LOD status).
  *
- * Above the clamp the shipped behaviour is flat too, so the fraction wins
- * nothing there: at 5 s the clamped 250 ms is 4.8 % of wall-clock, the same
- * order as the fixed-100 ms strawman's 2 %. That is the clamp doing its job —
- * it bounds the added latency of an on-demand repaint (see `maxCooldownMs`)
- * — not a failure of the constant. The measured wedge (~1042 ms frames) sits
- * essentially at the clamp already.
- *
- * Any of those shares is only real because the cooldown is armed from the first
- * event-loop turn AFTER the frame's work rather than at the frame's start
- * (see `scheduleNextFrame()`): a timer armed at the start would already be
- * overdue by the time the thread frees, and would insert nothing.
+ * Within a phase callbacks run in registration order. Before phases existed
+ * everything ran in registration order alone, so a camera writer registered
+ * after the view callbacks (every flight is: it registers when it starts)
+ * moved the camera after clipping, depth sort and LOD had already read it,
+ * and every flight frame rendered with the previous frame's near/far.
  */
-const PACING_COOLDOWN_FRACTION = 0.25;
+export type FramePhase = 'camera' | 'view' | 'pre-render' | 'ui';
 
-/**
- * Consecutive frames whose own cost must exceed
- * `config.animation.pacing.slowFrameMs` before a cooldown is inserted.
- *
- * Two rather than one, because the two failure modes are asymmetric:
- * - The wedge pacing exists for is SUSTAINED — every frame costs ~1 s and
- *   never recovers. Requiring a second consecutive slow frame therefore only
- *   delays the first cooldown; it never withholds it.
- * - A single outlier is precisely what must NOT be paced: a GC pause, a
- *   shader compile, one synchronous chunk decode, or any foreign
- *   main-thread task charged to the loop because the measurement is a frame
- *   PERIOD. Pacing one of those inserted a cooldown that adaptive DPR then
- *   read as a 3.75 fps frame rate off a freshly cleared two-sample window
- *   (an unprobed 10 % DPR scale-down), and turned a sub-`gapResetMs`
- *   interval into an over-`gapResetMs` one, inventing a stall gap-reset
- *   that had not happened. With the streak, adaptive DPR never sees a
- *   cooldown that was not preceded by genuinely sustained slowness.
- *
- * An ALTERNATING slow/fast cadence is deliberately not paced either: the
- * fast frames are proof the main thread is already getting slots, which is
- * the only thing a cooldown buys.
- *
- * Two MEASURED slow frames means three frames in one uninterrupted run: the
- * first frame of a run has no predecessor and so measures nothing, the second
- * sets the streak to 1, and the third reaches 2 and arms the first cooldown.
- * And since `startAnimation()` clears the streak on the stopped→running edge,
- * pacing is unreachable from a cold start whenever a frame costs more than
- * `config.animation.idleTimeoutMs / 2` — the idle timer fires before a third
- * frame exists and stops the loop.
- *
- * Neither fact costs anything here. The reported wedge holds
- * `animating=true` continuously — every landing depth-sort reply calls
- * `requestRender()`, which pushes the idle timer out again — so the streak
- * accumulates and pacing engages on the third frame. And in the cold-start
- * case the loop reaching its idle pause IS the outcome pacing exists to
- * enable: the main thread is free either way, so there is nothing to fix.
- */
-const PACING_SLOW_FRAME_STREAK = 2;
+/** Phase run order. */
+const FRAME_PHASES: readonly FramePhase[] = ['camera', 'view', 'pre-render', 'ui'];
+
+/** A registered per-frame callback. */
+export interface PerFrameEntry {
+  callback: () => void;
+  continuous: boolean;
+}
 
 /**
  * AnimationController manages the main rendering loop and performance optimization
  *
  * Key Features:
  * - RequestAnimationFrame loop for browser-optimized rendering
- * - Frame pacing for pathologically slow frames (see below)
+ * - Frame pacing for pathologically slow frames (see RafDriver)
  * - Automatic pause/resume based on user interaction (saves power)
  * - HDR post-processing pipeline with bloom effects
  * - Integrated performance monitoring with stats.js
@@ -97,77 +63,35 @@ const PACING_SLOW_FRAME_STREAK = 2;
  * - Integrates Three.js controls.update() and HDR post-processing render
  * - Measures frame timing for performance analysis including post-processing
  *
- * Frame pacing (#1724):
- * Because each frame re-arms `requestAnimationFrame` immediately, a scene
- * whose frames cost ~1 s puts the main thread at a 100 % duty cycle of
- * long tasks, and NOTHING else ever gets a slot — not worker message
- * delivery, not a CDP `Runtime.callFunctionOn`. That is not a rendering
- * inconvenience but a livelock: the depth-sort worker's replies (each
- * 0.1 ms of actual work) were dispatched at ~0.5/s, every landed reply
- * staged an ordering apply that called `requestRender()`, and the loop
- * could therefore never idle — the rendering starved the very hand-off
- * that would have let it stop. Measured on
- * `performance_benchmark_example.luxar.zarr`: ~120 of 200 dispatches
- * still outstanding after 70 s, `page.evaluate` timing out at 15 s
- * throughout.
- *
- * So when a frame's own cost exceeds `config.animation.pacing.slowFrameMs`
- * for `PACING_SLOW_FRAME_STREAK` consecutive frames — sustained slowness,
- * not an isolated hiccup — the next frame is scheduled after a bounded
- * cooldown (`setTimeout` → `setTimeout` → `requestAnimationFrame`) instead
- * of back-to-back. BOTH halves of that matter:
- * - no animation-frame request is outstanding while the frame is drawn, so
- *   the compositor stops driving main frames back-to-back on its own;
- * - and a genuine cooldown follows it. The genuineness is why the cooldown
- *   is armed from a zero-delay hop rather than directly: the expensive part
- *   of a slow frame runs after the rAF callback returns but inside the same
- *   main-thread task, so a timer armed at the frame's START is always
- *   already overdue when the thread frees and inserts no gap at all. The
- *   hop runs at the first event-loop turn after that work; only then is the
- *   real cooldown armed.
- *
- * Frames are DELAYED, never skipped: each one that runs still emits exactly
- * one `frame-start` / `frame-end` pair, and records itself with
- * `adaptiveDPRManager.recordFrame()` whenever that frame does GPU work of its
- * own — the call is gated on the context-lost and render-skip predicates, as
- * it was before pacing existed (see the comment at the call site). Both are
- * on the real clock: the achieved frame rate really is lower and neither the
- * FPS readout nor the DPR control loop may be told otherwise.
+ * Scheduling vs work:
+ * The controller owns WHAT a frame does ({@link AnimationController.tick}) and
+ * when the loop may go idle; {@link RafDriver} owns WHEN frames run
+ * (requestAnimationFrame, and frame pacing for pathologically slow frames,
+ * #1724). Another driver can run the same `tick()`.
  */
 export class AnimationController {
-  /** Whether the animation loop is currently running */
-  private isAnimating = false;
-
-  /** RequestAnimationFrame ID for cancellation */
-  private animationId: number = 0;
-
   /** Timeout ID for auto-pause functionality */
   private idleTimeout: ReturnType<typeof setTimeout> | null = null;
 
   /**
-   * Timeout ID for the pending frame-pacing chain (null = none armed). Holds
-   * the zero-delay hop first, then the cooldown that hop arms.
+   * Per-frame callbacks, one insertion-ordered map per phase (keyed by ID for
+   * safe add/remove). Iterating the live maps, rather than a sorted snapshot,
+   * keeps the long-standing semantics for a callback that registers or
+   * removes another mid-frame: a removed one that has not run yet is skipped,
+   * one added to the phase being run (or a later one) runs this frame.
    */
-  private pacingTimeout: ReturnType<typeof setTimeout> | null = null;
+  private readonly callbacksByPhase: Record<FramePhase, Map<string, PerFrameEntry>> = {
+    camera: new Map(),
+    view: new Map(),
+    'pre-render': new Map(),
+    ui: new Map(),
+  };
 
-  /** Start timestamp of the previous frame (null = no frame measured yet) */
-  private lastFrameStartTime: number | null = null;
+  /** Phase each registered callback id lives in. */
+  private readonly phaseOf = new Map<string, FramePhase>();
 
-  /** Cooldown we inserted BEFORE the current frame, in ms */
-  private appliedPacingDelayMs = 0;
-
-  /** Previous frame's own cost in ms (frame period minus our own cooldown) */
-  private lastFrameCostMs = 0;
-
-  /**
-   * How many consecutive measured frames have cost more than
-   * `config.animation.pacing.slowFrameMs`. Pacing engages only at
-   * `PACING_SLOW_FRAME_STREAK`; any fast frame resets it to 0.
-   */
-  private consecutiveSlowFrames = 0;
-
-  /** Per-frame callbacks for additional updates (keyed by ID for safe add/remove) */
-  private perFrameCallbacks: Map<string, { callback: () => void; continuous: boolean }> = new Map();
+  /** Ids of per-frame callbacks whose failure has already been logged. */
+  private readonly failedCallbackIds = new Set<string>();
 
   /** Adaptive DPR manager for dynamic resolution scaling */
   private adaptiveDPRManager: AdaptiveDPRManager | null = null;
@@ -196,13 +120,6 @@ export class AnimationController {
   private shouldSkipRender: (() => boolean) | null = null;
 
   /**
-   * Predicate that returns true while frame pacing must stay off because
-   * some other owner depends on the loop's exact frame cadence. Set for
-   * the whole of a recording. See {@link setPacingSuspendPredicate}.
-   */
-  private isPacingSuspended: (() => boolean) | null = null;
-
-  /**
    * Create animation controller for rendering loop management.
    *
    * Sets up performance monitoring and prepares animation loop. Does not
@@ -225,6 +142,9 @@ export class AnimationController {
     private postProcessing: PostProcessingManager
   ) {}
 
+  /** Schedules frames; each runs {@link tick}. */
+  private readonly driver = new RafDriver(() => this.tick());
+
   /**
    * Add a per-frame callback with a unique identifier.
    *
@@ -237,7 +157,9 @@ export class AnimationController {
    * - Camera-based LOD updates
    * - Custom animations or effects
    *
-   * The callback is executed after controls.update() but before rendering.
+   * The callback is executed after controls.update() but before rendering,
+   * in its phase's turn (camera → view → pre-render → ui), and within a phase
+   * in registration order.
    *
    * @param id - Unique identifier for this callback (for later removal)
    * @param callback - Function to call each frame
@@ -246,6 +168,10 @@ export class AnimationController {
    *   auto-pausing due to idle timeout. Use for callbacks that need every frame (e.g.,
    *   dimension animation, recording). Default: false (on-demand callbacks that only run
    *   when animation is active but don't prevent pausing).
+   * @param options.phase - Which {@link FramePhase} the callback runs in.
+   *   `'camera'` for callbacks that move the camera, `'pre-render'` for work
+   *   that needs the frame's final view state, `'ui'` for read-only overlays.
+   *   Default: `'view'`.
    *
    * @example
    * ```typescript
@@ -260,8 +186,19 @@ export class AnimationController {
    * }, { continuous: true });
    * ```
    */
-  addPerFrameCallback(id: string, callback: () => void, options?: { continuous?: boolean }): void {
-    this.perFrameCallbacks.set(id, { callback, continuous: options?.continuous ?? false });
+  addPerFrameCallback(
+    id: string,
+    callback: () => void,
+    options?: { continuous?: boolean; phase?: FramePhase }
+  ): void {
+    const phase = options?.phase ?? 'view';
+    const previous = this.phaseOf.get(id);
+    // Re-registering in the SAME phase keeps the callback's position (the
+    // map's own overwrite rule); a phase change moves it to the end of its
+    // new phase.
+    if (previous !== undefined && previous !== phase) this.callbacksByPhase[previous].delete(id);
+    this.callbacksByPhase[phase].set(id, { callback, continuous: options?.continuous ?? false });
+    this.phaseOf.set(id, phase);
   }
 
   /**
@@ -277,7 +214,13 @@ export class AnimationController {
    * ```
    */
   removePerFrameCallback(id: string): boolean {
-    return this.perFrameCallbacks.delete(id);
+    // A later registration under the same id is a new callback: report its
+    // first failure too.
+    this.failedCallbackIds.delete(id);
+    const phase = this.phaseOf.get(id);
+    if (phase === undefined) return false;
+    this.phaseOf.delete(id);
+    return this.callbacksByPhase[phase].delete(id);
   }
 
   /**
@@ -287,7 +230,7 @@ export class AnimationController {
    * @returns true if callback exists
    */
   hasPerFrameCallback(id: string): boolean {
-    return this.perFrameCallbacks.has(id);
+    return this.phaseOf.has(id);
   }
 
   /**
@@ -375,71 +318,47 @@ export class AnimationController {
    * pacing.
    */
   setPacingSuspendPredicate(predicate: (() => boolean) | null): void {
-    this.isPacingSuspended = predicate;
+    this.driver.setPacingSuspendPredicate(predicate);
   }
 
   /**
-   * Main animation loop function - the heart of HDR 3D rendering
+   * One frame of work — the heart of HDR 3D rendering.
    *
-   * This function is called ~60 times per second (depending on display refresh rate)
-   * and handles the complete HDR render pipeline:
+   * Run once per frame by the driver, which has already armed the next frame
+   * (so the loop survives an exception thrown here):
    *
-   * 1. Measure the previous frame's own cost and update the slow-frame streak
-   *    (for pacing)
-   * 2. Performance measurement begins (`frame-start`)
-   * 3. Record the frame for adaptive DPR — unless the context is lost or
+   * 1. Performance measurement begins (`frame-start`)
+   * 2. Record the frame for adaptive DPR — unless the context is lost or
    *    another owner is driving the pipeline, in which case this frame does no
    *    GPU work of its own and must not be recorded
-   * 4. Schedule next frame — immediately via requestAnimationFrame, or
-   *    after a bounded cooldown once consecutive frames have been
-   *    pathologically slow (see `scheduleNextFrame()` below and the class
-   *    JSDoc)
-   * 5. Update camera controls (handle user input, damping, constraints)
-   * 6. Render through HDR post-processing pipeline (scene → bloom → tone mapping)
-   * 7. Performance measurement ends (`frame-end`)
+   * 3. Update camera controls (handle user input, damping, constraints)
+   * 4. Run the per-frame callbacks
+   * 5. Render through HDR post-processing pipeline (scene → bloom → tone mapping)
+   * 6. Performance measurement ends (`frame-end`)
    *
-   * Uses arrow function to maintain 'this' context when passed as callback.
-   * Early return prevents unnecessary work when animation is paused.
+   * Public so a driver other than the window's requestAnimationFrame can run
+   * frames. It does not check whether the loop is running: that is the
+   * driver's decision.
    */
-  private animate = (): void => {
-    // Early exit if animation is paused - prevents unnecessary GPU work
-    if (!this.isAnimating) return;
-
-    // Measure the PREVIOUS frame's own cost for the pacing decision.
-    //
-    // The measurement is the frame PERIOD minus whatever cooldown we
-    // ourselves inserted before this frame — not `end - start` of the JS
-    // body. In the wedge this fixes, the ~1 s is non-JS main-thread /
-    // compositor time: the body's own span reads ~2 ms, so a body-span
-    // measurement would never fire. Subtracting our own gap is what stops
-    // the measurement chasing its own tail — otherwise the period is
-    // cost + cooldown, which stays above the threshold forever and
-    // pacing would latch on for the rest of the session.
-    //
-    // Only a STREAK of slow frames paces (see PACING_SLOW_FRAME_STREAK): the
-    // streak is advanced here, where the cost is measured, and read by
-    // nextFramePacingDelayMs(). It stays untouched when there was nothing to
-    // measure (the first frame of a run), so the rest before a resume cannot
-    // become a streak's first link; startAnimation() clears it outright.
-    const frameStart = performance.now();
-    if (this.lastFrameStartTime !== null) {
-      this.lastFrameCostMs = Math.max(
-        0,
-        frameStart - this.lastFrameStartTime - this.appliedPacingDelayMs
-      );
-      this.consecutiveSlowFrames =
-        this.lastFrameCostMs > config.animation.pacing.slowFrameMs
-          ? this.consecutiveSlowFrames + 1
-          : 0;
-    }
-    this.lastFrameStartTime = frameStart;
-
+  tick(): void {
     // Begin frame timing measurement for performance analysis.
     // Emits on the event bus so subscribers (e.g., the
     // PerformanceMonitor UI panel) can record the start timestamp
     // without animation-controller importing UI code directly.
     eventBus.emit('frame-start', {});
+    try {
+      this.frameWork();
+    } finally {
+      // End frame timing — pair with the frame-start emit above, even when
+      // the work threw: the PerformanceMonitor UI panel subscribes to both
+      // events when visible and feeds them into stats.js for FPS /
+      // frame-time readouts, and an unpaired start corrupts its timing.
+      eventBus.emit('frame-end', {});
+    }
+  }
 
+  /** {@link tick} between its frame-start and frame-end. */
+  private frameWork(): void {
     // Record frame for adaptive DPR - tracks FPS and adjusts pixel
     // ratio. Skipped while the rendering context is lost AND while the
     // render-skip predicate is on: both kinds of frame do no GPU work of
@@ -454,28 +373,18 @@ export class AnimationController {
     // resets; and the isolated-hiccup interactions — a paced interval read off
     // a freshly cleared window as a collapsed frame rate, or a
     // just-under-`gapResetMs` frame pushed just over it — cannot arise at all,
-    // because pacing requires a STREAK (see PACING_SLOW_FRAME_STREAK) and an
-    // isolated slow frame is therefore never paced.
+    // because pacing requires a STREAK (see PACING_SLOW_FRAME_STREAK in
+    // raf-driver.ts) and an isolated slow frame is therefore never paced.
     if (this.adaptiveDPRManager && !this.isContextLost?.() && !this.shouldSkipRender?.()) {
       this.adaptiveDPRManager.recordFrame(performance.now());
     }
-
-    // Schedule the next frame - requestAnimationFrame syncs with display
-    // refresh (smooth 60fps on most displays, 120fps on high-refresh
-    // monitors), with a pacing cooldown first once consecutive frames have
-    // been pathologically slow. Scheduled BEFORE the work below on purpose:
-    // the loop then survives an exception thrown by controls, a per-frame
-    // callback, or render.
-    this.scheduleNextFrame();
 
     // Update camera controls - processes mouse/touch input and applies damping
     // This must happen before rendering to reflect user interactions
     this.controls.update();
 
     // Call all registered per-frame callbacks (e.g., dynamic clipping, dimension animation)
-    for (const entry of this.perFrameCallbacks.values()) {
-      entry.callback();
-    }
+    this.runPerFrameCallbacks();
 
     // Skip GPU rendering while the WebGL context is lost. The
     // post-processing render() would otherwise issue draw calls
@@ -488,158 +397,44 @@ export class AnimationController {
     // offline capture owns the pipeline for its whole run, so the
     // loop's render would be discarded work drawn between the
     // capture's own passes.
-    if (this.isContextLost?.() || this.shouldSkipRender?.()) {
-      eventBus.emit('frame-end', {});
-      return;
-    }
+    if (this.isContextLost?.() || this.shouldSkipRender?.()) return;
 
     // Render through HDR post-processing pipeline
     // This executes the complete chain: Scene → HDR buffer → Bloom → Tone mapping → Display
     // Includes vertex shaders, fragment shaders, HDR buffers, bloom blur, ACES tone mapping
     this.postProcessing.render();
-
-    // End frame timing — pair with the frame-start emit above. The
-    // PerformanceMonitor UI panel subscribes to both events when
-    // visible and feeds them into stats.js for FPS / frame-time
-    // readouts.
-    eventBus.emit('frame-end', {});
-  };
-
-  /**
-   * Schedule the next loop iteration, inserting a pacing cooldown once
-   * `PACING_SLOW_FRAME_STREAK` consecutive frames have been pathologically
-   * slow.
-   *
-   * With no cooldown this is byte-for-byte the historical behaviour — a
-   * bare `requestAnimationFrame(this.animate)`. With one, the rAF is armed
-   * from a chain of two `setTimeout`s so the main thread has an actual gap
-   * in which the browser can deliver a worker message, a CDP evaluate, or a
-   * network callback. Frames are only ever DELAYED here, never dropped.
-   */
-  private scheduleNextFrame(): void {
-    const cooldownMs = this.nextFramePacingDelayMs();
-
-    if (cooldownMs <= 0) {
-      this.appliedPacingDelayMs = 0;
-      this.animationId = requestAnimationFrame(this.animate);
-      return;
-    }
-
-    this.appliedPacingDelayMs = cooldownMs;
-    // A timer armed HERE would be measured from the frame's start, and the
-    // expensive part of a slow frame is browser rendering work that runs
-    // after this callback returns but inside the same main-thread task — so
-    // it would already be overdue when the thread frees and would insert no
-    // gap at all. The zero-delay hop therefore runs at the first event-loop
-    // turn AFTER that work, and only then is the real cooldown armed, so the
-    // gap is genuine.
-    //
-    // The cost measurement subtracts the NOMINAL `cooldownMs`, but the real
-    // gap is the hop's own latency plus `max(cooldownMs, when the main thread
-    // next frees)` plus the post-cooldown rAF alignment (up to one vsync,
-    // likewise not subtracted). So while pacing is engaged the next frame's
-    // cost is OVER-estimated, and the over-estimate is NOT bounded by a few
-    // milliseconds: a cooldown that comes due while a long foreign task is
-    // running inflates it by all of that foreign work. (The hop itself is
-    // armed from a rAF callback, so timer nesting restarts every frame and the
-    // browser's 4 ms nesting clamp is never reached — it contributes nothing.)
-    //
-    // Unbounded above, but always in the safe direction: a slow frame is never
-    // under-measured into the fast path. It also cannot make pacing ENGAGE
-    // spuriously — the two frames that build the streak are by definition
-    // unpaced, so neither carries a hop or a cooldown and neither is biased.
-    // Its steady-state effect is that a session sharing the main thread with
-    // sustained foreign work STAYS paced, which is the intended behaviour:
-    // yielding to that work is the whole point.
-    this.pacingTimeout = setTimeout(() => {
-      // The loop may have been stopped (idle pause, tab hide, dispose)
-      // while the cooldown was in flight — stopAnimation() clears these
-      // timeouts, but a fire that already landed must not resurrect it.
-      if (!this.isAnimating) {
-        this.pacingTimeout = null;
-        return;
-      }
-      // Re-read the suspend predicate. It was last read at the top of the
-      // frame this cooldown was armed for, and a capture can have started
-      // since — honouring the stale answer would freeze up to `maxCooldownMs`
-      // of duplicate frame into the head of a real-time recording of an
-      // already-slow scene. Drop the cooldown instead, and clear the applied
-      // delay so the next cost measurement subtracts nothing.
-      if (this.pacingSuspended()) {
-        this.pacingTimeout = null;
-        this.appliedPacingDelayMs = 0;
-        this.animationId = requestAnimationFrame(this.animate);
-        return;
-      }
-      this.pacingTimeout = setTimeout(() => {
-        this.pacingTimeout = null;
-        if (!this.isAnimating) return;
-        this.animationId = requestAnimationFrame(this.animate);
-      }, cooldownMs);
-    }, 0);
   }
 
   /**
-   * Whether pacing is currently suspended, with a throwing predicate read as
-   * "not suspended".
+   * Run every per-frame callback, each isolated from the others.
    *
-   * The try/catch is load-bearing because `scheduleNextFrame()` is the loop's
-   * ONLY re-arm point: a throw that escaped it would leave nothing armed while
-   * `isAnimating` stayed true, so `startAnimation()` early-returns forever and
-   * no `requestRender()` can recover — an unrecoverable freeze. Today's wiring
-   * cannot reach that: `RecordingPanel.isCurrentlyRecording()` is a plain flag
-   * read, and the session it reads survives the panel's own `dispose()`. This
-   * is therefore a guard on the INJECTION POINT rather than on a known
-   * thrower — whatever gets wired here next inherits it, and the trade is a
-   * paced frame during a capture against the viewer freezing for the rest of
-   * the session.
-   *
-   * Shared by the two places the answer is needed — when the cooldown is
-   * armed, and again in the hop callback before the cooldown is committed —
-   * so both read it under the same guarantee.
+   * A callback that throws is logged (once per id, not once per frame: a
+   * callback that fails every frame would otherwise flood the console at the
+   * frame rate) and the remaining callbacks and the render still run.
+   * Without the isolation one broken subsystem skipped every callback
+   * registered after it, and the render, on every frame, freezing the view
+   * while the loop kept spinning.
    */
-  private pacingSuspended(): boolean {
+  private runPerFrameCallbacks(): void {
+    for (const phase of FRAME_PHASES) {
+      for (const [id, entry] of this.callbacksByPhase[phase]) this.runCallback(id, entry);
+    }
+  }
+
+  /** Run one callback, logging its first failure (see {@link runPerFrameCallbacks}). */
+  private runCallback(id: string, entry: PerFrameEntry): void {
     try {
-      return this.isPacingSuspended?.() === true;
-    } catch {
-      // Intentionally ignored — see above.
-      return false;
+      entry.callback();
+    } catch (error) {
+      if (!this.failedCallbackIds.has(id)) {
+        this.failedCallbackIds.add(id);
+        log.error(
+          Modules.ANIMATION,
+          `Per-frame callback '${id}' threw; skipping it this frame`,
+          error
+        );
+      }
     }
-  }
-
-  /**
-   * Cooldown (ms) to insert before the next frame; 0 means "re-arm
-   * requestAnimationFrame immediately", the untouched fast path.
-   *
-   * @returns Milliseconds to wait before the next `requestAnimationFrame`
-   */
-  private nextFramePacingDelayMs(): number {
-    const pacing = config.animation.pacing;
-    if (!pacing.enabled) return 0;
-
-    // Recording owns the frame cadence for the whole capture. Read again in
-    // the hop callback, since a capture can start mid-cooldown — see
-    // `scheduleNextFrame()`.
-    if (this.pacingSuspended()) return 0;
-
-    // Every healthy frame rate lands here, and so does an ISOLATED slow
-    // frame: the streak (advanced in animate(), where the cost is measured)
-    // is the whole of the threshold test, deliberately not repeated here.
-    // `lastFrameCostMs` is a frame PERIOD, so a foreign main-thread task of
-    // that size is charged to the loop — one of them cannot pace anything,
-    // but a sustained run of them can, which is what we want (see the
-    // `slowFrameMs` comment in config/sections/animation/data.ts).
-    if (this.consecutiveSlowFrames < PACING_SLOW_FRAME_STREAK) return 0;
-
-    // A bounded fraction of the cost (see PACING_COOLDOWN_FRACTION). A
-    // cooldown that rounds to 0 falls through the `cooldownMs <= 0` fast
-    // path above, which is right: at a 0.25 fraction and a cost past the
-    // threshold that only happens if `maxCooldownMs` is itself 0, i.e.
-    // pacing has been configured off.
-    return Math.min(
-      pacing.maxCooldownMs,
-      Math.round(this.lastFrameCostMs * PACING_COOLDOWN_FRACTION)
-    );
   }
 
   /**
@@ -665,8 +460,8 @@ export class AnimationController {
 
     // Check if any continuous per-frame callbacks are active (e.g., turntable recording, dimension animation)
     // On-demand callbacks (continuous: false) like dynamic-clipping and scale-bar don't prevent idle pause
-    const hasContinuousCallbacks = [...this.perFrameCallbacks.values()].some(
-      (entry) => entry.continuous
+    const hasContinuousCallbacks = FRAME_PHASES.some((phase) =>
+      [...this.callbacksByPhase[phase].values()].some((entry) => entry.continuous)
     );
 
     return autoCamera || gesture || hasEffects || hasContinuousCallbacks;
@@ -698,7 +493,7 @@ export class AnimationController {
       // The render-skip predicate is checked here too — this is the
       // loop's OTHER render call site, and the predicate's claim is
       // "nobody but the pipeline's current owner may draw", not "the
-      // animate() path may not draw". Today it is redundant (a capture
+      // tick() path may not draw". Today it is redundant (a capture
       // disables adaptive DPR, so isActive() is already false, and the
       // idle-restore predicate is off for the whole capture), but the
       // guard that makes it redundant lives in another file: drop
@@ -738,29 +533,68 @@ export class AnimationController {
    *
    * Continuous effects (noise, auto-rotate) will keep animation running.
    *
+   * On a stopped loop this ARMS the next animation frame; it does not draw
+   * synchronously (see RafDriver.start). Use {@link renderOnce} for a frame
+   * now.
+   *
    * Uses arrow function to maintain 'this' context when used as event handler.
    */
   startAnimation = (): void => {
     // Only start if not already running - prevents duplicate loops
-    if (!this.isAnimating) {
-      this.isAnimating = true;
-      // Resuming from a rest: let the adaptive DPR manager snap back to
-      // its remembered operating DPR in one step (stopped→running edge
-      // only — this must not fire on every interaction poke).
-      this.adaptiveDPRManager?.notifyResumed?.();
-      // Forget the frame-cost measurement across the rest. The clock kept
-      // running while the loop was stopped, so the gap between the last
-      // frame before the pause and the first frame after it is idle time —
-      // a two-second rest or a tab-hide would otherwise read as a
-      // two-second frame and pace the first frame back for nothing.
-      this.lastFrameStartTime = null;
-      this.appliedPacingDelayMs = 0;
-      this.lastFrameCostMs = 0;
-      this.consecutiveSlowFrames = 0;
-      // Kick off the first frame - subsequent frames are scheduled by animate()
-      this.animate();
-    }
+    this.resumeIfStopped();
+    this.resetIdleTimer();
+  };
 
+  /**
+   * Draw a frame NOW if the loop is stopped, then keep it running as
+   * {@link startAnimation} does.
+   *
+   * `startAnimation()` only arms the next animation frame. This is for the
+   * few callers that must have a frame on the canvas before they return,
+   * such as a video capture that starts recording the canvas in the same
+   * turn. When the loop is already running it draws nothing extra: the loop
+   * paints at the next animation frame.
+   */
+  renderOnce(): void {
+    if (this.resumeIfStopped()) this.tick();
+    this.resetIdleTimer();
+  }
+
+  /**
+   * Bring the view state up to date for the current camera without drawing:
+   * `controls.update()` and every per-frame callback, as a frame would run
+   * them, but no render and no frame events.
+   *
+   * For a caller that renders its own pipeline pass outside the loop (an
+   * embedder screenshot): after a camera change the per-frame view callbacks
+   * (clipping planes, LOD selection, depth sort) have not run yet until the
+   * loop's next frame, so a pass drawn before it would use the previous
+   * pose's near/far and LOD.
+   */
+  prepareFrame(): void {
+    this.controls.update();
+    this.runPerFrameCallbacks();
+  }
+
+  /**
+   * Start the driver if it is stopped.
+   *
+   * @returns true on the stopped→running edge
+   */
+  private resumeIfStopped(): boolean {
+    if (this.driver.isRunning) return false;
+    // Resuming from a rest: let the adaptive DPR manager snap back to
+    // its remembered operating DPR in one step (stopped→running edge
+    // only — this must not fire on every interaction poke).
+    this.adaptiveDPRManager?.notifyResumed?.();
+    // Arms the first frame for the next animation frame; later frames are
+    // scheduled by the driver.
+    this.driver.start();
+    return true;
+  }
+
+  /** Restart the idle countdown (see {@link handleIdleTimeout}). */
+  private resetIdleTimer(): void {
     // Reset the idle timeout - this is called on every user interaction
     // Clear any existing timeout to prevent premature stopping
     if (this.idleTimeout !== null) {
@@ -770,14 +604,13 @@ export class AnimationController {
     // Set new timeout to check for idle - will continue if continuous effects are active
     // This is the key power-saving optimization for static scenes
     this.idleTimeout = setTimeout(this.handleIdleTimeout, config.animation.idleTimeoutMs);
-  };
+  }
 
   /**
    * Stop animation loop and clean up timers
    *
    * This method halts all rendering activity to conserve resources:
-   * - Sets flag to prevent further animate() calls
-   * - Cancels pending requestAnimationFrame to stop browser scheduling
+   * - Stops the driver (no further frames; pending rAF and pacing cancelled)
    * - Clears idle timeout to prevent memory leaks
    *
    * Called automatically after idle timeout (when no continuous effects)
@@ -785,8 +618,9 @@ export class AnimationController {
    * next user interaction or continuous effect activation.
    */
   stopAnimation = (): void => {
-    // Set flag to prevent animate() from continuing the loop
-    this.isAnimating = false;
+    // Stop the driver first: no further frame runs, and the pending
+    // requestAnimationFrame and any pacing cooldown are cancelled.
+    this.driver.stop();
 
     // The FPS window, hysteresis streak, and any in-flight probe are
     // about to go stale across the pause — clear them (session state
@@ -794,21 +628,6 @@ export class AnimationController {
     // deliberate: tests inject bare {recordFrame} manager mocks, and
     // this also runs from dispose() after the manager may be gone.
     this.adaptiveDPRManager?.notifyPaused?.();
-
-    // Cancel any pending requestAnimationFrame call
-    // This ensures no more frames are scheduled by the browser
-    if (this.animationId) {
-      cancelAnimationFrame(this.animationId);
-    }
-
-    // Cancel a pending frame-pacing cooldown. Its callback also re-checks
-    // `isAnimating`, but leaving the timer armed would keep a stopped
-    // controller holding a live timer (and, under fake timers, fire a
-    // needless wake).
-    if (this.pacingTimeout !== null) {
-      clearTimeout(this.pacingTimeout);
-      this.pacingTimeout = null;
-    }
 
     // Clear the idle timeout to prevent memory leaks
     if (this.idleTimeout !== null) {
@@ -823,7 +642,7 @@ export class AnimationController {
    * @returns true if animation loop is running, false if paused
    */
   get isActive(): boolean {
-    return this.isAnimating;
+    return this.driver.isRunning;
   }
 
   /**
@@ -840,6 +659,7 @@ export class AnimationController {
    */
   dispose(): void {
     this.stopAnimation();
-    this.perFrameCallbacks.clear();
+    for (const phase of FRAME_PHASES) this.callbacksByPhase[phase].clear();
+    this.phaseOf.clear();
   }
 }

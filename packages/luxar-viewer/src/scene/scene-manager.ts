@@ -313,8 +313,42 @@ export class SceneManager extends THREE.EventDispatcher<{
     this.camera.fov = fov;
     this.camera.updateProjectionMatrix();
     this.updateMaterialsForCurrentCamera();
-    this.dispatchEvent({ type: 'change' });
+    this.commitCameraChange();
     return true;
+  }
+
+  /**
+   * The one way to publish a camera change made outside the controls' own
+   * input handling.
+   *
+   * Runs `write` (if given), brings the camera's world matrices up to date,
+   * and makes sure exactly ONE `change` event reaches the controls manager.
+   * That is where every consumer of a camera change listens: the scene
+   * manager's relay (loop wake, picking dirty), the input handler, and the
+   * embedder's `camera-changed`. If the write already made the controls fire
+   * `change` (an orbit `update()` does when the pose moved), nothing more is
+   * dispatched; if it fired none (fly controls never do for an outside write;
+   * a fov or zoom change goes through no controls at all), one is dispatched.
+   *
+   * Before this, writers each picked their own subset: the fov and clipping
+   * setters dispatched on the scene manager only, so embedders never heard of
+   * a fov change; the framing helpers relied on `controls.update()`, which in
+   * fly mode fires nothing, so framing there neither woke an idle loop nor
+   * told the embedder; `setCameraZoom` notified nobody.
+   */
+  commitCameraChange(write?: () => void): void {
+    let fired = 0;
+    const onChange = (): void => {
+      fired++;
+    };
+    this.controls.addEventListener('change', onChange);
+    try {
+      write?.();
+    } finally {
+      this.controls.removeEventListener('change', onChange);
+    }
+    this.camera.updateMatrixWorld();
+    if (fired === 0) this.controls.dispatchEvent({ type: 'change' });
   }
 
   /** Apply an authored zoom after the camera has switched to ortho projection. */
@@ -324,6 +358,7 @@ export class SceneManager extends THREE.EventDispatcher<{
     this.camera.updateProjectionMatrix();
     this.updateMaterialsForCurrentCamera();
     this.controls.setZoomLimits(zoom / ZOOM_OUT_FACTOR, zoom * ZOOM_IN_FACTOR);
+    this.commitCameraChange();
   }
 
   /**
@@ -972,6 +1007,11 @@ export class SceneManager extends THREE.EventDispatcher<{
    * ```
    */
   public centerCameraOnScene(): void {
+    this.commitCameraChange(() => this.frameScene());
+  }
+
+  /** {@link centerCameraOnScene}'s write, published by the caller. */
+  private frameScene(): void {
     // Prefer the scene's AUTHORED camera (zarr viewer_config) when it pins an
     // explicit position: F should return to the author's intended framing, not
     // re-fit to the raw min/max bounding box. A bounds fit zooms out to include
@@ -1004,7 +1044,11 @@ export class SceneManager extends THREE.EventDispatcher<{
    * framable geometry (e.g. a partition whose parts haven't streamed yet).
    */
   public fitCameraToObject(obj: THREE.Object3D): boolean {
-    return frameCameraOnObject(obj, this.camera, this.controls, this.sceneUp) !== null;
+    let framed = false;
+    this.commitCameraChange(() => {
+      framed = frameCameraOnObject(obj, this.camera, this.controls, this.sceneUp) !== null;
+    });
+    return framed;
   }
 
   /**
@@ -1071,7 +1115,7 @@ export class SceneManager extends THREE.EventDispatcher<{
    * {@link toggleCentering} switches back to the bounding box.
    */
   public centerOnOrigin(): void {
-    centerOnOrigin(this.camera, this.controls, this.sceneUp);
+    this.commitCameraChange(() => centerOnOrigin(this.camera, this.controls, this.sceneUp));
     this.isCenteredOnBoundingBox = false;
   }
 
@@ -1142,8 +1186,15 @@ export class SceneManager extends THREE.EventDispatcher<{
    * a `ResizeObserver` already get browser-batched delivery (~once/frame).
    */
   public resizeToCanvas(): void {
+    const canvas = this.renderer.domElement;
+    const before = `${canvas.width}x${canvas.height}`;
     const { width, height } = this.measureViewport();
     this.resizer.resizeNow(width, height, this.makeResizeCtx());
+    // A real size change clears the drawing buffer and changes the aspect:
+    // wake the loop to repaint it (and mark picking dirty). The container
+    // ResizeObserver lands here, and on an idle loop nothing else would draw
+    // until the next interaction, leaving the cleared canvas blank.
+    if (`${canvas.width}x${canvas.height}` !== before) this.dispatchEvent({ type: 'change' });
   }
 
   /** Build the per-call ResizeCtx snapshot used by the resize orchestrator. */
@@ -1234,7 +1285,7 @@ export class SceneManager extends THREE.EventDispatcher<{
       return true;
     }
     const applied = adjustFOV(this.makeCameraMaterialsCtx(), deltaY);
-    if (applied) this.dispatchEvent({ type: 'change' });
+    if (applied) this.commitCameraChange();
     return applied;
   }
 

@@ -7,6 +7,8 @@
  *   node scripts/render-gate/run-gate.mjs --base origin/main --cand HEAD \
  *     [--suite exact|perf|all] [--class IDENTICAL|ULP] [--intended id,id] \
  *     [--only id,id] [--backends webgl,webgpu] [--rounds 7] [--out <dir>]
+ *   node scripts/render-gate/run-gate.mjs --from-json <dir>/report.json
+ *     (rewrite <dir>/report.md from a saved report, measuring nothing)
  *
  * Both builds are served from their own `dist/` (cached per commit SHA, see
  * `builds.mjs`) with the checkout's `datasets/` mounted at `/datasets/`, and
@@ -68,6 +70,8 @@ const opts = {
   // Prebuilt dist/ for an arm (calibration: a baseline patched by hand).
   baseDist: arg('base-dist', null),
   candDist: arg('cand-dist', null),
+  // Re-render report.md from a saved report.json, measuring nothing.
+  fromJson: arg('from-json', null),
 };
 if (!['exact', 'perf', 'all'].includes(opts.suite)) throw new Error(`bad --suite ${opts.suite}`);
 if (!['IDENTICAL', 'ULP'].includes(opts.cls)) throw new Error(`bad --class ${opts.cls}`);
@@ -143,6 +147,47 @@ function browserArgs(perf) {
   }
   if (perf) a.push('--disable-gpu-vsync', '--disable-frame-rate-limit');
   return [...a, ...opts.chromeArgs];
+}
+
+/**
+ * The suite's browser, relaunched when it has died.
+ *
+ * A browser that crashes mid-run (seen on obsidian under systemd-oomd memory
+ * pressure) used to take every later case down with it: each reported
+ * "browser has been closed" and the run's verdict became FAIL with nothing
+ * wrong in the build. `run(fn)` hands `fn` a live browser and, when `fn` throws
+ * BECAUSE the browser disconnected, relaunches and retries it once. A case that
+ * kills the browser twice is reported as the error it is.
+ */
+function browserSession(perf) {
+  let browser = null;
+  let relaunches = 0;
+  const launch = () =>
+    chromium.launch({ channel: opts.channel, headless: opts.headless, args: browserArgs(perf) });
+  const live = async () => {
+    if (!browser?.isConnected()) {
+      if (browser) {
+        relaunches++;
+        log('browser disconnected; relaunching');
+      }
+      browser = await launch();
+    }
+    return browser;
+  };
+  return {
+    async run(fn) {
+      try {
+        return await fn(await live());
+      } catch (e) {
+        if (browser?.isConnected()) throw e;
+        return fn(await live());
+      }
+    },
+    relaunches: () => relaunches,
+    async close() {
+      if (browser?.isConnected()) await browser.close();
+    },
+  };
 }
 
 function caseUrl(origin, c, backend, dsf, urlParams) {
@@ -246,7 +291,7 @@ function strip(score) {
   return rest;
 }
 
-async function runExact(browser, servers, outDir) {
+async function runExact(session, servers, outDir) {
   const results = [];
   const cases = manifest.exact.filter((c) => !opts.only || opts.only.includes(c.id));
   for (const c of cases) {
@@ -261,12 +306,14 @@ async function runExact(browser, servers, outDir) {
         // differs; an unrelated warm-up scene or --disable-gpu-program-cache
         // does not help). Each build's shaders may differ, so each build warms
         // its own programs through the same views before its measured arms.
-        await captureArm(browser, servers.base.origin, c, variant);
-        const base = await captureArm(browser, servers.base.origin, c, variant);
-        const base2 = await captureArm(browser, servers.base.origin, c, variant);
-        await captureArm(browser, servers.cand.origin, c, variant);
-        const cand = await captureArm(browser, servers.cand.origin, c, variant);
-        arms = { base, base2, cand };
+        arms = await session.run(async (browser) => {
+          await captureArm(browser, servers.base.origin, c, variant);
+          const base = await captureArm(browser, servers.base.origin, c, variant);
+          const base2 = await captureArm(browser, servers.base.origin, c, variant);
+          await captureArm(browser, servers.cand.origin, c, variant);
+          const cand = await captureArm(browser, servers.cand.origin, c, variant);
+          return { base, base2, cand };
+        });
       } catch (e) {
         results.push({
           case: c.id,
@@ -360,26 +407,44 @@ async function measureArm(browser, origin, c, backend) {
     const s0 = await script();
     const mo = await page.evaluate(ops.motion, { pose: c.pose ?? d.pose });
     const s1 = await script();
+    const wk = await page.evaluate(ops.wake, {});
     return {
       gpuMs: gpu.minMs,
       frameMs: mo.frameMs,
       frameP95Ms: mo.p95Ms,
       cpuMs: ((s1 - s0) * 1000) / Math.max(1, mo.frames),
       rendersPerFrame: mo.rendersPerFrame,
+      wakeRenders: wk.renders,
+      wakeBlockMs: wk.blockMs,
     };
   } finally {
     await context.close();
   }
 }
 
-const PERF_METRICS = ['gpuMs', 'frameMs', 'frameP95Ms', 'cpuMs', 'rendersPerFrame'];
+const PERF_METRICS = [
+  'gpuMs',
+  'frameMs',
+  'frameP95Ms',
+  'cpuMs',
+  'rendersPerFrame',
+  'wakeRenders',
+  'wakeBlockMs',
+];
+/**
+ * Absolute tolerance per metric, in the metric's own unit, for metrics that
+ * sit near the timer's resolution. Chrome coarsens `performance.now()` to
+ * 100 µs without cross-origin isolation, so a wake that blocks for ~0 ms reads
+ * 0 or 0.1 ms: two quanta are never judged.
+ */
+const PERF_ABS_TOLERANCE = { wakeBlockMs: 0.2 };
 const ROTATIONS = [
   ['base', 'cand', 'base2'],
   ['cand', 'base2', 'base'],
   ['base2', 'base', 'cand'],
 ];
 
-async function runPerf(browser, servers) {
+async function runPerf(session, servers) {
   const d = manifest.perfDefaults;
   const rounds = opts.rounds ?? d.rounds;
   const results = [];
@@ -392,7 +457,9 @@ async function runPerf(browser, servers) {
         for (let r = 0; r < rounds; r++) {
           for (const arm of ROTATIONS[r % ROTATIONS.length]) {
             const origin = arm === 'cand' ? servers.cand.origin : servers.base.origin;
-            samples[arm].push(await measureArm(browser, origin, c, backend));
+            samples[arm].push(
+              await session.run((browser) => measureArm(browser, origin, c, backend))
+            );
           }
         }
       } catch (e) {
@@ -407,7 +474,7 @@ async function runPerf(browser, servers) {
         row.metrics[m] = {
           baseMedian: median(base),
           candMedian: median(cand),
-          ...judgePerf(base, cand, noiseFloor(base, base2)),
+          ...judgePerf(base, cand, noiseFloor(base, base2), PERF_ABS_TOLERANCE[m] ?? 0),
         };
       }
       row.status = Object.values(row.metrics).some((v) => v.verdict === 'fail') ? 'fail' : 'pass';
@@ -420,6 +487,11 @@ async function runPerf(browser, servers) {
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
+
+/** A perf statistic, or '-' when it is undefined (a ratio or CI over a zero base median). */
+function fmtNum(x, digits) {
+  return typeof x === 'number' && Number.isFinite(x) ? x.toFixed(digits) : '-';
+}
 
 function fmtScore(s) {
   if (!s) return '';
@@ -436,7 +508,13 @@ function markdown(meta, exact, perf) {
     `- cand: \`${meta.cand.ref}\` (${meta.cand.sha.slice(0, 10)})`,
     `- class: ${opts.cls}; intended: ${opts.intended.join(', ') || '-'}`
   );
-  lines.push(`- host: ${meta.host}; GPU: ${meta.gpu ?? '?'}`, `- verdict: **${meta.verdict}**`, '');
+  lines.push(`- host: ${meta.host}; GPU: ${meta.gpu ?? '?'}`);
+  if (meta.browserRelaunches > 0) {
+    lines.push(
+      `- browser relaunched ${meta.browserRelaunches}x after disconnecting (cases retried once)`
+    );
+  }
+  lines.push(`- verdict: **${meta.verdict}**`, '');
   if (exact) {
     lines.push(
       '## Exactness',
@@ -466,7 +544,7 @@ function markdown(meta, exact, perf) {
       }
       for (const [m, v] of Object.entries(r.metrics)) {
         lines.push(
-          `| ${r.case} | ${r.backend} | ${m} | ${v.baseMedian.toFixed(3)} | ${v.candMedian.toFixed(3)} | ${v.ratio.toFixed(3)} | ${v.lo.toFixed(3)}–${v.hi.toFixed(3)} | ${(v.floor * 100).toFixed(1)}% | ${v.verdict} |`
+          `| ${r.case} | ${r.backend} | ${m} | ${fmtNum(v.baseMedian, 3)} | ${fmtNum(v.candMedian, 3)} | ${fmtNum(v.ratio, 3)} | ${fmtNum(v.lo, 3)}–${fmtNum(v.hi, 3)} | ${typeof v.floor === 'number' ? `${fmtNum(v.floor * 100, 1)}%` : '-'} | ${v.verdict} |`
         );
       }
     }
@@ -498,30 +576,25 @@ async function main() {
   };
   let exact = null;
   let perf = null;
+  let browserRelaunches = 0;
 
   try {
     if (opts.suite !== 'perf') {
-      const browser = await chromium.launch({
-        channel: opts.channel,
-        headless: opts.headless,
-        args: browserArgs(false),
-      });
+      const session = browserSession(false);
       try {
-        exact = await runExact(browser, servers, outDir);
+        exact = await runExact(session, servers, outDir);
       } finally {
-        await browser.close();
+        browserRelaunches += session.relaunches();
+        await session.close();
       }
     }
     if (opts.suite !== 'exact') {
-      const browser = await chromium.launch({
-        channel: opts.channel,
-        headless: opts.headless,
-        args: browserArgs(true),
-      });
+      const session = browserSession(true);
       try {
-        perf = await runPerf(browser, servers);
+        perf = await runPerf(session, servers);
       } finally {
-        await browser.close();
+        browserRelaunches += session.relaunches();
+        await session.close();
       }
     }
   } finally {
@@ -541,6 +614,7 @@ async function main() {
     cand: { ref: cand.ref, sha: cand.sha },
     host: `${process.platform}/${process.arch}`,
     gpu: [...seenGpus].join(' | '),
+    browserRelaunches,
     verdict,
     options: opts,
   };
@@ -550,7 +624,14 @@ async function main() {
   process.exit(verdict === 'PASS' ? 0 : verdict === 'FAIL' ? 1 : 3);
 }
 
-main().catch((e) => {
+function rerender(jsonPath) {
+  const { meta, exact, perf } = JSON.parse(readFileSync(jsonPath, 'utf8'));
+  const mdPath = join(dirname(resolve(jsonPath)), 'report.md');
+  writeFileSync(mdPath, markdown(meta, exact, perf));
+  log(`${meta.verdict}: ${mdPath}`);
+}
+
+(opts.fromJson ? Promise.resolve().then(() => rerender(opts.fromJson)) : main()).catch((e) => {
   console.error(e);
   process.exit(2);
 });

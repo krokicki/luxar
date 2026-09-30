@@ -11,6 +11,7 @@ import { OPEN_DATASET_BROWSER_EVENT } from '../../../core/app/interaction/canvas
 
 const jsdomDocument = document;
 const ownershipMocks = vi.hoisted(() => ({ install: vi.fn() }));
+const screenshotMocks = vi.hoisted(() => ({ capture: vi.fn() }));
 
 // NOTE: This test file mocks 9 internal modules (below). It primarily
 // verifies initialization ordering + cross-wiring; component behavior
@@ -62,6 +63,9 @@ vi.mock('../../../ui/error-overlay');
 vi.mock('../../../ui/toast');
 vi.mock('../../../ui/help-overlay');
 vi.mock('../../../ui/layers');
+vi.mock('../../../core/app/embedder/screenshot', () => ({
+  captureScreenshot: screenshotMocks.capture,
+}));
 vi.mock('../../../core/app/interaction/canvas-gesture-ownership', () => ({
   installCanvasGestureOwnership: ownershipMocks.install,
 }));
@@ -171,6 +175,7 @@ describe('LuxarApp', () => {
     // Clear all mocks
     vi.clearAllMocks();
     ownershipMocks.install.mockReset();
+    screenshotMocks.capture.mockReset();
 
     // Reset mock implementations
     mockSceneManager = {
@@ -204,10 +209,19 @@ describe('LuxarApp', () => {
       // Embedder-API delegation targets.
       resizeToCanvas: vi.fn(),
       centerCameraOnScene: vi.fn(),
+      // Like production: run the write, then publish ONE controls `change`
+      // (the fake controls fire none on their own). Reads the controls
+      // lazily because a test may swap them out.
+      commitCameraChange: vi.fn((write?: () => void) => {
+        write?.();
+        mockSceneManager.camera.updateMatrixWorld?.();
+        mockSceneManager.controls.dispatchEvent?.({ type: 'change' });
+      }),
     };
 
     mockAnimationController = {
       startAnimation: vi.fn(),
+      prepareFrame: vi.fn(),
       stopAnimation: vi.fn(),
       addPerFrameCallback: vi.fn(),
       removePerFrameCallback: vi.fn(),
@@ -653,6 +667,23 @@ describe('LuxarApp', () => {
     beforeEach(async () => {
       mockFetch.mockResolvedValue({ ok: true });
       await app.init({ canvas: mockCanvas, src: 'http://example.com/data.zarr' });
+    });
+
+    it('prepares view state before capturing an embedder screenshot', async () => {
+      const blob = new Blob(['frame'], { type: 'image/png' });
+      const opts = { format: 'png' as const };
+      screenshotMocks.capture.mockResolvedValue(blob);
+
+      await expect(app.screenshot(opts)).resolves.toBe(blob);
+      expect(mockAnimationController.prepareFrame).toHaveBeenCalledOnce();
+      expect(screenshotMocks.capture).toHaveBeenCalledWith(
+        mockSceneManager,
+        expect.anything(),
+        opts
+      );
+      expect(mockAnimationController.prepareFrame.mock.invocationCallOrder[0]).toBeLessThan(
+        screenshotMocks.capture.mock.invocationCallOrder[0]
+      );
     });
 
     it('should connect rendering controls to animation controller', () => {
@@ -1565,7 +1596,7 @@ describe('LuxarApp', () => {
       expect(mockAnimationController.addPerFrameCallback).toHaveBeenCalledWith(
         'camera-flight',
         expect.any(Function),
-        { continuous: true }
+        { continuous: true, phase: 'camera' }
       );
       expect(mockAnimationController.startAnimation).toHaveBeenCalled();
 
@@ -1594,6 +1625,7 @@ describe('LuxarApp', () => {
         near: 0.1,
         far: 100,
         updateProjectionMatrix: vi.fn(),
+        lookAt: vi.fn(),
       };
       mockSceneManager.getSceneViewerConfig.mockReturnValue({
         waypoints: [
@@ -1638,7 +1670,7 @@ describe('LuxarApp', () => {
         expect(mockAnimationController.addPerFrameCallback).toHaveBeenCalledWith(
           'camera-flight',
           expect.any(Function),
-          { continuous: true }
+          { continuous: true, phase: 'camera' }
         );
 
         const flightsStarted = (): number =>
@@ -1670,6 +1702,7 @@ describe('LuxarApp', () => {
         near: 0.1,
         far: 100,
         updateProjectionMatrix: vi.fn(),
+        lookAt: vi.fn(),
       };
       const dimensions = ['x', 'y', 'z', 'story'].map((name, index) => ({
         name,

@@ -44,10 +44,12 @@ function makeSceneManager(camera?: LuxarCamera): {
 function makeAnimationController(): {
   animationController: AnimationController;
   startAnimation: ReturnType<typeof vi.fn>;
+  renderOnce: ReturnType<typeof vi.fn>;
 } {
   const startAnimation = vi.fn();
-  const animationController = { startAnimation } as unknown as AnimationController;
-  return { animationController, startAnimation };
+  const renderOnce = vi.fn();
+  const animationController = { startAnimation, renderOnce } as unknown as AnimationController;
+  return { animationController, startAnimation, renderOnce };
 }
 
 function dispatchWheel(target: EventTarget, init: WheelEventInit): WheelEvent {
@@ -486,6 +488,7 @@ describe('WindowEventHandler', () => {
 
       // updateSize should NOT be called synchronously — it's deferred.
       expect(updateSize).not.toHaveBeenCalled();
+      expect(startAnimation).not.toHaveBeenCalled();
 
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 

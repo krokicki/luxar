@@ -88,6 +88,17 @@ export function applyView(view) {
     up: view.pose.up,
   };
   if (view.projection === 'ortho' && typeof view.pose.zoom === 'number') pose.zoom = view.pose.zoom;
+  // Orient the camera to the pose first. Before "Camera: a restored pose keeps
+  // its up vector", setCameraPose set position and up but not the orientation,
+  // and orbit's reinitialize() read the stale quaternion: a freshly swapped
+  // ortho camera (identity) or the previous pose's roll survived until a
+  // controls update happened to run, which an uncapped frame rate could lose.
+  // Such a baseline measured a different view from the candidate.
+  const cam = dbg.camera;
+  cam.position.fromArray(pose.position);
+  cam.up.fromArray(pose.up);
+  cam.lookAt(pose.target[0], pose.target[1], pose.target[2]);
+  cam.updateMatrixWorld();
   dbg.app.setCameraPose(pose);
   dbg.renderOnce();
 }
@@ -366,9 +377,16 @@ export async function motion({ frames = 180, warm = 30, degPerFrame = 1, pose })
   const phase = Math.atan2(dz, dx);
   const place = (i) => {
     const a = phase + (i * degPerFrame * Math.PI) / 180;
+    const position = [tx + radius * Math.cos(a), pose.position[1], tz + radius * Math.sin(a)];
+    // Orient first, as applyView does (serialized into the page: no shared helper).
+    const cam = dbg.camera;
+    cam.position.fromArray(position);
+    cam.up.fromArray(pose.up);
+    cam.lookAt(pose.target[0], pose.target[1], pose.target[2]);
+    cam.updateMatrixWorld();
     dbg.app.setCameraPose({
       ...dbg.app.getCameraPose(),
-      position: [tx + radius * Math.cos(a), pose.position[1], tz + radius * Math.sin(a)],
+      position,
       target: pose.target,
       up: pose.up,
     });
@@ -407,6 +425,53 @@ export async function motion({ frames = 180, warm = 30, degPerFrame = 1, pose })
     p95Ms: deltas[Math.min(deltas.length - 1, Math.floor(0.95 * deltas.length))],
     rendersPerFrame: renders / frames,
   };
+}
+
+/**
+ * The cost of WAKING a stopped loop: stop it, let two animation frames pass,
+ * then call `startAnimation()` as an input handler would, and measure
+ *
+ * - `renders`: how many times the pipeline rendered from the wake up to and
+ *   including the first animation frame after it (the frame that paints).
+ *   One is the minimum a wake needs; a wake that also renders inline inside
+ *   the handler costs two.
+ * - `blockMs`: how long the `startAnimation()` call itself blocked its
+ *   caller, i.e. the input latency a wake adds to the handler that caused it.
+ *
+ * Our own rAF is registered AFTER the wake, so the loop's armed frame (if
+ * any) runs before it in the same animation frame. Medians over `reps`.
+ */
+export async function wake({ reps = 9 }) {
+  const dbg = window.__luxarDebug;
+  const ac = dbg.animationController;
+  const pp = dbg.app.sceneManager.postProcessing;
+  const tick = () => new Promise((r) => requestAnimationFrame(() => r()));
+  const med = (a) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
+  let renders = 0;
+  const original = pp.render;
+  pp.render = function countedRender(...args) {
+    renders++;
+    return original.apply(this, args);
+  };
+  const perWake = [];
+  const blocked = [];
+  try {
+    for (let i = 0; i < reps; i++) {
+      ac.stopAnimation();
+      await tick();
+      await tick();
+      renders = 0;
+      const t0 = performance.now();
+      ac.startAnimation();
+      blocked.push(performance.now() - t0);
+      await tick();
+      perWake.push(renders);
+    }
+  } finally {
+    pp.render = original;
+    ac.startAnimation();
+  }
+  return { renders: med(perWake), blockMs: med(blocked) };
 }
 
 /**
