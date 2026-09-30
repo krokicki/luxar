@@ -1047,6 +1047,26 @@ describe('gsplat append commit — held draw until the grown ordering lands', ()
     expect(drawn(geom)).toEqual([5, 4, 3, 2, 1, 0]);
   });
 
+  it('a seed overlaid on a buffer already known to hold identity is uploaded and forgets the identity memo', () => {
+    // A pooled geometry whose ordering buffer is already identity over the
+    // whole population (its last tenant was order-independent) makes the
+    // identity write inside the seeded hold a no-op. The seed overlay must
+    // still reach the GPU, and must not leave the buffer marked as identity,
+    // or the next full identity commit would skip rewriting the seed.
+    const geom = pool.acquireGSplatsGeometry('grown', 16);
+    pool.updateGSplatsGeometry(geom, packed(6), 6);
+    flushSortedIndexUploads(geom);
+    pool.updateGSplatsGeometry(geom, packed(6), 6, 3.0, {
+      seedOrdering: new Uint32Array([2, 0, 1]),
+    });
+    const attr = getActiveSortedIndexAttribute(geom)!;
+    const covered = attr.updateRanges.some((r) => r.start === 0 && r.count >= 3);
+    expect(covered).toBe(true);
+
+    pool.updateGSplatsGeometry(geom, packed(6), 6);
+    expect(drawn(geom)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
   it('a seed that is not smaller than the population is ignored (identity, all drawn)', () => {
     const geom = pool.acquireGSplatsGeometry('grown', 16);
     pool.updateGSplatsGeometry(geom, packed(3), 3, 3.0, {

@@ -1265,16 +1265,18 @@ describe('depth-sort coordinator', () => {
     }
     await flush();
 
-    coord.evaluateDepthSortPerFrame();
+    // The return value is the render-on-change contract: true exactly when
+    // the pass changed a draw order (or ordering slot).
+    expect(coord.evaluateDepthSortPerFrame()).toBe(true);
     expect(parts.map((mesh) => mesh.renderOrder)).toEqual([1, 2]);
     const readsAfterFirstFrame = leafReads;
 
-    coord.evaluateDepthSortPerFrame();
+    expect(coord.evaluateDepthSortPerFrame()).toBe(false);
     expect(parts.map((mesh) => mesh.renderOrder)).toEqual([1, 2]);
     expect(leafReads).toBe(readsAfterFirstFrame);
 
     camera = cameraAt(-1000, 0, 0);
-    coord.evaluateDepthSortPerFrame();
+    expect(coord.evaluateDepthSortPerFrame()).toBe(true);
     expect(parts.map((mesh) => mesh.renderOrder)).toEqual([2, 1]);
     expect(leafReads).toBeGreaterThan(readsAfterFirstFrame);
   });
@@ -5786,6 +5788,26 @@ describe('depth-sort coordinator — layer_order bands', () => {
     expect(mesh.renderOrder).toBe(0);
   });
 
+  it('clears the drawn-state latch when global ranks change in the same pass', async () => {
+    const coord = await loadCoordinator();
+    coord.configureDepthSort({ getCamera: () => makeCamera(), requestRender: vi.fn() });
+    const removed = makeGSplatsMesh(2, 'additive');
+    const remaining = makeGSplatsMesh(2, 'additive');
+    setLevel(removed, 9);
+    setLevel(remaining, 10);
+    for (const mesh of [removed, remaining]) {
+      coord.noteDepthSortCommit(mesh, new Float32Array([0, 0, -1]), 1);
+    }
+    await flush();
+    expect(coord.evaluateDepthSortPerFrame()).toBe(true);
+    expect([removed.renderOrder, remaining.renderOrder]).toEqual([1, 2]);
+
+    removed.userData.layerOrder = undefined;
+    expect(coord.evaluateDepthSortPerFrame()).toBe(true);
+    expect([removed.renderOrder, remaining.renderOrder]).toEqual([0, 1]);
+    expect(coord.evaluateDepthSortPerFrame()).toBe(false);
+  });
+
   // D3's precise wording: it is a DIFFERENCE in order that overrides
   // containment, not the act of authoring one. The obvious paraphrase ("an
   // explicit order wins over containment") is wrong, and this is the case that
@@ -5977,6 +5999,32 @@ describe('depth-sort coordinator — held append draws', () => {
     await flush();
     expect(drawnCount(mesh)).toBe(6);
     expect(isPermutation(mesh, 6)).toBe(true);
+  });
+
+  it('an asynchronous release wakes a frame under render-on-change', async () => {
+    // A release lands in a promise callback, long after the commit's own
+    // render request was consumed. Under render-on-change nothing else draws
+    // the raised instanceCount, so the stale held draw would stay on screen.
+    const coord = await loadCoordinator();
+    const requestRender = vi.fn();
+    coord.configureDepthSort({ getCamera: () => makeCamera(), requestRender });
+    const failing = await heldMesh('normal');
+    coord.noteDepthSortCommit(failing, centers(6), 6);
+    await flush();
+    requestRender.mockClear();
+    sortRejectors[0](new Error('worker crashed'));
+    await flush();
+    expect(drawnCount(failing)).toBe(6);
+    expect(requestRender).toHaveBeenCalled();
+
+    const empty = await heldMesh('normal');
+    coord.noteDepthSortCommit(empty, centers(6), 6);
+    await flush();
+    requestRender.mockClear();
+    sortResolvers[1](null);
+    await flush();
+    expect(drawnCount(empty)).toBe(6);
+    expect(requestRender).toHaveBeenCalled();
   });
 
   it('a null (unregistered) result for the current population releases the hold', async () => {

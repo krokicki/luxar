@@ -47,6 +47,7 @@ export const URL_PARAM_KEYS = {
   controlAllowCrossOrigin: 'controlAllowCrossOrigin',
   panel: 'panel',
   debug: 'debug',
+  verboseLog: 'verboseLog',
   kiosk: 'kiosk',
   noCache: 'noCache',
   noSliceCache: 'noSliceCache',
@@ -69,6 +70,8 @@ export const URL_PARAM_KEYS = {
   renderer: 'renderer',
   webgpuForceWebgl: 'webgpuForceWebgl',
   perfTimestamp: 'perfTimestamp',
+  renderAlways: 'renderAlways',
+  renderAudit: 'renderAudit',
   gpuBudgetMB: 'gpuBudgetMB',
   cacheBudgetMB: 'cacheBudgetMB',
   dpr: 'dpr',
@@ -423,6 +426,12 @@ export interface UrlParams {
   /** Enable the `window.__luxarDebug` interface (`?debug`). */
   debug: boolean;
   /**
+   * `?verboseLog` — also print per-query / per-part detail lines
+   * (`log.verbose`). Off by default: on huge partition trees they reach tens
+   * of thousands of console calls per slice step.
+   */
+  verboseLog: boolean;
+  /**
    * `?kiosk` — lock this display down for unattended public use.
    *
    * A hard override over the scene's authored `ui.kiosk` block, because this
@@ -571,6 +580,18 @@ export interface UrlParams {
    */
   perfTimestamp: boolean;
   /**
+   * `?renderAlways` — render every loop tick (the pre-render-on-change loop).
+   * A kill switch: the pixels are identical, only the redundant re-renders of
+   * an unchanged frame come back.
+   */
+  renderAlways: boolean;
+  /**
+   * `?renderAudit` — debug only (needs `?debug`): render every tick and count,
+   * in the perf counter `render.missedDirty`, ticks the scheduler would have
+   * skipped whose pixels nonetheless changed.
+   */
+  renderAudit: boolean;
+  /**
    * Override the adaptive GPU-geometry byte budget, in megabytes
    * (`?gpuBudgetMB=1536`). Pins the single VRAM budget shared by the
    * buffer pool and LOD-group retention, bypassing the auto-size
@@ -703,6 +724,7 @@ export function readUrlParams(
     controlAllowCrossOrigin: allowCrossOriginControl,
     panel: normalizePanelModuleUrl(get(K.panel), pageOrigin),
     debug: has(K.debug),
+    verboseLog: has(K.verboseLog),
     kiosk: has(K.kiosk),
     noCache: has(K.noCache),
     noSliceCache: has(K.noSliceCache),
@@ -725,6 +747,8 @@ export function readUrlParams(
     renderer: normalizeRendererParam(get(K.renderer)),
     webgpuForceWebGL: has(K.webgpuForceWebgl),
     perfTimestamp: has(K.perfTimestamp),
+    renderAlways: has(K.renderAlways),
+    renderAudit: has(K.renderAudit),
     gpuBudgetMB: parseNonNegativeInt(get(K.gpuBudgetMB)),
     cacheBudgetMB: parseNonNegativeInt(get(K.cacheBudgetMB)),
     dpr: parsePositiveFloat(get(K.dpr)),

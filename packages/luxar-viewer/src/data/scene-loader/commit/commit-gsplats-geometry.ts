@@ -19,9 +19,9 @@ import { clampSplatCapacity } from '../../../rendering/element-texture-layout';
 import { getActiveSortedIndexAttribute } from '../../../rendering/element-storage';
 import { syncGSplatMaterialWithGeometry } from '../../../rendering/material-sync-helpers';
 import { isGSplatsUserData } from '../../../types/gsplats';
-import { log, Modules } from '../../../utils/log';
+import { log, LogEmoji, Modules } from '../../../utils/log';
 import type { UpdateSession } from '../../../profiling/update-profiler';
-import type { GPUBufferPool } from '../../../rendering/gpu-buffer-pool';
+import type { GPUBufferPool, GSplatsUpdateOptions } from '../../../rendering/gpu-buffer-pool';
 import { invalidateRenderObjectFor } from './invalidate-render-object';
 import { stampLadderComplete, stampLoadedViewVersion } from './stamp-view-version';
 import { markFirstCommit } from '../../../profiling/load-timeline';
@@ -71,6 +71,143 @@ function drawnOrderingSeed(
     return undefined;
   }
   return (attr.array as Uint32Array).subarray(0, drawn);
+}
+
+/** The pre-commit facts {@link planPoolOrdering} decides the ordering from. */
+interface PoolOrderingInput {
+  mesh: THREE.Mesh;
+  staged: StagedGSplatsCommit;
+  /** The geometry the pool just acquired for this commit. */
+  geometry: THREE.BufferGeometry;
+  prevGeometry: THREE.BufferGeometry;
+  prevDrawnCount: number;
+  hadCommittedData: boolean;
+  prevCount: number | undefined;
+  splatCount: number;
+  attributesRebuilt: boolean;
+  truncationRadius: number;
+}
+
+/**
+ * Decide how the pool commit writes the node's ordering buffer: keep it, repair
+ * it over a changed count, append a suffix, or seed a grown geometry's held draw.
+ */
+function planPoolOrdering(input: PoolOrderingInput): GSplatsUpdateOptions {
+  return { ...planSameBufferOrdering(input), ...planGrowthOrdering(input) };
+}
+
+/** The same-buffer prior: keep the permutation, or repair it over a new count. */
+function planSameBufferOrdering(
+  input: PoolOrderingInput
+): Pick<GSplatsUpdateOptions, 'preserveOrdering' | 'repairFromCount'> {
+  const { geometry, prevGeometry, hadCommittedData, prevCount, splatCount, attributesRebuilt } =
+    input;
+  // Keep the previous depth-sort permutation on a same-node same-count
+  // in-place recommit (timepoint scrub): a permutation of [0,count) is a
+  // strictly-no-worse prior than storage order for the ≥1 frame until the
+  // re-sort dispatched by noteDepthSortCommit below lands. Every guard is
+  // load-bearing:
+  // - !attributesRebuilt / geometry === prevGeometry: pool best-fit reuse
+  //   can hand this node a geometry holding ANOTHER node's permutation
+  //   over a different prior count — entries could point at texels never
+  //   rewritten for this commit.
+  // - hadCommittedData: covers this node's own first commit after LOD
+  //   demotion (stamp cleared) — the retained geometry's ordering is no
+  //   longer vouched for.
+  // - prevCount === splatCount: a permutation of [0,prevCount) is not a
+  //   permutation of [0,count).
+  // No blending-mode gate: under commutative modes / depth-sort-off the
+  // ordering is identity anyway (never permuted), so skipping the
+  // redundant rewrite is a no-op; under normal mode the sort corrects
+  // draw order within ~a frame.
+  // The same-buffer prior splits in two on the count.
+  //
+  // Equal count: keep the permutation verbatim (`preserveOrdering`).
+  //
+  // CHANGED count: hand the adapter the previous count so it can REBUILD
+  // the permutation over the new population (`repairSortedIndexForCount`)
+  // instead of falling back to storage order. This closes exactly the gap
+  // the third bullet above names — "a permutation of [0,prevCount) is not a
+  // permutation of [0,count)" is true, and rebuilding it is cheaper than
+  // giving it up. It is also the branch a timelapse actually takes: an nD
+  // re-slice changes the resident count at almost every step, so the
+  // equal-count guard alone never fired and every timepoint drew at least
+  // one unsorted frame — a flash per timepoint under an order-dependent
+  // blending mode (#2290). Measured on the `cloud` demo at a frozen camera
+  // pose, as the fraction of sampled element pairs composited in correct
+  // back-to-front order: storage order 0.617, repaired 0.858, a real sort
+  // 1.000.
+  //
+  // The other three conjuncts are what make the buffer's contents
+  // meaningful at all, and are unchanged.
+  const sameBuffers = hadCommittedData && !attributesRebuilt && geometry === prevGeometry;
+  const preserveOrdering = sameBuffers && prevCount === splatCount;
+  const repairFromCount =
+    sameBuffers && prevCount !== undefined && prevCount !== splatCount ? prevCount : undefined;
+  return { preserveOrdering, repairFromCount };
+}
+
+/** The growth paths: an in-place suffix append, or a seeded hold on a grown geometry. */
+function planGrowthOrdering(
+  input: PoolOrderingInput
+): Pick<GSplatsUpdateOptions, 'fromInstance' | 'seedOrdering'> {
+  const { mesh, geometry, prevGeometry, prevDrawnCount, prevCount, attributesRebuilt } = input;
+  // Append fast path (depth-sorting Phase 4 Stage 2): when this commit
+  // merely EXTENDS the prefix already on the GPU, write & upload only the
+  // new `[prevCount, splatCount)` suffix. Correctness rests on the
+  // projected prefix being byte-identical to what the GPU holds, which
+  // every conjunct below establishes:
+  // - !attributesRebuilt && geometry === prevGeometry: the pool reused
+  //   THIS node's buffers in place (a grow/best-fit/fresh acquire sets
+  //   attributesRebuilt and may hand back another node's texels). This
+  //   also guarantees splatCount ≤ the existing capacity (the pool only
+  //   grows via release+reacquire, which rebuilds).
+  // - gpuPrefixIntact: a WebGL context restore zeroed the GPU buffers;
+  //   the restore hook clears this so the next commit does a full rewrite.
+  // - splatCount > prevCount: a genuine append (equal → preserveOrdering
+  //   path; shrink/first-commit → full write).
+  // - prefix lineage === committedData: the new concat result forward-
+  //   chains to the exact object last committed here — proving same
+  //   generation (view unchanged: a view change resets the generation, so
+  //   the post-reset concat has no parent), a genuine extension, and that
+  //   the GPU still holds that parent's projection.
+  // - committedTruncate === truncationRadius: `truncate` is a material
+  //   uniform outside the loader view state; a change would restyle the
+  //   prefix's frustum sizing, so a mismatch forces a full rewrite.
+  // Unlike the points/lines gates there is NO optional-field presence
+  // conjunct. Colors white-fill missing parts, while the progressive
+  // GSplat loader requires every concatenated level to agree on label
+  // presence and vocabulary. A valid append therefore preserves both
+  // optional channels across the proven prefix lineage.
+  const extendsCommitted = extendsCommittedPrefix(input);
+  const canAppend =
+    extendsCommitted &&
+    !attributesRebuilt &&
+    geometry === prevGeometry &&
+    mesh.userData.gpuPrefixIntact === true;
+  // A GROW (the pool handed back a fresh geometry — every ladder rung that
+  // doubles crosses the 1.5x capacity headroom) cannot append, but the
+  // same lineage proof makes the previous geometry's DRAWN permutation an
+  // exact ordering of the new geometry's prefix. The adapter holds the draw
+  // on it instead of drawing the grown node in storage order until the
+  // worker's sort lands.
+  const seedOrdering =
+    extendsCommitted && !canAppend
+      ? drawnOrderingSeed(prevGeometry, geometry, prevDrawnCount)
+      : undefined;
+  const fromInstance = canAppend ? (prevCount ?? 0) : 0;
+  return { fromInstance, seedOrdering };
+}
+
+/** True when this commit's data provably extends the population committed here. */
+function extendsCommittedPrefix(input: PoolOrderingInput): boolean {
+  const { mesh, staged, hadCommittedData, prevCount, splatCount, truncationRadius } = input;
+  return (
+    hadCommittedData &&
+    splatCount > (prevCount ?? 0) &&
+    getPrefixParent(staged.sourceData) === getCommittedData(mesh) &&
+    mesh.userData.committedTruncate === truncationRadius
+  );
 }
 
 /**
@@ -129,96 +266,18 @@ export function commitGSplatsGeometry(
       const geometry = gpuBufferPool.acquireGSplatsGeometry(staged.path, splatCount);
       const attributesRebuilt = gpuBufferPool.didLastAcquireRebuildAttributes();
       const truncationRadius = readTruncate(mesh);
-      // Keep the previous depth-sort permutation on a same-node same-count
-      // in-place recommit (timepoint scrub): a permutation of [0,count) is a
-      // strictly-no-worse prior than storage order for the ≥1 frame until the
-      // re-sort dispatched by noteDepthSortCommit below lands. Every guard is
-      // load-bearing:
-      // - !attributesRebuilt / geometry === prevGeometry: pool best-fit reuse
-      //   can hand this node a geometry holding ANOTHER node's permutation
-      //   over a different prior count — entries could point at texels never
-      //   rewritten for this commit.
-      // - hadCommittedData: covers this node's own first commit after LOD
-      //   demotion (stamp cleared) — the retained geometry's ordering is no
-      //   longer vouched for.
-      // - prevCount === splatCount: a permutation of [0,prevCount) is not a
-      //   permutation of [0,count).
-      // No blending-mode gate: under commutative modes / depth-sort-off the
-      // ordering is identity anyway (never permuted), so skipping the
-      // redundant rewrite is a no-op; under normal mode the sort corrects
-      // draw order within ~a frame.
-      // The same-buffer prior splits in two on the count.
-      //
-      // Equal count: keep the permutation verbatim (`preserveOrdering`).
-      //
-      // CHANGED count: hand the adapter the previous count so it can REBUILD
-      // the permutation over the new population (`repairSortedIndexForCount`)
-      // instead of falling back to storage order. This closes exactly the gap
-      // the third bullet above names — "a permutation of [0,prevCount) is not a
-      // permutation of [0,count)" is true, and rebuilding it is cheaper than
-      // giving it up. It is also the branch a timelapse actually takes: an nD
-      // re-slice changes the resident count at almost every step, so the
-      // equal-count guard alone never fired and every timepoint drew at least
-      // one unsorted frame — a flash per timepoint under an order-dependent
-      // blending mode (#2290). Measured on the `cloud` demo at a frozen camera
-      // pose, as the fraction of sampled element pairs composited in correct
-      // back-to-front order: storage order 0.617, repaired 0.858, a real sort
-      // 1.000.
-      //
-      // The other three conjuncts are what make the buffer's contents
-      // meaningful at all, and are unchanged.
-      const sameBuffers = hadCommittedData && !attributesRebuilt && geometry === prevGeometry;
-      const preserveOrdering = sameBuffers && prevCount === splatCount;
-      const repairFromCount =
-        sameBuffers && prevCount !== undefined && prevCount !== splatCount ? prevCount : undefined;
-      // Append fast path (depth-sorting Phase 4 Stage 2): when this commit
-      // merely EXTENDS the prefix already on the GPU, write & upload only the
-      // new `[prevCount, splatCount)` suffix. Correctness rests on the
-      // projected prefix being byte-identical to what the GPU holds, which
-      // every conjunct below establishes:
-      // - !attributesRebuilt && geometry === prevGeometry: the pool reused
-      //   THIS node's buffers in place (a grow/best-fit/fresh acquire sets
-      //   attributesRebuilt and may hand back another node's texels). This
-      //   also guarantees splatCount ≤ the existing capacity (the pool only
-      //   grows via release+reacquire, which rebuilds).
-      // - gpuPrefixIntact: a WebGL context restore zeroed the GPU buffers;
-      //   the restore hook clears this so the next commit does a full rewrite.
-      // - splatCount > prevCount: a genuine append (equal → preserveOrdering
-      //   path; shrink/first-commit → full write).
-      // - prefix lineage === committedData: the new concat result forward-
-      //   chains to the exact object last committed here — proving same
-      //   generation (view unchanged: a view change resets the generation, so
-      //   the post-reset concat has no parent), a genuine extension, and that
-      //   the GPU still holds that parent's projection.
-      // - committedTruncate === truncationRadius: `truncate` is a material
-      //   uniform outside the loader view state; a change would restyle the
-      //   prefix's frustum sizing, so a mismatch forces a full rewrite.
-      // Unlike the points/lines gates there is NO optional-field presence
-      // conjunct. Colors white-fill missing parts, while the progressive
-      // GSplat loader requires every concatenated level to agree on label
-      // presence and vocabulary. A valid append therefore preserves both
-      // optional channels across the proven prefix lineage.
-      const extendsCommitted =
-        hadCommittedData &&
-        splatCount > (prevCount ?? 0) &&
-        getPrefixParent(staged.sourceData) === getCommittedData(mesh) &&
-        mesh.userData.committedTruncate === truncationRadius;
-      const canAppend =
-        extendsCommitted &&
-        !attributesRebuilt &&
-        geometry === prevGeometry &&
-        mesh.userData.gpuPrefixIntact === true;
-      // A GROW (the pool handed back a fresh geometry — every ladder rung that
-      // doubles crosses the 1.5x capacity headroom) cannot append, but the
-      // same lineage proof makes the previous geometry's DRAWN permutation an
-      // exact ordering of the new geometry's prefix. The adapter holds the draw
-      // on it instead of drawing the grown node in storage order until the
-      // worker's sort lands.
-      const seedOrdering =
-        extendsCommitted && !canAppend
-          ? drawnOrderingSeed(prevGeometry, geometry, prevDrawnCount)
-          : undefined;
-      const fromInstance = canAppend ? (prevCount ?? 0) : 0;
+      const orderingOptions = planPoolOrdering({
+        mesh,
+        staged,
+        geometry,
+        prevGeometry,
+        prevDrawnCount,
+        hadCommittedData,
+        prevCount,
+        splatCount,
+        attributesRebuilt,
+        truncationRadius,
+      });
       // Consume-and-clear (see prefix-lineage.ts retention contract): the
       // lineage entry existed solely for the gate check above — clearing it
       // unpins the parent concat's CPU arrays. A retry after a throwing
@@ -238,7 +297,7 @@ export function commitGSplatsGeometry(
           },
           splatCount,
           truncationRadius,
-          { preserveOrdering, repairFromCount, fromInstance, seedOrdering }
+          orderingOptions
         );
       } catch (err) {
         // Defense-in-depth: a throwing write leaves the buffer content
@@ -352,7 +411,8 @@ export function commitGSplatsGeometry(
     }
 
     if (splatCount === 0) {
-      log.info(
+      log.verbose(
+        LogEmoji.INFO,
         Modules.SCENE_LOADER,
         `Clearing gsplats for ${staged.path} (no visible splats at current slice)`
       );

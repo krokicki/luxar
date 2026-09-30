@@ -58,11 +58,10 @@ export function wireSceneEnvironment(deps: EnvironmentWiringDeps): void {
 
   // `pre-render`: a capture this frame sees the frame's final view state
   // (camera writers and view callbacks, including a dimension step, have run).
+  // Returns whether a capture landed (a new environment map is drawn).
   animationController.addPerFrameCallback(
     'environment-capture',
-    () => {
-      sceneManager.environment?.tick();
-    },
+    () => sceneManager.environment?.tick() ?? false,
     { phase: 'pre-render' }
   );
   events.add(() => animationController.removePerFrameCallback('environment-capture'));
@@ -91,15 +90,22 @@ function scheduleBake(
   animationController.addPerFrameCallback(
     id,
     () => {
-      if (started) return;
+      if (started) return false;
       // Not before a dataset load has begun and produced a scene root.
       const hasScene = sceneManager.scene.children.some((c) => c.name === 'LuxarScene');
-      if (!getSceneLoader('default') || !hasScene) return;
+      if (!getSceneLoader('default') || !hasScene) return false;
       settledFrames = isSettled() ? settledFrames + 1 : 0;
-      if (settledFrames < BAKE_SETTLED_FRAMES) return;
+      if (settledFrames < BAKE_SETTLED_FRAMES) return false;
       started = true;
       animationController.removePerFrameCallback(id);
-      void runBake(sceneManager, request);
+      // The bake swaps the scene's environment (it captures afresh): redraw
+      // once it is done.
+      void runBake(sceneManager, request).finally(() =>
+        animationController.requestRender('environmentBake')
+      );
+      // Nothing drawn changes yet: the bake is async and requests its own
+      // render when it lands.
+      return false;
     },
     { continuous: true }
   );

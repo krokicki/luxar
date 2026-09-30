@@ -59,6 +59,8 @@ import {
   sortedIndexNode,
   densityDroppedNode,
 } from '../../materials/_shared/tsl-helpers';
+import { gsplatQuadFootprintTSL } from '../../materials/gsplat/shader-tsl';
+import { GSPLAT_VISIBILITY_FLOOR } from '../../materials/gsplat/math';
 
 const vec2: (a?: TSLNode, b?: TSLNode) => TSLNode = _vec2 as TSLNode;
 const vec3: (a?: TSLNode, b?: TSLNode, c?: TSLNode) => TSLNode = _vec3 as TSLNode;
@@ -335,8 +337,27 @@ export function gsplatPickWebGPUFactory(
       .greaterThan(maxExtentPx)
       .select(maxExtentPx.div(largestExtent), float(1.0))
       .toVar();
-    const extent1: TSLNode = extent1Raw.mul(clampScale);
-    const extent2: TSLNode = extent2Raw.mul(clampScale);
+    const extent1Legacy: TSLNode = extent1Raw.mul(clampScale);
+    const extent2Legacy: TSLNode = extent2Raw.mul(clampScale);
+
+    // Visible-footprint tightening — visual parity (materials/gsplat/
+    // shader-tsl.ts; derivation in materials/gsplat/math.ts). The pick
+    // fragment's visibility test carries no gain or alpha factor, so it
+    // omits the draw factors — the SAME footprint graph as the visual shader.
+    // Pickability always uses max projection — amplitude = aAmplitude · nearFade.
+    const amplitude2D: TSLNode = aAmplitude.mul(nearFade).toVar();
+    const {
+      culled: footprintCulled,
+      extent1,
+      extent2,
+    } = gsplatQuadFootprintTSL({
+      amplitude2D,
+      invOneMinusC: uInvOneMinusC,
+      shiftC: uShiftC,
+      truncateSq: uTruncateSq,
+      legacyExtents: [extent1Legacy, extent2Legacy],
+      lambdas: [lambda1, lambda2],
+    });
 
     // Screen centre in pixels from the clip-space centre.
     const vCenterScreenVal: TSLNode = centerClip.xy
@@ -375,10 +396,10 @@ export function gsplatPickWebGPUFactory(
       .or(invalidAmp)
       .or(invalidCov)
       .or(labelRejected)
-      .or(densityDropped);
+      .or(densityDropped)
+      .or(footprintCulled);
 
-    // Pickability always uses max projection — amplitude = aAmplitude · nearFade.
-    vAmplitude2D.assign(aAmplitude.mul(nearFade));
+    vAmplitude2D.assign(amplitude2D);
     vL2D.assign(vL2DVal);
     vCenterScreen.assign(vCenterScreenVal);
 
@@ -470,7 +491,9 @@ export function gsplatPickWebGPUFactory(
   const colorNode = Fn(() => {
     fragmentPrologue();
     Discard(mahalSq.greaterThan(uTruncateSq));
-    Discard(intensity.lessThan(1e-4));
+    // The vertex stage sizes the quad from this exact test
+    // (gsplatQuadFootprintTSL) — change both together.
+    Discard(intensity.lessThan(GSPLAT_VISIBILITY_FLOOR));
     return vec4(vNodeId, vElementId.x, brightness, vElementId.y);
   });
 

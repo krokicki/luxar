@@ -55,6 +55,7 @@ import {
 } from '../scene-loader/progressive/residency-budget';
 import { viewStatesEqual } from '../loaders/progressive/view-state-equal';
 import type { SliceCache } from '../../cache/slice-cache';
+import { tagSignalOrigin } from '../../cache/decompressed-chunk-cache/decode-origin';
 import { log, Modules, LogEmoji } from '../../utils/log';
 import { getErrorMessage } from '../../utils/format-error';
 import { timeLodStageWithResult } from '../scene-loader/lod-load-stats';
@@ -711,13 +712,15 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
     // Log LOD loading summary (compact, always shown for progressive loaders)
     const totalSplats = this.loadedLODs.reduce((s, d) => s + d.splatCount, 0);
     if (this._loadedLODCount < this.nLods) {
-      log.info(
+      log.verbose(
+        LogEmoji.INFO,
         Modules.GSPLATS_SPATIAL_INDEX_LOADER,
         `Progressive: ${this._loadedLODCount}/${this.nLods} LODs loaded (${totalSplats} splats) — refining`
       );
     } else if (startLevel < this.nLods) {
       // Only log "all loaded" when we actually loaded something new this call
-      log.info(
+      log.verbose(
+        LogEmoji.INFO,
         Modules.GSPLATS_SPATIAL_INDEX_LOADER,
         `Progressive: ${this.nLods}/${this.nLods} LODs loaded (${totalSplats} splats) — complete`
       );
@@ -872,6 +875,8 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
   ): void {
     if (this._prefetchingLevels.has(level)) return;
     this._prefetchingLevels.add(level);
+    // Attribute the decodes this read triggers to `decode.count.lookahead`.
+    tagSignalOrigin(controller.signal, 'lookahead');
     const prefetch = async (): Promise<void> => {
       const ranges = plan ? (await plan).ranges : undefined;
       if (ranges) {

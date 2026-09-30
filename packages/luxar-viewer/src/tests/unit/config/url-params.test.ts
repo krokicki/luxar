@@ -175,6 +175,7 @@ describe('readUrlParams', () => {
       controlAllowCrossOrigin: false,
       panel: null,
       debug: false,
+      verboseLog: false,
       kiosk: false,
       noCache: false,
       noSliceCache: false,
@@ -197,6 +198,8 @@ describe('readUrlParams', () => {
       renderer: null,
       webgpuForceWebGL: false,
       perfTimestamp: false,
+      renderAlways: false,
+      renderAudit: false,
       gpuBudgetMB: null,
       cacheBudgetMB: null,
       dpr: null,
@@ -465,6 +468,16 @@ describe('readUrlParams', () => {
       expect(readUrlParams('').webgpuForceWebGL).toBe(false);
       expect(readUrlParams('?webgpuForceWebgl').webgpuForceWebGL).toBe(true);
       expect(readUrlParams('?renderer=webgpu&webgpuForceWebgl').webgpuForceWebGL).toBe(true);
+    });
+  });
+
+  describe('?renderAlways / ?renderAudit', () => {
+    it('parses the render-on-change kill switch and the debug audit flag', () => {
+      expect(readUrlParams('').renderAlways).toBe(false);
+      expect(readUrlParams('').renderAudit).toBe(false);
+      expect(readUrlParams('?renderAlways').renderAlways).toBe(true);
+      expect(readUrlParams('?debug&renderAudit').renderAudit).toBe(true);
+      expect(readUrlParams('?renderAudit').renderAlways).toBe(false);
     });
   });
 

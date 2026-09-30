@@ -118,6 +118,7 @@ const EMPTY_PARAMS: UrlParams = {
   controlAllowCrossOrigin: false,
   panel: null,
   debug: false,
+  verboseLog: false,
   kiosk: false,
   noCache: false,
   noSliceCache: false,
@@ -140,6 +141,8 @@ const EMPTY_PARAMS: UrlParams = {
   renderer: null,
   webgpuForceWebGL: false,
   perfTimestamp: false,
+  renderAlways: false,
+  renderAudit: false,
   gpuBudgetMB: null,
   cacheBudgetMB: null,
   dpr: null,
@@ -609,9 +612,13 @@ describe('bootstrapStandalone', () => {
           renderer: 'webgpu',
           webgpuForceWebGL: true,
           perfTimestamp: true,
+          renderAlways: true,
+          renderAudit: true,
         },
       });
       const arg = mocks.init.mock.calls.at(-1)?.[0];
+      expect(arg.renderAlways).toBe(true);
+      expect(arg.renderAudit).toBe(true);
       expect(arg.canvas).toBe(CANVAS);
       expect(arg.src).toBe('https://example.com/data.zarr');
       expect(arg.updateBrowserUrl).toBe(true);

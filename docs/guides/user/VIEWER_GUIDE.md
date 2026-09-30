@@ -207,6 +207,7 @@ Append parameters to the viewer URL to control startup behavior.
 | `panel` | module URL | On the `control.html` panel page, load an alternative same-origin control-panel module. Cross-origin modules are rejected. |
 | `kiosk` | flag | Force kiosk mode on as a hard operator override. It can lock a scene but cannot unlock authored kiosk mode. |
 | `debug` | flag | Enable the debug interface (developer use). |
+| `verboseLog` | flag | Print per-query and per-part detail log lines (developer use; very chatty on large scenes). |
 | `noCache` | flag | Disable ALL caching tiers (S-cache + L0/L1/L2). |
 | `noSliceCache` | flag | Disable only the SliceCache (per-slice decoded-geometry reuse); L0/L1/L2 stay on. |
 | `noOpfs` | flag | Disable only the L2 persistent (OPFS) tier; L0/L1/S-cache stay on. For environments whose OPFS stalls — the deterministic sibling of the automatic circuit breaker. |
@@ -231,6 +232,8 @@ Append parameters to the viewer URL to control startup behavior.
 | `renderer` | `webgl` \| `webgpu` | Select the default GLSL WebGLRenderer path or opt into the WebGPURenderer + TSL path. |
 | `webgpuForceWebgl` | flag | Diagnostic flag for `renderer=webgpu`: keep WebGPURenderer + TSL materials but force Three.js's internal WebGL2 backend. |
 | `perfTimestamp` | flag | Opt into GPU timestamp queries (WebGPU only, `timestamp-query` feature). Small runtime cost; intended for the perf bench. |
+| `renderAlways` | flag | Render every animation-loop tick, as before render-on-change. A kill switch: the pixels are identical, only the redundant re-renders of an unchanged frame come back. |
+| `renderAudit` | flag | Debug only (needs `debug`): render every tick and count, in the perf counter `render.missedDirty`, ticks the render-on-change scheduler would have skipped whose pixels nonetheless changed. |
 | `gpuBudgetMB` | number | Pin the GPU-geometry byte budget in MB, bypassing auto-sizing. `0` disables the budget (unbounded resident geometry). |
 | `cacheBudgetMB` | number | Total in-memory cache pool (L0 + L1 + S-cache) in MB, for environments without `performance.memory` (Safari, WKWebView). Also supplies the implied non-cache remainder as a GPU-geometry/LOD residency signal; without `deviceMemory`, it replaces the 512 MB fallback and may raise or lower it, capped at 2 GB. |
 | `dpr` | number | Pin a fixed device pixel ratio and disable adaptive DPR (clamped to [0.25, native DPR]). Overrides the high-DPR ceiling, so `?dpr=2` renders at 2 even with **Allow High DPR** off. For deterministic E2E/visual runs. |

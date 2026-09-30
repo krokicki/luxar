@@ -274,10 +274,13 @@ export async function flushRenderTicks(
       break;
     }
 
-    // Kick the loop. On a stopped loop, renderOnce() draws synchronously and
-    // arms the next rAF frame. Later kicks wake the running loop and reset its
-    // idle timeout, keeping it alive for the whole flush. Outcomes are counted so
-    // the diagnostics can say how many kicks the page actually answered.
+    // Kick the loop. Under render-on-change an idle tick draws nothing, so
+    // every kick is what makes the NEXT frame render: on a stopped loop,
+    // renderOnce() draws synchronously and arms the next rAF frame; on a
+    // running loop it marks the next tick dirty. Every kick also resets the
+    // idle timeout, keeping the loop alive for the whole flush. Outcomes are
+    // counted rather than swallowed so the diagnostics can say how many kicks
+    // the page actually answered.
     const outcome = await raceEvaluate<KickOutcome>(
       page
         .evaluate(() => {
@@ -303,8 +306,14 @@ export async function flushRenderTicks(
     try {
       await page.waitForFunction(
         (target) => {
-          const info = (window as any).__luxarDebug?.renderer?.info;
-          return (info?.render?.frame ?? info?.frame ?? 0) >= target;
+          const debug = (window as any).__luxarDebug;
+          const info = debug?.renderer?.info;
+          const done = (info?.render?.frame ?? info?.frame ?? 0) >= target;
+          // Idle ticks no longer render (render-on-change): re-kick on each
+          // poll until the counter has advanced, rather than waiting on a loop
+          // that has nothing new to draw.
+          if (!done) debug?.renderOnce?.();
+          return done;
         },
         startFrame + i + 1,
         { timeout: waitBound }

@@ -44,6 +44,40 @@ import { wireDensityGuard } from './density-guard-wiring';
 import { buildLoadActivityPredicate } from './load-activity';
 import { wireSceneEnvironment } from './environment-wiring';
 import { getInputProfile } from '../../../utils/input-capabilities';
+import { eventBus } from '../../../utils/cross-layer/event-bus';
+import { RenderAudit, canvasReadback } from '../../../scene/animation/render-audit';
+
+/**
+ * Render-on-change wiring for the loop: the kill switch (`?renderAlways` /
+ * `config.animation.renderOnChange`), the camera + drawing-buffer source of
+ * the view signature, and the debug-only `?renderAudit`.
+ */
+function wireRenderOnChange(
+  animationController: AnimationController,
+  sceneManager: SceneManager,
+  options: LuxarAppOptions,
+  events: EventGroup
+): void {
+  animationController.setRenderOnChange(
+    config.animation.renderOnChange && options.renderAlways !== true
+  );
+  // Live getters: the ortho toggle replaces the camera, a context restore the
+  // renderer.
+  animationController.setViewSignatureSource({
+    getCamera: () => sceneManager.camera,
+    getDrawingBuffer: () => sceneManager.renderer.domElement,
+  });
+  if (options.renderAudit === true && options.debug === true) {
+    animationController.setRenderAudit(
+      new RenderAudit(canvasReadback(() => sceneManager.renderer.domElement))
+    );
+    log.info(
+      Modules.ANIMATION,
+      'Render audit on (?renderAudit): every tick renders and is checked'
+    );
+    events.add(() => animationController.setRenderAudit(null));
+  }
+}
 
 /**
  * Everything `LuxarApp.init()` constructs is returned in this result.
@@ -183,6 +217,7 @@ export async function runInitPipeline(
   animationController.setContextLostPredicate(
     () => gpuDeviceLost || sceneManager.isWebGLContextLost()
   );
+  wireRenderOnChange(animationController, sceneManager, ports.options, ports.events);
   // When the perf readout is shown, kick the loop once so it gets a live
   // reading if the scene had idled — but do NOT force continuous rendering
   // (that would defeat the idle-pause / battery saving). The FPS is live while
@@ -219,7 +254,10 @@ export async function runInitPipeline(
     // throws, so the canvas sizes are re-read once per frame. A camera move or
     // near/far change rebuilds the snapshot on read regardless (view-context.ts).
     viewContext.invalidate();
-    sceneManager.updateDynamicClippingPlanes();
+    const changed = sceneManager.updateDynamicClippingPlanes();
+    // A near/far change is also a projection change the view signature would
+    // catch; returning it keeps the callback's own contract honest.
+    return changed;
   });
 
   // Wire LOD-group selection. The factory closes over the live
@@ -283,10 +321,13 @@ export async function runInitPipeline(
       // slice-aware coarse-while-reloading fallback. Read from the OWNING
       // loader for the same per-instance reason as getResidentBytes.
       getViewVersion: () => owner.currentViewVersion,
-      // Keep the on-demand render loop alive while a lazy fine level reloads
+      // Keep the on-demand render loop TICKING while a lazy fine level reloads
       // (it commits outside the per-slice sweep and can outlast the idle
-      // timeout), so the swap-up to the fresh level fires when it lands.
-      requestRender: () => animationController.startAnimation(),
+      // timeout), so the swap-up to the fresh level fires when it lands. Only
+      // a tick: the landing commit requests the render, and the swap reports
+      // itself through `takeDrawnStateChanged` below.
+      requestRender: () => animationController.requestRender('lod'),
+      requestTick: () => animationController.requestTick(),
       // LOD cross-fade (ON by default; ?noLodFade disables): the registry
       // blends adjacent LOD levels' opacity across a zoom transition instead of
       // a hard swap (blendable modes only: additive/luminous/volumetric).
@@ -320,7 +361,14 @@ export async function runInitPipeline(
   // the stale frame until the next user input. startAnimation is
   // idempotent (early-out while animating + idle-timer re-arm), so
   // per-node calls inside an atomic sweep are harmless.
-  SceneLoaderManager.getInstance().setRequestRender(() => animationController.startAnimation());
+  SceneLoaderManager.getInstance().setRequestRender(() =>
+    animationController.requestRender('geometry')
+  );
+  // Belt and braces for the same moment from the node factory (pick-buffer
+  // invalidation): any commit path that reaches it redraws too.
+  ports.events.add(
+    eventBus.on('geometry-committed', () => animationController.requestRender('geometry'))
+  );
   SceneLoaderManager.getInstance().setKTX2TextureDecoder(
     createKTX2TextureDecoder(sceneManager.renderer)
   );
@@ -335,7 +383,7 @@ export async function runInitPipeline(
     // whichever camera is current (same pattern as the LOD registry's
     // getCamera above).
     getCamera: () => sceneManager.camera,
-    requestRender: () => animationController.startAnimation(),
+    requestRender: () => animationController.requestRender('depthSort'),
     // Blending-mode-switch hook (spec §5.4): switching a gsplat layer TO
     // `normal` clears its noop stamp and forces a reprocess so the next
     // commit registers with the SortWorker.
@@ -367,9 +415,10 @@ export async function runInitPipeline(
   // 'lod-group-selector' below; the evaluation early-outs when no
   // order-dependent node exists (with nodes it allocates only the small
   // per-frame order slots — documented in assignGlobalRenderOrder).
-  animationController.addPerFrameCallback('depth-sort-scheduler', () => {
-    evaluateDepthSortPerFrame();
-  });
+  // Returns whether the pass changed a renderOrder or an ordering-buffer slot.
+  animationController.addPerFrameCallback('depth-sort-scheduler', () =>
+    evaluateDepthSortPerFrame()
+  );
   // Projected-density guard walker (config.densityGuard; `?noDensityGuard`):
   // measures elements per drawing-buffer pixel for every committed data mesh
   // once per frame. Consumers read it through getProjectedDensityTracker()
@@ -390,16 +439,19 @@ export async function runInitPipeline(
       loaderManager.setRefinementDensityProvider(provider, caps),
     getDefaultLoader: () => getSceneLoader('default'),
     getAdaptiveDpr: () => partial.adaptiveDPRManager,
-    requestRender: () => animationController.startAnimation(),
+    requestRender: () => animationController.requestRender('densityGuard'),
   });
   animationController.addPerFrameCallback('projected-density', densityWiring.perFrame);
   animationController.addPerFrameCallback('lod-group-selector', () => {
     const loader = getSceneLoader('default');
+    const registry = loader?.lodGroupRegistry;
+    if (!loader || !registry) return false;
     // When a substitutive-LOD group swaps its active level (a camera-move
     // event with no data reload), refresh the monitor's visible-element
     // tally so it reflects the level now rendering rather than staying
     // pinned to the default/coarsest level from the last updateView.
-    if (loader?.lodGroupRegistry?.evaluatePerFrame()) {
+    const swapped = registry.evaluatePerFrame();
+    if (swapped) {
       loader.refreshVisibleCounts();
       // A level swap changes what is being rendered — learned DPR
       // bounds (floor/backoff) describe the old level's render cost.
@@ -407,6 +459,10 @@ export async function runInitPipeline(
       // swap bursts during a zoom don't spam the ledger.
       partial.adaptiveDPRManager?.notifyContentChanged();
     }
+    // Any level shown or hidden, a cross-fade / energy-compensation opacity
+    // step, a partition part culled: the frame must be redrawn. Taken every
+    // tick so the flag never carries over.
+    return registry.takeDrawnStateChanged() || swapped;
   });
 
   // Seed the pixel-ratio cap from config BEFORE anything sizes a frame.

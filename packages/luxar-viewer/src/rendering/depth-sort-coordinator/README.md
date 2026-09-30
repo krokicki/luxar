@@ -74,7 +74,7 @@ Both files are **module-scoped singletons** (the `element-texture-layout.ts` pat
 - `initTimeoutRetryPending` / `initTimeoutCount` / `initRetryNotBeforeMs` / `initRetryWakeTimer` — starved-retry bookkeeping: whether a retry is armed, deadline misses so far (bounds the attempts), the `performance.now()` instant the next attempt may start, and the one self-wake `setTimeout` armed alongside it
 - `nodeStates: Map<string, NodeSortState>` — per-node tracking (generation, in-flight flag, last sort pose, queued re-sort, registered flag)
 - `nextGeneration` — monotonic counter (unique across a node's LIFETIMES, not just within one)
-- Injected callbacks: `getCamera` (getter, not captured reference), `requestRender`, `requestReprocess`, `isLoadInProgress`, `getProfiler`
+- Injected callbacks: `getCamera` (getter, not captured reference), `requestRender`, `requestReprocess`, `isLoadInProgress`, `getProfiler`, `getDisplayDims`
 - Session master switch: `depthSortEnabled` (from `config.depthSort.enabled` + `?depthSort=0`)
 
 **Module state** (render-order.ts):
@@ -227,7 +227,7 @@ Every ordering uses the same staged-apply path; orderings larger than one 1M-ind
 
 ### Held Append Draws
 
-A gsplat append commit — or a pool GROW that extends the drawn population, seeded with the previous geometry's drawn permutation — HOLDS its draw at the previous population (see `holdSortedIndexDrawForAppend` / `holdSortedIndexDrawFromSeed` in `element-storage.ts`): the suffix texels are uploaded but `instanceCount` stays at the drawn count until an ordering of the WHOLE grown population is installed — the slot flip of the worker's ordering, or the synchronous first sort's live write. So every frame is an exact back-to-front draw of some population instead of storage order for the 75-225 ms a large sort takes. The coordinator owns the other exit, `releaseHeldDraw` (a repaired full permutation, all elements drawn), on every path where that ordering will not arrive: an order-independent / depth-sort-off / empty commit, a missing API, a failed `registerNode`, a commit that cannot reach the worker, a `scheduleSort` that cannot dispatch, a current-generation sort that stages nothing (null result, rejected write), a failed sort RPC, a switch to a commutative mode, and node release. A STALE result does not release: the newer commit's sort is queued behind it.
+A gsplat append commit — or a pool GROW that extends the drawn population, seeded with the previous geometry's drawn permutation — HOLDS its draw at the previous population (see `holdSortedIndexDrawForAppend` / `holdSortedIndexDrawFromSeed` in `element-storage.ts`): the suffix texels are uploaded but `instanceCount` stays at the drawn count until an ordering of the WHOLE grown population is installed — the slot flip of the worker's ordering, or the synchronous first sort's live write. So every frame is an exact back-to-front draw of some population instead of storage order for the 75-225 ms a large sort takes. The coordinator owns the other exit, `releaseHeldDraw` (a repaired full permutation, all elements drawn), on every path where that ordering will not arrive: an order-independent / depth-sort-off / empty commit, a missing API, a failed `registerNode`, a commit that cannot reach the worker, a `scheduleSort` that cannot dispatch, a current-generation sort that stages nothing (null result, rejected write), a failed sort RPC, a switch to a commutative mode, and node release. A STALE result does not release: the newer commit's sort is queued behind it. A release that ends a hold marks the drawn state changed and calls `requestRender`, since most release paths run in a promise callback after the commit's own render request was consumed; under render-on-change the held draw would otherwise stay on screen.
 
 ### Per-Frame Camera Re-Sort Scheduler (Phase 3)
 
@@ -403,25 +403,31 @@ The sibling partition-footprint cache in `scene/lod-group-registry.ts` uses push
 ### App Init (core/app/init/pipeline.ts)
 
 ```typescript
-configureDepthSort({
-  getCamera: () => sceneManager.camera, // GETTER, not captured reference
-  requestRender: () => animationController.requestRender(),
-  requestReprocess: () => sceneLoader.updateView({}),
-  isLoadInProgress: () => sceneLoader.isUpdateInProgress(),
-  getProfiler: () => updateProfiler ?? null,
-});
+// Session master switch: bootstrap threads `?depthSort=0` into the app options.
+setDepthSortEnabled(config.depthSort.enabled && (ports.options.depthSort ?? true));
 
-// Session master switch
-const depthSortEnabled = config.depthSort.enabled && urlParams.get('depthSort') !== '0';
-setDepthSortEnabled(depthSortEnabled);
+configureDepthSort({
+  getCamera: () => sceneManager.camera, // GETTER, not a captured reference
+  requestRender: () => animationController.requestRender('depthSort'),
+  // The loader changes per dataset, so it is resolved at call time.
+  requestReprocess: () => {
+    void getSceneLoader('default')?.updateView({});
+  },
+  isLoadInProgress: () => getSceneLoader('default')?.isUpdateInProgress() ?? false,
+  getProfiler: () => SceneLoaderManager.getInstance().getProfiler(),
+  // Partition painter's order maps the BSP `axis` column through the
+  // displayed dims; read live so nD navigation is tracked.
+  getDisplayDims: () => sceneDimsManager.getDims()?.displayed ?? null,
+});
+warmUpDepthSortWorker();
 ```
 
 ### Per-Frame Registration
 
 ```typescript
-animationController.addPerFrameCallback('depth-sort-scheduler', () => {
-  evaluateDepthSortPerFrame();
-});
+// Returns true when the pass changed a renderOrder or an ordering-buffer
+// slot, so the render-on-change loop redraws exactly then.
+animationController.addPerFrameCallback('depth-sort-scheduler', () => evaluateDepthSortPerFrame());
 ```
 
 ### Commit-Time First Sort

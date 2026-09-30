@@ -49,9 +49,31 @@ import type { OverlayManager } from '../../../ui/overlay-manager';
 import type { LuxarApp } from '../../app';
 import { GSPLAT_DEFAULT_TRUNCATION_RADIUS } from '../../../config/constants';
 import { computePerfSnapshot } from './perf-snapshot';
+import { perfCounters } from '../../../profiling/perf-counters';
 import { getRendererInfoSnapshot, installRendererInfoSampler } from './renderer-info-sampler';
 import { snapshotProjectedDensity } from '../../../scene/projected-density';
 import type { LODGroupRegistry } from '../../../scene/lod-group-registry';
+
+/** Marks `Object3D.prototype.getObjectByName` once it counts its calls. */
+const GET_OBJECT_BY_NAME_COUNTED = Symbol.for('luxar.getObjectByNameCounted');
+
+/**
+ * Count every `Object3D.getObjectByName` call in the `scene.getObjectByName`
+ * perf counter (a full subtree walk each — a hot-path smell worth gating on).
+ * Patches a three prototype, so only debug sessions install it. Idempotent;
+ * the wrapper forwards arguments and result unchanged.
+ */
+function installGetObjectByNameCounter(): void {
+  const proto = THREE.Object3D.prototype as THREE.Object3D & Record<symbol, unknown>;
+  if (proto[GET_OBJECT_BY_NAME_COUNTED]) return;
+  Object.defineProperty(proto, GET_OBJECT_BY_NAME_COUNTED, { value: true });
+  const slot = perfCounters.slot('scene.getObjectByName');
+  const original = proto.getObjectByName;
+  proto.getObjectByName = function countedGetObjectByName(this: THREE.Object3D, name: string) {
+    perfCounters.add(slot);
+    return original.call(this, name);
+  };
+}
 
 /**
  * Populate `window.__luxarDebug` with runtime components, helper
@@ -90,6 +112,10 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
   // that gap for navigation-cost diagnosis. Snapshot via
   // __luxarDebug.getLodLoadStats().
   setLodLoadStatsEnabled(true);
+
+  // Count Object3D.getObjectByName calls for the perf counters (?debug only:
+  // it patches a three prototype).
+  installGetObjectByNameCounter();
 
   // Sample renderer.info at every frame-end for getPerf().rendererInfo —
   // between frames Three's autoReset leaves only the last post-processing
@@ -486,6 +512,8 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
     // Every hook is read INSIDE the getter, per snapshot, for the same
     // reason `isLoading` is: capturing once here would freeze it.
     perfReady: true,
+    getPerfRecords: (kind: string) => perfCounters.records(kind),
+    resetPerfCounters: () => perfCounters.reset(),
     getPerf: () =>
       computePerfSnapshot({
         rendererInfo: getRendererInfoSnapshot,
