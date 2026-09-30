@@ -1308,19 +1308,36 @@ function formatOrderingBytes(bytes: number, uploaded: boolean): string {
 }
 
 /**
- * The model-view matrix to sort against.
+ * How far behind an orthographic camera the BSP eye is placed (world units):
+ * beyond any scene extent, so every split plane the view crosses at an angle
+ * is decided by the view direction, and small enough to stay finite through
+ * the wrapper's inverse matrix.
+ */
+const ORTHO_BSP_EYE_DISTANCE = 1e15;
+
+/**
+ * Result of {@link computeModelView}; every caller copies out of it
+ * synchronously. Created on first use, like the per-frame scratch.
+ */
+let modelViewScratch: THREE.Matrix4 | null = null;
+
+/**
+ * The model-view matrix to sort against, in a shared scratch (copy it before
+ * the next call).
  *
  * Both matrices are normally renderer-maintained (updated during render), but
  * a commit can fire BEFORE the next frame — the first commit of a load, or
  * while the on-demand loop is idle-paused — and would otherwise read a
- * stale/identity pose. Refresh them here and derive the view matrix locally
- * (`camera.matrixWorldInverse` is only refreshed by `renderer.render`, not by
- * `updateMatrixWorld`).
+ * stale/identity pose, so both are refreshed here. The view is the plain
+ * `inverse(camera.matrixWorld)`, the same one the per-frame trigger and the
+ * frame's view snapshot use (three's `matrixWorldInverse`, which
+ * `updateMatrixWorld` also refreshes, is built with the scale removed).
  */
 function computeModelView(mesh: THREE.Mesh, camera: THREE.Camera): THREE.Matrix4 {
   mesh.updateWorldMatrix(true, false);
   camera.updateMatrixWorld();
-  return new THREE.Matrix4().copy(camera.matrixWorld).invert().multiply(mesh.matrixWorld);
+  modelViewScratch ??= new THREE.Matrix4();
+  return modelViewScratch.copy(camera.matrixWorld).invert().multiply(mesh.matrixWorld);
 }
 
 /**
@@ -1443,12 +1460,7 @@ function scheduleSort(mesh: THREE.Mesh, nodeId: string): void {
   state.inFlight = true;
 
   const generation = state.generation;
-  // Both matrices are normally renderer-maintained (updated during
-  // render), but a commit can fire BEFORE the next frame — the first
-  // commit of a load, or while the on-demand loop is idle-paused — and
-  // would otherwise read a stale/identity pose. Refresh them here and
-  // derive the view matrix locally (camera.matrixWorldInverse is only
-  // refreshed by renderer.render, not by updateMatrixWorld).
+  // Fresh matrices even between frames (see computeModelView).
   const modelView = computeModelView(mesh, camera);
   recordSortPose(state, modelView);
 
@@ -1888,13 +1900,25 @@ export function evaluateDepthSortPerFrame(): void {
     }
 
     if (!viewComputed) {
-      // One-frame-stale matrices are fine for the TRIGGER test (the
-      // dispatch itself re-derives fresh ones in scheduleSort), but the
-      // camera's matrixWorld must at least exist post-move — cheap when
-      // nothing changed.
+      // Derived here from the live camera rather than read from the frame's
+      // view snapshot: resortForCapture runs this pass straight after a pose
+      // is set, outside the frame loop, where a snapshot would be the
+      // previous frame's. (The dispatch re-derives fresh matrices in
+      // scheduleSort either way.)
       camera.updateMatrixWorld();
       scratch.view.copy(camera.matrixWorld).invert();
       scratch.camPos.setFromMatrixPosition(camera.matrixWorld);
+      if ((camera as THREE.OrthographicCamera).isOrthographicCamera) {
+        // Parallel rays: which side of a BSP split plane is near depends on
+        // the view direction alone, not on where the eye sits (the ortho
+        // camera keeps the perspective pose's position, often on the far
+        // side of a plane the view looks back across). An eye pushed
+        // effectively to infinity behind the camera gives that answer through
+        // the same eye-side test. camPos feeds only the BSP ranks.
+        const e = camera.matrixWorld.elements;
+        scratch.axis.set(e[8], e[9], e[10]).normalize();
+        scratch.camPos.addScaledVector(scratch.axis, ORTHO_BSP_EYE_DISTANCE);
+      }
       viewComputed = true;
     }
 

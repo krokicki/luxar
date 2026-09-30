@@ -1,6 +1,7 @@
 import type * as THREE from 'three';
 import { SceneManager } from '../../../scene/scene-manager';
 import { AnimationController } from '../../../scene/animation/animation-controller';
+import { ViewContextProvider } from '../../../scene/view-context';
 import { PerformanceMonitor } from '../../../ui/performance-monitor';
 import { DebugConsole } from '../../../ui/debug-console';
 import {
@@ -194,9 +195,28 @@ export async function runInitPipeline(
   const debugConsole = new DebugConsole();
   partial.debugConsole = debugConsole;
 
+  // The frame's camera snapshot, shared by the view-dependent per-frame work
+  // (see scene/view-context.ts). The canvas is read live: a collapsed canvas
+  // reports no viewport and the consumers skip the frame.
+  const viewContext = new ViewContextProvider({
+    getCamera: () => sceneManager.camera,
+    getViewportCss: () => {
+      const canvas = sceneManager.renderer.domElement;
+      return { width: canvas.clientWidth, height: canvas.clientHeight };
+    },
+    getDrawingBuffer: () => {
+      const canvas = sceneManager.renderer.domElement;
+      return { width: canvas.width, height: canvas.height };
+    },
+  });
+
   // Set up per-frame callback for dynamic clipping plane updates
   // Uses unique ID so it won't conflict with other per-frame callbacks (e.g., dimension animation)
   animationController.addPerFrameCallback('dynamic-clipping', () => {
+    // The first 'view' callback invalidates every frame, even if clipping
+    // throws, so the canvas sizes are re-read once per frame. A camera move or
+    // near/far change rebuilds the snapshot on read regardless (view-context.ts).
+    viewContext.invalidate();
     sceneManager.updateDynamicClippingPlanes();
   });
 
@@ -228,13 +248,8 @@ export async function runInitPipeline(
   SceneLoaderManager.getInstance().setLODGroupRegistryFactory((owner) => {
     return new LODGroupRegistry({
       getCamera: () => sceneManager.camera,
-      getViewportSize: () => {
-        const canvas = sceneManager.renderer.domElement;
-        return {
-          width: canvas.clientWidth || window.innerWidth,
-          height: canvas.clientHeight || window.innerHeight,
-        };
-      },
+      getViewportSize: () => viewContext.get().viewportCss ?? { width: 0, height: 0 },
+      getViewContext: () => viewContext.get(),
       // Return an empty list when scene dimensions aren't initialized
       // yet rather than the misleading ``[0, 1, 2]`` default — for
       // 2D scenes the latter projected onto a phantom Z axis. The
@@ -367,6 +382,7 @@ export async function runInitPipeline(
     capOverride: ports.options.densityCap,
     energyComp: lodEnergyCompEnabled,
     sceneManager,
+    getViewContext: () => viewContext.get(),
     registerMaterial: (material) => materialManager.register(material),
     setRefinementDensityProvider: (provider, caps) =>
       loaderManager.setRefinementDensityProvider(provider, caps),
