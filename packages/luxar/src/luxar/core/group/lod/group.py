@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from numbers import Integral
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1153,6 +1154,35 @@ def resolve_coarsen_dims(
     return _finalize(idxs)
 
 
+def _resolve_lift_refine_controls(
+    kwargs: Dict[str, Any], geometry: str
+) -> tuple[str, Optional[int]]:
+    """Validate the volume-free refinement options before lifting geometry."""
+    refine = kwargs.pop("refine", "none")
+    if not isinstance(refine, str) or refine not in ("none", "l2"):
+        raise ValueError(
+            f"substitutive_lod for {geometry}: refine must be 'none' or 'l2' "
+            f"(volume refinement needs a source volume); got {refine!r}"
+        )
+    refine_iters = kwargs.pop("refine_iters", None)
+    if refine_iters is not None:
+        if (
+            isinstance(refine_iters, bool)
+            or not isinstance(refine_iters, Integral)
+            or refine_iters < 1
+        ):
+            raise ValueError(
+                f"substitutive_lod for {geometry}: refine_iters must be an integer >= 1; "
+                f"got {refine_iters!r}"
+            )
+        if refine != "l2":
+            raise ValueError(
+                f"substitutive_lod for {geometry}: refine_iters requires refine='l2'"
+            )
+        refine_iters = int(refine_iters)
+    return refine, refine_iters
+
+
 def resolve_substitutive_axis(
     spec: Any,
     geometry: str,
@@ -1175,7 +1205,9 @@ def resolve_substitutive_axis(
       did), ``coarsen_dims``,
       ``max_aspect`` (per-splat anisotropy cap on the coarse levels, default 3.0;
       ``None`` disables — see :func:`luxar.gsplats.lift._cap_aspect`), and
-      ``quality_stamps`` (measure per-level mixture quality, default ``True``).
+      ``quality_stamps`` (measure per-level mixture quality, default ``True``),
+      ``refine`` (``"none"`` or volume-free ``"l2"``), and
+      ``refine_iters`` (positive integer Adam steps for ``"l2"``).
       Unrecognized keys raise. LOD switch thresholds are otherwise auto-derived by
       :func:`derive_coverage_fractions` (screen-occupancy halving, re-anchored at
       fills-screen when the insertion point is partition-bound) — no method
@@ -1270,6 +1302,8 @@ def resolve_substitutive_axis(
 
     quality_stamps = _resolve_quality_stamps(kwargs)
 
+    refine, refine_iters = _resolve_lift_refine_controls(kwargs, geometry)
+
     if kwargs:
         valid_keys = [
             "compression_factor (K)",
@@ -1282,6 +1316,8 @@ def resolve_substitutive_axis(
             "coarsen_dims",
             "max_aspect",
             "quality_stamps",
+            "refine",
+            "refine_iters",
             *extra_valid_keys,
         ]
         raise ValueError(
@@ -1300,6 +1336,8 @@ def resolve_substitutive_axis(
         "coarsen_dims": coarsen_dims,
         "max_aspect": max_aspect,
         "quality_stamps": quality_stamps,
+        "refine": refine,
+        "refine_iters": refine_iters,
     }
 
 
