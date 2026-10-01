@@ -414,6 +414,25 @@ def test_graft_keeps_footprint_stamps_on_leaves(tmp_path):
         assert stats["footprint_dims"] == [0, 1, 2]
 
 
+def test_remap_footprint_stats_maps_data_columns_to_scene_order():
+    """``footprint_dims`` is stored in input-data column order and must be
+    remapped to scene-axis order when a ``dim_order`` is given, or the viewer
+    checks the footprint against the wrong axes."""
+    from luxar.core.group.gsplats_pipeline.lod_dispatch import (
+        _remap_footprint_stats,
+    )
+
+    # data columns [T, X, Y, Z]; footprint measured on columns [1, 2, 3] = X, Y, Z.
+    # scene stores dims as [X, Y, Z, T], so those become scene indices [0, 1, 2].
+    out = _remap_footprint_stats(
+        {"median_footprint": 2.5, "footprint_dims": [1, 2, 3]},
+        ["T", "X", "Y", "Z"],
+        ["X", "Y", "Z", "T"],
+    )
+    assert out["footprint_dims"] == [0, 1, 2]
+    assert out["median_footprint"] == 2.5
+
+
 def test_graft_reference_uses_only_the_finest_lod_level():
     """Coarse merged representatives must not darken the default finest view."""
 
