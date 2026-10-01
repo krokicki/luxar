@@ -92,6 +92,7 @@ export interface UpdateOptions {
   height?: number;
 }
 
+/** Backend texture update call intercepted for partial row uploads. */
 export type UpdateTextureFn = (texture: THREE.Texture, options: UpdateOptions) => void;
 
 /** Structural view of three's backends (native WebGPU + WebGL2 fallback). */

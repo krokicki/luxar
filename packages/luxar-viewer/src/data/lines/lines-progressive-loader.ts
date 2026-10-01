@@ -37,6 +37,7 @@ import {
   measureLodBytes,
   restoreLadderSnapshot,
   storeLadder,
+  awaitShadowStore,
 } from '../loaders/progressive/slice-cache-helper';
 import { planLadderRollback } from '../loaders/progressive/pass-rollback';
 import { LINE_FLOATS_PER_SEGMENT } from '../../rendering/element-texture-layout';
@@ -46,8 +47,10 @@ import {
 } from '../scene-loader/progressive/residency-budget';
 import { viewStatesEqual } from '../loaders/progressive/view-state-equal';
 import type { SliceCache } from '../../cache/slice-cache';
+import { setSliceCacheOrigin, type SliceCacheOrigin } from '../../cache/slice-cache-origin';
 import { log, Modules, LogEmoji } from '../../utils/log';
 import { timeLodStageWithResult } from '../scene-loader/lod-load-stats';
+import { createLookaheadController } from '../loaders/progressive/lookahead-signal';
 
 /**
  * Concatenate per-LOD `LoadedLinesData`. Segment indices are
@@ -254,6 +257,8 @@ export class LinesProgressiveLoader implements LinesDataLoader {
   private _initialLoadDone = false;
   private _lastAllResident = true;
   private _disposed = false;
+  /** Controller for the in-flight next-rung lookahead (null when idle). */
+  private _lookaheadController: AbortController | null = null;
   // Memoized concatenation. Keyed on (resetGeneration, logical LOD count):
   // the generation bumps on every view-state reset so a reset-then-reload
   // back to the same LOD count yields a NEW reference (contents differ),
@@ -275,6 +280,9 @@ export class LinesProgressiveLoader implements LinesDataLoader {
   private _payloadsAtPassStart = 0;
   private _restoredFullLadderAtPassStart = false;
   private _retryFoldedPass = false;
+  // The S-cache entry `loadedLODs` holds exactly (see the GSplats twin):
+  // stamped on concatenations built from it alone, for the stage cache.
+  private _restoredOrigin: SliceCacheOrigin | null = null;
   // Per-sub-LOD cumulative energy fractions e(k) (the build-time
   // `lod_stats.energy_fraction_cum` stamps), normalized at construction:
   // non-null only when EVERY sub-LOD carries a stamp (a partially stamped
@@ -393,6 +401,7 @@ export class LinesProgressiveLoader implements LinesDataLoader {
       this._retryFoldedPass = true;
       return 0;
     }
+    this._restoredOrigin = null;
     if (plan.action === 'unwind-restored-full') {
       this.loadedLODs = [];
       this._loadedLODCount = 0;
@@ -471,10 +480,16 @@ export class LinesProgressiveLoader implements LinesDataLoader {
       isPrefetch ? concatenateLinesData([]) : this.concatenateMemoized(session);
 
     if (!this.lastViewState || !viewStatesEqual(viewState, this.lastViewState)) {
+      // The old view's next rung will never be read now.
+      this.cancelLookahead();
       // DEPARTURE store: snapshot the outgoing view's partial ladder under
       // the OUTGOING key before discarding — scrub-back stays warm even when
       // ladders never complete between navigations. Mirrors Points/GSplats.
-      if (this.lastViewState && this._loadedLODCount > 0) {
+      if (
+        this.lastViewState &&
+        this._loadedLODCount > 0 &&
+        !(isPrefetch && this.tornDown(signal))
+      ) {
         storeLadder(this.sliceCache, this.path, this.lastViewState, this.loadedLODs, {
           scan: this._frameBudgetMs !== null,
           pin: viewState.prefetch === true,
@@ -483,6 +498,14 @@ export class LinesProgressiveLoader implements LinesDataLoader {
         });
       }
       // Try the SliceCache before discarding the ladder (see GSplats loader).
+      // IN-FLIGHT ADOPTION: a shadow (SlicePrefetcher) pass may be building
+      // this very slice right now. Wait for its store (bounded; rejects on
+      // this update's abort) and restore that, instead of redoing the same
+      // dequant/assembly — measured 49% duplicate work during playback.
+      const shadowStore = isPrefetch
+        ? null
+        : awaitShadowStore(this.sliceCache, this.path, viewState, signal);
+      if (shadowStore) await shadowStore;
       const restored = restoreLadderSnapshot<LoadedLinesData>(
         this.sliceCache,
         this.path,
@@ -493,6 +516,7 @@ export class LinesProgressiveLoader implements LinesDataLoader {
       // levels and must never mutate the cache's payload array (elements
       // stay shared read-only). Mirrors GSplatsProgressiveLoader.
       this.loadedLODs = restored ? [...restored.lods] : [];
+      this._restoredOrigin = restored?.origin ?? null;
       this._loadedLODCount = restored?.depth ?? 0;
       this._levelsAtPassStart = 0;
       this._payloadsAtPassStart = 0;
@@ -566,11 +590,12 @@ export class LinesProgressiveLoader implements LinesDataLoader {
       const elapsed = performance.now() - t0;
 
       this.loadedLODs.push(lodData);
+      this._restoredOrigin = null;
       this._loadedLODCount++;
       this._lastAllResident = allResident;
 
       if (!this._initialLoadDone) {
-        log.custom(
+        log.verbose(
           LogEmoji.BROADCAST,
           Modules.LINES_LOADER,
           `LOD ${level}/${this.nLods - 1}: ${lodData.segmentCount} segments (${elapsed.toFixed(1)}ms${allResident ? '' : ', miss'})`
@@ -628,13 +653,17 @@ export class LinesProgressiveLoader implements LinesDataLoader {
       );
     }
 
-    this.prefetchNextLOD(viewState);
+    this.prefetchNextLOD(viewState, signal);
 
     // Snapshot into the SliceCache (upgrade-if-longer): full ladders always;
     // PREFIXES only while a playback budget is active. Mirrors
     // GSplatsProgressiveLoader.
     const result = finish();
 
+    // A pass aborted or disposed mid-level must not store: releaseShadows()
+    // has already unpinned this key, so a late pinned store would outlive
+    // playback with nothing left to release it.
+    if (this.tornDown(signal)) return result;
     if (
       this._loadedLODCount === this.nLods ||
       this._frameBudgetMs !== null ||
@@ -649,6 +678,11 @@ export class LinesProgressiveLoader implements LinesDataLoader {
     }
 
     return result;
+  }
+
+  /** True once this pass was aborted or the loader disposed. */
+  private tornDown(signal?: AbortSignal): boolean {
+    return signal?.aborted === true || this._disposed;
   }
 
   /**
@@ -686,6 +720,7 @@ export class LinesProgressiveLoader implements LinesDataLoader {
           : null;
       const result = concatenateLinesData(this.loadedLODs);
       setPrefixParent(result, prevMemo);
+      if (this._restoredOrigin) setSliceCacheOrigin(result, this._restoredOrigin);
       // Keep only the cumulative payload, and release the sub-loaders' pooled
       // buffers that back the decoded rung views. Retaining either copy keeps
       // roughly the same bytes as `result` and doubles terminal residency.
@@ -704,16 +739,30 @@ export class LinesProgressiveLoader implements LinesDataLoader {
     }
   }
 
-  private prefetchNextLOD(viewState: LinesViewState): void {
+  private prefetchNextLOD(viewState: LinesViewState, updateSignal?: AbortSignal): void {
     // Same teardown race as the streaming loop: a dispose() between the
     // awaited level and this fire-and-forget clears `lodLoaders`, and
     // indexing it would TypeError before the .catch can swallow anything.
     if (this._disposed) return;
+    // Playback (frame-budgeted) and pinned-scrub passes skip the lookahead:
+    // the next pass is a different slice, so this slice's next rung is never
+    // read (measured pure waste during playback). Shadow passes carry a frame
+    // budget, so they are covered too. Mirrors GSplatsProgressiveLoader.
+    if (this._frameBudgetMs !== null || this._ladderDepth !== null) return;
     const nextLevel = this._loadedLODCount;
     if (nextLevel >= this.nLods) return;
-    void this.lodLoaders[nextLevel].prefetchChunks(viewState).catch(() => {
+    this.cancelLookahead();
+    const controller = createLookaheadController(updateSignal);
+    this._lookaheadController = controller;
+    // Fire-and-forget; errors ignored (network failures, aborts).
+    void this.lodLoaders[nextLevel].prefetchChunks(viewState, controller.signal).catch(() => {
       /* ignore */
     });
+  }
+
+  private cancelLookahead(): void {
+    this._lookaheadController?.abort();
+    this._lookaheadController = null;
   }
 
   // ---- LoaderMonitor surface (delegated to ProgressiveMonitorAdapter) ----
@@ -741,11 +790,13 @@ export class LinesProgressiveLoader implements LinesDataLoader {
 
   dispose(): void {
     this._disposed = true;
+    this.cancelLookahead();
     for (const loader of this.lodLoaders) {
       loader.dispose();
     }
     this.lodLoaders = [];
     this.loadedLODs = [];
+    this._restoredOrigin = null;
     this._loadedLODCount = 0;
     this._retryFoldedPass = false;
     this.lastViewState = null;

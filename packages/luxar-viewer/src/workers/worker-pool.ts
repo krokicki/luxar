@@ -39,6 +39,14 @@ import { nextRoundRobin } from './worker-pool/selection/round-robin';
 import { DispatchTracker } from './worker-pool/selection/dispatch-tracker';
 import { computeStats, computeQueueDepth, type PoolStats } from './worker-pool/stats';
 import { markLoad } from '../profiling/load-timeline';
+import {
+  areWorkerCodecsEnabled,
+  setBloscDecodeBackend,
+  setWorkerCodecsEnabled,
+} from '../data/codecs/worker-blosc';
+import { hasUrlFlag, URL_PARAM_KEYS } from '../config/url-params';
+import { BloscDecodeDispatcher } from './worker-pool/codec-dispatch';
+import { CodecWarmup } from './worker-pool/codec-warmup';
 
 export type { WorkerInstance };
 export {
@@ -113,6 +121,15 @@ export class WorkerPool {
   private nextWorkerIndex = 0;
   /** Worker-side in-flight accounting for the `worker.*` perf counters only. */
   private readonly dispatchTracker = new DispatchTracker();
+  /** Lazy, one-worker-first blosc codec warm-up (see `worker-pool/codec-warmup.ts`). */
+  private readonly codecWarmup = new CodecWarmup({
+    workers: () => this.workers,
+    run: (entry, call) =>
+      this.withTimeout('warmCodecs', call, this.pickTimeoutMs('decode'), entry.worker),
+    enabled: areWorkerCodecsEnabled,
+    onError: (error) =>
+      log.warning(Modules.WORKER_POOL, 'Worker codec warm-up failed (decodes will retry)', error),
+  });
   /**
    * Pool-wide abort signal. When set (by `setAbortSignal`), every
    * `runWithTimeout` call additionally races against this signal so
@@ -568,7 +585,7 @@ export class WorkerPool {
    * indefinitely (Comlink's onerror handler can't settle an in-flight
    * promise). Production code MUST go through {@link runWithTimeout}
    * instead — it routes the call through {@link withTimeout} on a
-   * round-robin-selected worker. This direct `getWorker()` accessor is
+   * least-busy worker. This direct `getWorker()` accessor is
    * intentionally retained for tests and low-level worker-pool
    * unit tests that need raw access; lint-grep for new production
    * uses periodically.
@@ -588,7 +605,7 @@ export class WorkerPool {
   }
 
   /**
-   * Run a worker call through {@link withTimeout} on a round-robin-selected
+   * Run a worker call through {@link withTimeout} on a least-busy
    * worker. The single production entry point for any Comlink-routed call
    * that needs a hang-detection guard — direct `await` against a worker
    * `Remote` lets a dead worker hang the caller forever (the `onerror`
@@ -619,50 +636,147 @@ export class WorkerPool {
         throw new WorkerAbortError(op);
       }
 
-      // Route through getWorkerWithTracking so a stalled worker (one
+      // Route through acquireTrackedWorker so a stalled worker (one
       // whose activeQueries has grown past the others) stops being
       // selected. The previous round-robin via nextWorkerInstance had
       // no load awareness, so a slow worker received every Nth call
       // until each call timed out individually — head-of-line blocking.
-      const tracked = await this.getWorkerWithTracking();
+      // The slot is taken AT SELECTION (same synchronous step), so concurrent
+      // dispatches see each other's load instead of all reading index 0 idle.
+      const tracked = await this.acquireTrackedWorker();
 
       // Second-chance abort check: the await above may have yielded long
       // enough for the caller's dataset-switch to fire. Don't even start.
       if (effectiveSignal?.aborted) {
+        tracked.markQueryEnd();
         throw new WorkerAbortError(op);
       }
 
-      tracked.markQueryStart();
+      // Race the worker call against the timeout AND the abort signal.
+      // The abort cannot kill the WASM task, but it can settle the
+      // promise immediately so the caller proceeds with whatever the
+      // dataset-switch wants to do next.
+      const workerPromise = this.dispatchTracked(op, kind, tracked, fn);
+
+      if (!effectiveSignal) {
+        return await workerPromise;
+      }
+
+      let onAbort: (() => void) | undefined;
+      const abortPromise = new Promise<never>((_, reject) => {
+        onAbort = (): void => reject(new WorkerAbortError(op));
+        effectiveSignal.addEventListener('abort', onAbort, { once: true });
+      });
+
       try {
-        // Race the worker call against the timeout AND the abort signal.
-        // The abort cannot kill the WASM task, but it can settle the
-        // promise immediately so the caller proceeds with whatever the
-        // dataset-switch wants to do next.
-        const task = fn(tracked.api);
-        this.dispatchTracker.dispatch(tracked.worker, this.workers, task);
-        const workerPromise = this.withTimeout(op, task, this.pickTimeoutMs(kind), tracked.worker);
-
-        if (!effectiveSignal) {
-          return await workerPromise;
-        }
-
-        let onAbort: (() => void) | undefined;
-        const abortPromise = new Promise<never>((_, reject) => {
-          onAbort = (): void => reject(new WorkerAbortError(op));
-          effectiveSignal.addEventListener('abort', onAbort, { once: true });
-        });
-
-        try {
-          return await Promise.race([workerPromise, abortPromise]);
-        } finally {
-          if (onAbort) effectiveSignal.removeEventListener('abort', onAbort);
-        }
+        return await Promise.race([workerPromise, abortPromise]);
       } finally {
-        tracked.markQueryEnd();
+        if (onAbort) effectiveSignal.removeEventListener('abort', onAbort);
       }
     } finally {
       abortScope?.dispose();
     }
+  }
+
+  /**
+   * Select the least-busy worker AND mark its slot busy in one synchronous
+   * step after the usability await. Marking later (after the caller resumes)
+   * let every concurrent dispatch read the same worker as idle.
+   */
+  private async acquireTrackedWorker(
+    eligible: (w: WorkerInstance) => boolean = () => true
+  ): Promise<TrackedWorkerHandle> {
+    await this.whenUsable();
+    if (this.workers.length === 0) {
+      throw new WorkerUnavailableError('[WorkerPool] No workers available after initialization');
+    }
+    // No await between selection and marking — see the method doc.
+    const candidates = this.workers.filter(eligible);
+    if (candidates.length === 0) {
+      throw new WorkerUnavailableError('[WorkerPool] No worker eligible for this task');
+    }
+    const tracked = selectLeastBusy(candidates);
+    tracked.markQueryStart();
+    return tracked;
+  }
+
+  /**
+   * Start `fn` on an already-acquired worker and release its slot when the
+   * WORKER'S OWN (timeout-guarded) promise settles — not when the caller's
+   * abort race settles. An aborted caller walks away, but the worker keeps
+   * running the abandoned task; freeing the slot early made least-busy
+   * routing send the next dispatch to a busy worker while others idled. The
+   * release path swallows the rejection (the caller observes it through the
+   * returned promise, or has already moved on after an abort).
+   */
+  private dispatchTracked<T>(
+    op: string,
+    kind: TimeoutKind,
+    tracked: TrackedWorkerHandle,
+    fn: (api: Remote<DataWorkerAPI>) => Promise<T>
+  ): Promise<T> {
+    let workerPromise: Promise<T>;
+    try {
+      const task = fn(tracked.api);
+      this.dispatchTracker.dispatch(tracked.worker, this.workers, task);
+      workerPromise = this.withTimeout(op, task, this.pickTimeoutMs(kind), tracked.worker);
+    } catch (error) {
+      tracked.markQueryEnd();
+      throw error;
+    }
+    workerPromise.then(
+      () => tracked.markQueryEnd(),
+      () => tracked.markQueryEnd()
+    );
+    return workerPromise;
+  }
+
+  /**
+   * Run a chunk-decode task on the least-busy WARM worker (see
+   * `CodecWarmup.isWarm`; none warm rejects, and the codec decodes on the main
+   * thread instead), timeout-guarded but NOT
+   * raced against the pool-wide abort signal: a decode is a few milliseconds
+   * of work whose result the L0 cache keeps, and abandoning it on a dataset
+   * switch would only make the codec fall back to decoding it on the main
+   * thread. Used by the blosc codec dispatcher (`worker-pool/codec-dispatch.ts`).
+   */
+  async runDecode<T>(op: string, fn: (api: Remote<DataWorkerAPI>) => Promise<T>): Promise<T> {
+    const tracked = await this.acquireTrackedWorker((w) => this.codecWarmup.isWarm(w));
+    return this.dispatchTracked(op, 'decode', tracked, fn);
+  }
+
+  /** Workers with no task in flight. */
+  getIdleWorkerCount(): number {
+    return this.workers.reduce((n, w) => n + (w.activeQueries === 0 ? 1 : 0), 0);
+  }
+
+  /** Idle workers whose codec is warm (the codec dispatcher spreads batches over these). */
+  getIdleWarmWorkerCount(): number {
+    return this.workers.reduce(
+      (n, w) => n + (w.activeQueries === 0 && this.codecWarmup.isWarm(w) ? 1 : 0),
+      0
+    );
+  }
+
+  /**
+   * True when a worker's blosc codec is warm, so a chunk decode may be
+   * offloaded. Otherwise warms ONE worker (the others follow once it finished,
+   * reading the codec chunk from the HTTP cache) and returns false: decode on
+   * the main thread meanwhile. Never warms under `?mainThreadCodecs`, and a
+   * warm-up never counts as a query. Called by the codec dispatcher for each
+   * chunk above its offload floor, so a store with no such chunk never makes a
+   * worker download its codec.
+   */
+  ensureCodecsWarm(): boolean {
+    return this.codecWarmup.ensureWarm();
+  }
+
+  /**
+   * Start warming the workers' blosc codec now, one worker first (see
+   * {@link ensureCodecsWarm}). Fire-and-forget and idempotent.
+   */
+  warmCodecs(): void {
+    this.codecWarmup.ensureWarm();
   }
 
   /**
@@ -705,11 +819,8 @@ export class WorkerPool {
    * eviction-on-timeout), and callbacks to mark query start/end so
    * the active-queries counter reflects in-flight load.
    *
-   * Used by {@link runWithTimeout} to route hot-path calls to the
-   * least-loaded worker. A stalled worker stops being selected once
-   * its activeQueries grows past the others — without this, the
-   * round-robin fallback would queue new calls on the stalled worker
-   * until it timed out individually.
+   * For callers that manage their own slot accounting. Hot-path calls use
+   * {@link runWithTimeout}, which selects and marks in one synchronous step.
    */
   async getWorkerWithTracking(): Promise<TrackedWorkerHandle> {
     await this.whenUsable();
@@ -817,8 +928,30 @@ let workerPoolInstance: WorkerPool | null = null;
 export function getWorkerPool(): WorkerPool {
   if (!workerPoolInstance) {
     workerPoolInstance = new WorkerPool();
+    installCodecBackend(workerPoolInstance);
   }
   return workerPoolInstance;
+}
+
+/**
+ * Route the zarr blosc codec's chunk decodes through `pool` (see
+ * `worker-pool/codec-dispatch.ts`). The dispatcher declines — the codec then
+ * decodes on the main thread — until the pool has a usable worker, so this is
+ * safe to install before any worker exists. `?mainThreadCodecs` is the kill
+ * switch (keeps every decode on the main thread).
+ */
+function installCodecBackend(pool: WorkerPool): void {
+  setWorkerCodecsEnabled(!hasUrlFlag(URL_PARAM_KEYS.mainThreadCodecs));
+  setBloscDecodeBackend(new BloscDecodeDispatcher(pool));
+}
+
+/**
+ * Start warming the data workers' blosc codec (fire-and-forget; one worker
+ * first, the rest once it finished). Nothing warms it eagerly: the first chunk
+ * decode above the offload floor does, so this only front-loads that.
+ */
+export function warmWorkerCodecs(): void {
+  workerPoolInstance?.warmCodecs();
 }
 
 /**
@@ -864,6 +997,9 @@ export function disposeWorkerPool(): void {
       workerPoolInstance.dispose();
     } finally {
       workerPoolInstance = null;
+      // Drop the codec route with the pool: blosc decodes run on the main
+      // thread until a new pool is created.
+      setBloscDecodeBackend(null);
     }
   }
 }

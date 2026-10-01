@@ -8,9 +8,12 @@
  * Loading strategy:
  * - On each updateView() call, loads LODs sequentially starting from LOD 0
  * - Stops at the first LOD whose load takes longer than the cache-hit threshold
- * - After first paint, initializes the remaining spatial indexes concurrently
+ * - Requests rung k+1's spatial index (`chunk_bounds`) while rung k loads, at
+ *   refinement fetch priority; after first paint, initializes the rest
  * - Prefetches up to three unloaded LODs when the L0 cache has headroom
  * - Keeps playback/shadow prefetch at one rung to avoid abandoned-slice waste
+ * - A pinned (`ladderDepth`) pass fetches its rungs concurrently, coarsest first
+ * - After a hidden-dim slice step, reads ahead rung 0 of the neighbouring slices
  *
  * LODs are additive: LOD 0 contains the coarsest (highest-amplitude) splats,
  * and each subsequent LOD adds residual detail. The loader concatenates all
@@ -26,6 +29,7 @@ import type {
   GSplatsSpatialIndexLoader,
 } from './gsplats-spatial-index-loader';
 import type { UpdateSession } from '../../profiling/update-profiler';
+import { tagSignalPriority } from '../../utils/fetch-concurrency';
 import type {
   LoaderMetrics,
   MonitorEventListener,
@@ -46,6 +50,7 @@ import {
   measureLodBytes,
   restoreLadderSnapshot,
   storeLadder,
+  awaitShadowStore,
 } from '../loaders/progressive/slice-cache-helper';
 import { planLadderRollback } from '../loaders/progressive/pass-rollback';
 import { SPLAT_FLOATS_PER_SPLAT } from '../../rendering/element-texture-layout';
@@ -55,6 +60,7 @@ import {
 } from '../scene-loader/progressive/residency-budget';
 import { viewStatesEqual } from '../loaders/progressive/view-state-equal';
 import type { SliceCache } from '../../cache/slice-cache';
+import { setSliceCacheOrigin, type SliceCacheOrigin } from '../../cache/slice-cache-origin';
 import { tagSignalOrigin } from '../../cache/decompressed-chunk-cache/decode-origin';
 import { log, Modules, LogEmoji } from '../../utils/log';
 import { getErrorMessage } from '../../utils/format-error';
@@ -68,12 +74,8 @@ function reportSpeculativeFailure(action: string, error: unknown): void {
   log.warning(Modules.GSPLATS_SPATIAL_INDEX_LOADER, `${action}: ${getErrorMessage(error)}`);
 }
 
-function resolvePrefetchDepth(
-  metadataWarmStarted: boolean,
-  hasCacheStats: boolean,
-  frameBudgetMs: number | null
-): number {
-  return metadataWarmStarted && hasCacheStats && frameBudgetMs === null ? MAX_PREFETCH_LEVELS : 1;
+function resolvePrefetchDepth(metadataWarmStarted: boolean, hasCacheStats: boolean): number {
+  return metadataWarmStarted && hasCacheStats ? MAX_PREFETCH_LEVELS : 1;
 }
 
 function readPrefetchHeadroom(loader: GSplatsSpatialIndexLoader | undefined): number | null {
@@ -295,6 +297,39 @@ export function concatenateGSplatsData(parts: LoadedGSplatsData[]): LoadedGSplat
   };
 }
 
+/** Hidden dimensions whose slice position differs between two views. */
+function scrubbedHiddenDims(previous: GSplatsViewState, next: GSplatsViewState): number[] {
+  const dims: number[] = [];
+  for (let d = 0; d < next.slicePosition.length; d++) {
+    if (next.displayDims.includes(d)) continue;
+    if (previous.slicePosition[d] !== next.slicePosition[d]) dims.push(d);
+  }
+  return dims;
+}
+
+/** The in-range slice values one step either side of dimension `d`'s current one. */
+function neighbourValues(viewState: GSplatsViewState, d: number): number[] {
+  const meta = viewState.dimensions?.[d];
+  const step = meta?.step;
+  if (step === undefined || !(step > 0)) return [];
+  const at = viewState.slicePosition[d];
+  const range = meta?.range;
+  return [at - step, at + step].filter((v) => !range || (v >= range[0] && v <= range[1]));
+}
+
+/** One step either way along each of `dims` (stepped dims only, inside their range). */
+function neighbourSlices(viewState: GSplatsViewState, dims: readonly number[]): GSplatsViewState[] {
+  const out: GSplatsViewState[] = [];
+  for (const d of dims) {
+    for (const value of neighbourValues(viewState, d)) {
+      const slicePosition = [...viewState.slicePosition];
+      slicePosition[d] = value;
+      out.push({ ...viewState, slicePosition });
+    }
+  }
+  return out;
+}
+
 /**
  * Progressive GSplats loader for multi-LOD datasets.
  *
@@ -334,6 +369,11 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
   // A completed pass can still fail after loading, during projection or commit.
   // Keep it schedulable for one retry even though the ladder cursor is full.
   private _retryFoldedPass = false;
+  // The S-cache entry `loadedLODs` was restored from, while `loadedLODs` still
+  // holds that entry's content and NOTHING else (cleared by any pushed level,
+  // rollback, or reset). A concatenation built under it is stamped with it, so
+  // the post-projection stage cache can recognise the revisit (#2944 B2).
+  private _restoredOrigin: SliceCacheOrigin | null = null;
   // Per-sub-LOD cumulative energy fractions e(k) (the build-time
   // `lod_stats.energy_fraction_cum` stamps), normalized at construction:
   // non-null only when EVERY sub-LOD carries a stamp (a partially stamped
@@ -344,6 +384,14 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
   private readonly sliceCache: SliceCache | null;
   private _metadataWarmStarted = false;
   private _prefetchController: AbortController | null = null;
+  /**
+   * Speculative ±1-slice read-ahead of rung 0 (B5), one controller per
+   * neighbour slice. A view change aborts every one EXCEPT the slice it moved
+   * onto: that warm is what the new pass's level-0 reads join.
+   */
+  private _readAheads: Array<{ view: GSplatsViewState; controller: AbortController }> = [];
+  /** Hidden dims whose slice moved into the current view (read-ahead axes). */
+  private _scrubDims: number[] = [];
   private _prefetchPlanning = false;
   private readonly _prefetchingLevels = new Set<number>();
   private _lastLoggedPrefetchDepth: number | null = null;
@@ -473,6 +521,7 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
       this._retryFoldedPass = true;
       return 0;
     }
+    this._restoredOrigin = null;
     if (plan.action === 'unwind-restored-full') {
       this.loadedLODs = [];
       this._loadedLODCount = 0;
@@ -555,11 +604,16 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
     // `loadedLODs` outright (so `hasMoreLODs` reads false and the refinement
     // loop never re-streams), skipping the whole load+decode.
     if (!this.lastViewState || !viewStatesEqual(viewState, this.lastViewState)) {
-      if (this.lastViewState) this.cancelLookaheadPrefetch();
+      this._scrubDims = this.lastViewState ? scrubbedHiddenDims(this.lastViewState, viewState) : [];
+      if (this.lastViewState) this.cancelLookaheadPrefetch(viewState);
       // DEPARTURE store: snapshot the outgoing view's partial ladder under
       // the OUTGOING key before discarding — scrub-back stays warm even when
       // ladders never complete between navigations. Mirrors Points/Lines.
-      if (this.lastViewState && this._loadedLODCount > 0) {
+      if (
+        this.lastViewState &&
+        this._loadedLODCount > 0 &&
+        !(isPrefetch && this.tornDown(signal))
+      ) {
         storeLadder(this.sliceCache, this.path, this.lastViewState, this.loadedLODs, {
           scan: this._frameBudgetMs !== null,
           pin: viewState.prefetch === true,
@@ -567,6 +621,14 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
           totalLODCount: this.nLods,
         });
       }
+      // IN-FLIGHT ADOPTION: a shadow (SlicePrefetcher) pass may be building
+      // this very slice right now. Wait for its store (bounded; rejects on
+      // this update's abort) and restore that, instead of redoing the same
+      // dequant/assembly — measured 49% duplicate work during playback.
+      const shadowStore = isPrefetch
+        ? null
+        : awaitShadowStore(this.sliceCache, this.path, viewState, signal);
+      if (shadowStore) await shadowStore;
       const restored = restoreLadderSnapshot<LoadedGSplatsData>(
         this.sliceCache,
         this.path,
@@ -577,6 +639,7 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
       // levels into loadedLODs and must never mutate the cache's payload
       // array (the elements stay shared read-only — store deep-clones).
       this.loadedLODs = restored ? [...restored.lods] : [];
+      this._restoredOrigin = restored?.origin ?? null;
       this._loadedLODCount = restored?.depth ?? 0;
       // A restored full ladder has not been committed for this pass. If its
       // concat or commit fails, unwind the whole restored snapshot rather than
@@ -638,6 +701,13 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
     // A pinned pass bounds the loop at the pinned rung count; the policy's
     // `pinned` kind disables the deadline / cold-level brakes.
     const targetLevels = this._ladderDepth ?? this.nLods;
+    // A pinned pass takes every rung up to its depth whatever they cost, so
+    // their fetches need not wait on one another (B5): start them all now,
+    // coarsest first, and commit them below in ladder order as before.
+    const pinnedLoads =
+      pass === 'pinned'
+        ? this.startLevelLoads(startLevel, targetLevels, viewState, session, signal)
+        : null;
     for (let level = startLevel; level < targetLevels; level++) {
       // A dispose() racing the awaited level below clears `lodLoaders`, so
       // the next iteration would TypeError on `this.lodLoaders[level]` — a
@@ -651,20 +721,23 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
       if (shouldStopBeforeLevel(pass, level, startLevel, performance.now(), budgetDeadline)) {
         break;
       }
+      // Rung level+1's chunk_bounds is fetched WHILE this rung's data loads
+      // (B6), not after the pass: the next refinement step then starts with
+      // its index in hand. Not under a playback budget (one rung per tick) nor
+      // for a shadow prefetch pass — the same rule as `warmRemainingLODMetadata`.
+      if (this._frameBudgetMs === null && !isPrefetch) this.warmLevelIndex(level + 1);
       const t0 = performance.now();
-      const { data: lodData, allResident } = await timeLodStageWithResult(
-        ({ allResident }) => `additive:gsplats:level:${level}:${allResident ? 'resident' : 'miss'}`,
-        `additive:gsplats:level:${level}:aborted`,
-        () => this.lodLoaders[level].updateViewWithResidency(viewState, session, signal)
-      );
+      const { data: lodData, allResident } = await (pinnedLoads?.[level - startLevel] ??
+        this.loadLevel(level, viewState, session, signal));
       const elapsed = performance.now() - t0;
 
       this.loadedLODs.push(lodData);
+      this._restoredOrigin = null;
       this._loadedLODCount++;
       this._lastAllResident = allResident;
 
       if (!this._initialLoadDone) {
-        log.custom(
+        log.verbose(
           LogEmoji.BROADCAST,
           Modules.GSPLATS_SPATIAL_INDEX_LOADER,
           `LOD ${level}/${this.nLods - 1}: ${lodData.splatCount} splats (${elapsed.toFixed(1)}ms${allResident ? '' : ', miss'})`
@@ -726,8 +799,10 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
       );
     }
 
-    // Fire-and-forget: prefetch later unloaded LODs to warm cache.
+    // Fire-and-forget: prefetch later unloaded LODs to warm cache (free
+    // navigation only — see prefetchNextLODs).
     this.prefetchNextLODs(viewState);
+    if (!isPrefetch) this.readAheadNeighbourSlices(viewState);
 
     // Snapshot into the SliceCache (upgrade-if-longer): full ladders always
     // (instant revisit restore); PREFIXES only while a playback budget is
@@ -736,6 +811,10 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
     // Gating prefixes on the budget keeps the non-play cost profile (a
     // store per refinement pass would clone O(N²) bytes per slice).
     const result = finish();
+    // A pass aborted or disposed mid-level must not store: releaseShadows()
+    // has already unpinned this key, so a late pinned store would outlive
+    // playback with nothing left to release it.
+    if (this.tornDown(signal)) return result;
     if (
       this._loadedLODCount === this.nLods ||
       this._frameBudgetMs !== null ||
@@ -750,6 +829,11 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
     }
 
     return result;
+  }
+
+  /** True once this pass was aborted or the loader disposed. */
+  private tornDown(signal?: AbortSignal): boolean {
+    return signal?.aborted === true || this._disposed;
   }
 
   /**
@@ -787,6 +871,7 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
           : null;
       const result = concatenateGSplatsData(this.loadedLODs);
       setPrefixParent(result, prevMemo);
+      if (this._restoredOrigin) setSliceCacheOrigin(result, this._restoredOrigin);
       for (let level = 0; level < this._loadedLODCount; level++) {
         this.lodLoaders[level]?.releaseAccumulator();
       }
@@ -808,25 +893,29 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
    * This is fire-and-forget: the prefetched chunks land in the L0/L1 cache
    * and become fast cache hits on the next updateView() call.
    *
-   * Uses prefetchChunks() which performs the spatial index query and zarr
-   * get() calls (populating the cache) WITHOUT allocating full-size output
-   * buffers or running the accumulator — avoiding wasted memory.
+   * Uses prefetchChunks(), which performs the spatial index query and warms
+   * each touched chunk into L0 through the proxy's `warmChunk` (decode only —
+   * no zarr get(), so no output selection is assembled and the accumulator
+   * does not run).
    */
   private prefetchNextLODs(viewState: GSplatsViewState): void {
     // Same teardown race as the streaming loop: a dispose() between the
     // awaited level and this fire-and-forget clears `lodLoaders`, and
     // indexing it would TypeError before the .catch can swallow anything.
     if (this._disposed) return;
+    // Playback (frame-budgeted) and pinned-scrub passes skip the lookahead:
+    // their next pass is a DIFFERENT slice, so the next rung of THIS slice is
+    // never read. Measured on real playback it was pure waste — 310 MB (45%
+    // of loop-0 bytes) on drosophila with no looked-ahead chunk ever read by a
+    // foreground pass, and 92% of later-loop decodes. Shadow passes carry a
+    // frame budget, so they are covered too. Free navigation keeps it.
+    if (this._frameBudgetMs !== null || this._ladderDepth !== null) return;
     const firstLevel = this._loadedLODCount;
     if (firstLevel >= this.nLods) return;
 
     const headroom = readPrefetchHeadroom(this.lodLoaders[0]);
     const controller = (this._prefetchController ??= new AbortController());
-    const maxLevels = resolvePrefetchDepth(
-      this._metadataWarmStarted,
-      headroom !== null,
-      this._frameBudgetMs
-    );
+    const maxLevels = resolvePrefetchDepth(this._metadataWarmStarted, headroom !== null);
     if (maxLevels === 1 || headroom === null || headroom <= 0) {
       this.logPrefetchDepth(1, headroom);
       this.startLookaheadPrefetch(firstLevel, viewState, controller);
@@ -907,19 +996,106 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
     );
   }
 
+  /** Load one rung for `viewState` (timed as `additive:gsplats:level:<n>`). */
+  private loadLevel(
+    level: number,
+    viewState: GSplatsViewState,
+    session: UpdateSession | undefined,
+    signal: AbortSignal | undefined
+  ): Promise<{ data: LoadedGSplatsData; allResident: boolean }> {
+    return timeLodStageWithResult(
+      ({ allResident }) => `additive:gsplats:level:${level}:${allResident ? 'resident' : 'miss'}`,
+      `additive:gsplats:level:${level}:aborted`,
+      () => this.lodLoaders[level].updateViewWithResidency(viewState, session, signal)
+    );
+  }
+
+  /**
+   * Start rungs `[from, to)` concurrently, coarsest first. A rung the loop never
+   * awaits (it broke out early, or an earlier rung threw) must not surface as an
+   * unhandled rejection, so each promise gets a no-op handler; the loop still
+   * awaits — and rethrows — the original.
+   */
+  private startLevelLoads(
+    from: number,
+    to: number,
+    viewState: GSplatsViewState,
+    session: UpdateSession | undefined,
+    signal: AbortSignal | undefined
+  ): Array<Promise<{ data: LoadedGSplatsData; allResident: boolean }>> {
+    const loads: Array<Promise<{ data: LoadedGSplatsData; allResident: boolean }>> = [];
+    for (let level = from; level < to; level++) {
+      const load = this.loadLevel(level, viewState, session, signal);
+      void load.catch(() => {});
+      loads.push(load);
+    }
+    return loads;
+  }
+
   private warmRemainingLODMetadata(): void {
     if (this._metadataWarmStarted || this._disposed) return;
     this._metadataWarmStarted = true;
     for (let level = 1; level < this.nLods; level++) {
-      void this.lodLoaders[level]
-        .ensureInitialized()
+      this.warmLevelIndex(level);
+    }
+  }
+
+  /**
+   * Request rung `level`'s spatial index (its `chunk_bounds`) at REFINEMENT
+   * priority (B6): a finer rung of something already on screen queues behind
+   * every demand read but no longer waits for the rung before it to finish.
+   * Idempotent — the sub-loader initialises once.
+   */
+  private warmLevelIndex(level: number): void {
+    if (this._disposed || level >= this.nLods) return;
+    void this.lodLoaders[level]
+      .ensureInitialized('refinement')
+      .catch((error: unknown) => reportSpeculativeFailure('GSplat metadata warming failed', error));
+  }
+
+  /**
+   * Predictive read-ahead for a scrub (B5): once a pass for a view reached by
+   * moving a hidden-dimension slice has run, warm the COARSE rung (rung 0) of
+   * the neighbouring slices, one step either way along each moved axis, so the
+   * next drag step's first commit is a cache hit. Speculative priority,
+   * aborted by the next view change. Free navigation only — playback has the
+   * t+1 SlicePrefetcher, which already warms whole ladders ahead — and once per
+   * view. Each neighbour gets its own controller, so the step that lands on
+   * one keeps its read (see {@link cancelLookaheadPrefetch}).
+   */
+  private readAheadNeighbourSlices(viewState: GSplatsViewState): void {
+    const dims = this._scrubDims;
+    this._scrubDims = [];
+    if (dims.length === 0 || this.nLods < 2 || this._disposed) return;
+    if (this._frameBudgetMs !== null || this._ladderDepth !== null) return;
+    for (const neighbour of neighbourSlices(viewState, dims)) {
+      const controller = new AbortController();
+      tagSignalPriority(controller.signal, 'speculative');
+      this._readAheads.push({ view: neighbour, controller });
+      void this.lodLoaders[0]
+        .prefetchChunks(neighbour, controller.signal)
         .catch((error: unknown) =>
-          reportSpeculativeFailure('GSplat metadata warming failed', error)
+          reportSpeculativeFailure('GSplat slice read-ahead failed', error)
         );
     }
   }
 
-  private cancelLookaheadPrefetch(): void {
+  /**
+   * Abort the speculative reads of the view being left. `keepFor` is the view
+   * being entered: a read-ahead of exactly that slice is KEPT, because until
+   * the new pass's level-0 read joins it the warm is the only waiter on its
+   * chunk fetches, and aborting it there cancels the shared fetch and makes
+   * the demand read refetch from scratch. The kept warm is aborted by the
+   * next view change, by which time the demand read holds the fetch itself.
+   */
+  private cancelLookaheadPrefetch(keepFor?: GSplatsViewState): void {
+    const kept = this._readAheads.filter(
+      ({ view }) => keepFor !== undefined && viewStatesEqual(view, keepFor)
+    );
+    for (const entry of this._readAheads) {
+      if (!kept.includes(entry)) entry.controller.abort();
+    }
+    this._readAheads = kept;
     this._prefetchController?.abort();
     this._prefetchController = null;
     this._prefetchPlanning = false;
@@ -960,6 +1136,7 @@ export class GSplatsProgressiveLoader implements GSplatsDataLoader {
     }
     this.lodLoaders = [];
     this.loadedLODs = [];
+    this._restoredOrigin = null;
     this._loadedLODCount = 0;
     this._retryFoldedPass = false;
     this.lastViewState = null;

@@ -101,7 +101,18 @@ Key behaviours:
 - **Health counters** — `oversizedWriteSkipped`, `quotaWriteSkipped`,
   `evictions`, `writeFailures`, `corruptedEntries`,
   `metadataParseFailures`, `orphanedFilesRemoved` are surfaced via
-  `getStats()` and the cache monitor's "Errors" card.
+  `getStats()` and the cache monitor's "Errors" card (plus
+  `orphansReindexed`).
+- **Index persistence** — the index save is a 1 s debounce with a 2 s
+  ceiling, flushed on `pagehide` / hidden (`flushAllMetadata`) and on
+  `dispose()`; an open-time, per-session-budgeted orphan reconcile re-indexes
+  or deletes chunk files the index never recorded (see `../README.md`,
+  "L2 index persistence").
+- **Quota estimate cache** — `navigator.storage.estimate()` is re-run at most
+  every 30 s / 64 MB written, or when the debited cached headroom cannot cover
+  a write.
+- **No write-path copy** — `set()` writes the caller's `Uint8Array` view
+  directly (only a detached buffer, detected by a length check, is refused).
 - **External-dataset validation state** — the persisted
   `validationMode` (`content-hash` | `zattrs-hash` | `archive-etag` | `ttl` |
   `none`) and `lastValidatedAt` ride along in `_cache_meta.json` so a TTL
@@ -134,11 +145,22 @@ Key behaviours:
   at a 16 KiB/s aggregate floor shared across at most eight active leases, or
   eight stall windows shared across at most four leases when the length is
   unavailable. Metadata probes use a separate lane from data bodies: the caps
-  are 24 data + 4 metadata in TLS-only sessions, and shrink to 4 data + 2
-  metadata once an `http:` URL is seen. A caller-aborted signal exits immediately
-  without consuming retry budget.
-  The consumer runs inside its fetch-gate lease and may call `readBody()` once;
-  returning without reading cancels the body before release.
+  are 24 data + 4 metadata in TLS-only sessions, with the data lane widened to 96
+  for an origin whose resource timing shows it negotiated h2/h3, and both lanes
+  shrink to 4 data + 2 metadata once an `http:` URL is seen (HTTP/1.1's six
+  sockets). `priority` (`demand` > `refinement` > `speculative`, or a
+  `FetchPriorityCell` a coalescing caller may raise) orders the gate's queue;
+  speculative requests never hold more than a quarter of a lane. The store
+  passes `speculative` for prefetcher reads and raises a pending read to
+  `demand` when a demand caller joins it. A read whose abort signal carries a
+  class (`tagSignalPriority` — the refinement loop tags its run's signal
+  `refinement`) is fetched at that class unless the call names one; the L0
+  chunk proxy copies the class onto its shared decode's signal and lifts it
+  when a more urgent caller joins. `cache` forwards a `RequestCache` mode
+  (the zip range reader sends `no-store`). A caller-aborted signal exits
+  immediately without consuming retry budget. The consumer runs inside its
+  fetch-gate lease and may call `readBody()` once; returning without reading
+  cancels the body before release.
 
 ### `bandwidth-window.ts` — sliding-window throughput
 

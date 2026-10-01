@@ -19,6 +19,7 @@ import type { LinesSpatialIndexLoader } from '../../../data/lines/lines-spatial-
 import type { LinesViewState, LoadedLinesData } from '../../../types/lines';
 import { CACHE_HIT_THRESHOLD_MS } from '../../../data/loaders/progressive/constants';
 import { SliceCache } from '../../../cache/slice-cache';
+import { beginShadowStore } from '../../../data/loaders/progressive/slice-cache-helper';
 import {
   buildSliceViewSig,
   measureLodBytes,
@@ -189,6 +190,56 @@ describe('LinesProgressiveLoader', () => {
       slicePosition: [0, 0, 0, 1],
       tolerance: [0, 0, 0, 0],
     };
+
+    it('keeps an outgoing foreground prefix when the incoming update is already aborted', async () => {
+      const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
+      const setSpy = vi.spyOn(sc, 'set');
+      const a = makeSubLoader(makeLodData(20, 10));
+      const b = makeSubLoader(makeLodData(10, 5));
+      const c = makeSubLoader(makeLodData(4, 2));
+      b.updateViewWithResidency.mockResolvedValue({ data: makeLodData(10, 5), allResident: false });
+      const l = new LinesProgressiveLoader(
+        [a, b, c] as unknown as LinesSpatialIndexLoader[],
+        3,
+        '/l',
+        undefined,
+        sc
+      );
+      await l.updateView(viewA);
+      expect(sc.getStats().count).toBe(0);
+
+      const aborted = new AbortController();
+      aborted.abort();
+      await l.updateView(viewB, undefined, aborted.signal);
+      const key = SliceCache.makeKey('/l', buildSliceViewSig(viewA));
+      expect(sc.peek(key)?.ladderDepth).toBe(2);
+      expect(setSpy.mock.calls.find((call) => call[0] === key)?.[2]).toEqual({
+        scan: false,
+        pin: false,
+      });
+      a.updateViewWithResidency.mockClear();
+      await l.updateView(viewA);
+      expect(a.updateViewWithResidency).not.toHaveBeenCalled();
+    });
+
+    it('does not pin an outgoing prefix from an already aborted shadow update', async () => {
+      const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
+      const a = makeSubLoader(makeLodData(20, 10));
+      const b = makeSubLoader(makeLodData(10, 5));
+      b.updateViewWithResidency.mockResolvedValue({ data: makeLodData(10, 5), allResident: false });
+      const l = new LinesProgressiveLoader(
+        [a, b, makeSubLoader(makeLodData(4, 2))] as unknown as LinesSpatialIndexLoader[],
+        3,
+        '/l',
+        undefined,
+        sc
+      );
+      await l.updateView(viewA);
+      const aborted = new AbortController();
+      aborted.abort();
+      await l.updateView({ ...viewB, prefetch: true }, undefined, aborted.signal);
+      expect(sc.peek(SliceCache.makeKey('/l', buildSliceViewSig(viewA)))).toBeUndefined();
+    });
 
     it('restores a revisited view from the SliceCache without re-streaming sub-LODs', async () => {
       const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
@@ -494,23 +545,18 @@ describe('LinesProgressiveLoader', () => {
     });
 
     it('still prefetches the next level after an empty LOD 0', async () => {
-      // Budget-expiry needs a clock that MOVES: with the real one a 10ms budget
-      // never expires against these instant stubs, and playback now streams
-      // resident levels rather than stopping at level 0 (#2374). Advance on
-      // every read so the deadline is past by level 1's loop-top check.
-      let nowMs = 0;
-      const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => (nowMs += 100));
-      try {
-        // The moving clock exhausts the playback budget after LOD 0. The level
-        // that actually holds this slice's geometry is the one still to come,
-        // so skipping prefetch would leave it cold.
-        lodA.updateView.mockResolvedValue(makeLodData(0, 0));
-        await loader.updateView({ ...baseViewState, frameBudgetMs: 10 });
-        expect(loader.loadedLODCount).toBe(1);
-        expect(lodB.prefetchChunks).toHaveBeenCalled();
-      } finally {
-        nowSpy.mockRestore();
-      }
+      // A free-navigation refine pass that stops at a cold level 1 must still
+      // warm level 2: an empty LOD 0 says nothing about the later levels, which
+      // may hold this slice's geometry. (Playback passes skip the lookahead
+      // altogether — see the A4a block — so this is a budget-free pass.)
+      lodA.updateView.mockResolvedValue(makeLodData(0, 0));
+      lodB.updateViewWithResidency.mockResolvedValue({
+        data: makeLodData(10, 5),
+        allResident: false,
+      });
+      await loader.updateView(baseViewState);
+      expect(loader.loadedLODCount).toBe(2);
+      expect(lodC.prefetchChunks).toHaveBeenCalled();
     });
 
     it('walks EVERY level even when they all come back empty', async () => {
@@ -1211,6 +1257,144 @@ describe('LinesProgressiveLoader', () => {
     });
   });
 
+  describe('in-flight shadow adoption (A4b)', () => {
+    // The SlicePrefetcher's shadow pass for key K and the foreground pass for
+    // K did the same work twice (measured: 49% duplicate decodes). The shared
+    // L0 now dedups the decode, but dequant/assembly would still run twice —
+    // so a foreground pass for a key whose shadow store is in flight waits for
+    // it and restores the stored ladder instead.
+    const viewK = { ...baseViewState, slicePosition: [0, 0, 0, 3] };
+
+    function makePair() {
+      const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
+      const shadowLods = [makeLodData(10, 5), makeLodData(8, 4), makeLodData(6, 3)].map((d) =>
+        makeSubLoader(d)
+      );
+      const fgLods = [makeLodData(10, 5), makeLodData(8, 4), makeLodData(6, 3)].map((d) =>
+        makeSubLoader(d)
+      );
+      const shadow = new LinesProgressiveLoader(
+        shadowLods as unknown as LinesSpatialIndexLoader[],
+        3,
+        '/n',
+        undefined,
+        sc
+      );
+      const foreground = new LinesProgressiveLoader(
+        fgLods as unknown as LinesSpatialIndexLoader[],
+        3,
+        '/n',
+        undefined,
+        sc
+      );
+      return { sc, shadowLods, fgLods, shadow, foreground };
+    }
+
+    it('a foreground pass for a key whose shadow is in flight triggers no second assembly', async () => {
+      const { sc, shadowLods, fgLods, shadow, foreground } = makePair();
+      let releaseLevel0!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseLevel0 = resolve));
+      const inner = shadowLods[0].updateViewWithResidency.getMockImplementation() as (
+        vs: unknown,
+        s?: unknown
+      ) => Promise<unknown>;
+      shadowLods[0].updateViewWithResidency.mockReturnValueOnce(gate.then(() => inner(viewK)));
+
+      const shadowVs = { ...viewK, frameBudgetMs: 100_000, prefetch: true };
+      const release = beginShadowStore(sc, '/n', shadowVs);
+      const shadowPass = shadow.updateView(shadowVs).finally(release);
+      const fgPass = foreground.updateView({ ...viewK, frameBudgetMs: 100_000 });
+      await Promise.resolve();
+      await Promise.resolve();
+      releaseLevel0();
+      await shadowPass;
+      await fgPass;
+
+      for (const lod of fgLods) expect(lod.updateViewWithResidency).not.toHaveBeenCalled();
+      expect(foreground.loadedLODCount).toBe(3);
+    });
+
+    it('rejects promptly with an AbortError when its own update is superseded while waiting', async () => {
+      const { sc, fgLods, foreground } = makePair();
+      const shadowKeyView = { ...viewK, prefetch: true };
+      const release = beginShadowStore(sc, '/n', shadowKeyView); // never settles here
+      const update = new AbortController();
+      const fgPass = foreground.updateView(
+        { ...viewK, frameBudgetMs: 100_000 },
+        undefined,
+        update.signal
+      );
+      update.abort();
+      await expect(fgPass).rejects.toMatchObject({ name: 'AbortError' });
+      for (const lod of fgLods) expect(lod.updateViewWithResidency).not.toHaveBeenCalled();
+      release();
+    });
+
+    it('does not wait when no shadow store is in flight for the key', async () => {
+      const { fgLods, foreground } = makePair();
+      await foreground.updateView(viewK);
+      expect(fgLods[0].updateViewWithResidency).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('next-rung lookahead on playback / scrub passes (A4a)', () => {
+    // Measured on real playback: the next-rung lookahead is pure waste there
+    // (no foreground pass read a looked-ahead chunk; 92% of later-loop decodes
+    // were lookahead). A pinned or frame-budgeted pass skips it; free
+    // navigation keeps it — with an abortable, lookahead-tagged signal.
+    beforeEach(() => {
+      // Level 1 is cold, so a refine pass stops with level 2 unloaded.
+      lodB.updateViewWithResidency.mockResolvedValue({
+        data: makeLodData(10, 5),
+        allResident: false,
+      });
+    });
+
+    it('a frame-budgeted (playback) pass does not call lodLoaders[n].prefetchChunks', async () => {
+      let nowMs = 0;
+      const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => (nowMs += 100));
+      try {
+        await loader.updateView({ ...baseViewState, frameBudgetMs: 10 });
+        expect(loader.loadedLODCount).toBeLessThan(3);
+        await Promise.resolve();
+        for (const lod of [lodA, lodB, lodC]) expect(lod.prefetchChunks).not.toHaveBeenCalled();
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('a pinned (ladderDepth) scrub pass does not call lodLoaders[n].prefetchChunks', async () => {
+      await loader.updateView({ ...baseViewState, ladderDepth: 1 });
+      expect(loader.loadedLODCount).toBe(1);
+      await Promise.resolve();
+      for (const lod of [lodA, lodB, lodC]) expect(lod.prefetchChunks).not.toHaveBeenCalled();
+    });
+
+    it('a normal (free-navigation) pass still prefetches the next rung, with an abort signal', async () => {
+      await loader.updateView(baseViewState);
+      expect(loader.loadedLODCount).toBe(2);
+      expect(lodC.prefetchChunks).toHaveBeenCalledWith(baseViewState, expect.any(AbortSignal));
+    });
+
+    it('aborts the lookahead signal when the update signal aborts or the view changes', async () => {
+      await loader.updateView(baseViewState);
+      const first = lodC.prefetchChunks.mock.calls[0][1] as AbortSignal;
+      expect(first.aborted).toBe(false);
+      const update = new AbortController();
+      await loader.updateView(
+        { ...baseViewState, slicePosition: [0, 0, 0, 1] },
+        undefined,
+        update.signal
+      );
+      expect(first.aborted).toBe(true); // view change cancels the old lookahead
+
+      const second = lodC.prefetchChunks.mock.calls[1][1] as AbortSignal;
+      expect(second.aborted).toBe(false);
+      update.abort();
+      expect(second.aborted).toBe(true); // the update's own signal cancels it too
+    });
+  });
+
   describe('prefetch scheduling', () => {
     it('fires prefetchChunks on the next unloaded LOD after a partial load', async () => {
       let now = 0;
@@ -1227,7 +1411,7 @@ describe('LinesProgressiveLoader', () => {
       await loader.loadLines(baseViewState);
       await Promise.resolve();
 
-      expect(lodC.prefetchChunks).toHaveBeenCalledWith(baseViewState);
+      expect(lodC.prefetchChunks).toHaveBeenCalledWith(baseViewState, expect.any(AbortSignal));
       spy.mockRestore();
     });
 
@@ -1887,5 +2071,78 @@ describe('LinesProgressiveLoader — vertexRangeBounds are never published (issu
     const result = await loader.loadLines(baseViewState);
     expect(result.vertexCount).toBe(30);
     expect(result.vertexRangeBounds).toBeUndefined();
+  });
+});
+
+describe('LinesProgressiveLoader — no pin after the shadow pass is torn down', () => {
+  // A shadow (prefetch) pass's pinned store must not land after its abort or
+  // the loader's dispose: releaseShadows() has already unpinned its keys, so a
+  // late pin would outlive playback and never be released.
+  const shadowView: LinesViewState = { ...baseViewState, frameBudgetMs: 100_000, prefetch: true };
+
+  function gatedPair(): {
+    loader: LinesProgressiveLoader;
+    sc: SliceCache;
+    release: () => void;
+    entered: Promise<void>;
+  } {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let enter!: () => void;
+    const entered = new Promise<void>((r) => {
+      enter = r;
+    });
+    const first = makeSubLoader(makeLodData(20, 10, 3, { color: 'uint8' }));
+    const last = makeSubLoader(makeLodData(10, 5, 3, { color: 'uint8' }));
+    const data = makeLodData(10, 5, 3, { color: 'uint8' });
+    last.updateViewWithResidency = vi.fn(async () => {
+      enter();
+      await gate; // hold the LAST level in flight
+      return { data, allResident: true };
+    });
+    const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
+    const loader = new LinesProgressiveLoader(
+      [first, last] as unknown as LinesSpatialIndexLoader[],
+      2,
+      '/shadow-teardown',
+      undefined,
+      sc
+    );
+    return { loader, sc, release, entered };
+  }
+
+  function pinnedStores(sc: SliceCache, run: () => Promise<void>): Promise<number> {
+    const setSpy = vi.spyOn(sc, 'set');
+    return run().then(
+      () =>
+        setSpy.mock.calls.filter((call) => (call[2] as { pin?: boolean } | undefined)?.pin).length
+    );
+  }
+
+  it('stores no pin when the last level resolves after the abort', async () => {
+    const { loader, sc, release, entered } = gatedPair();
+    const controller = new AbortController();
+    const pins = await pinnedStores(sc, async () => {
+      const pending = loader.updateView(shadowView, undefined, controller.signal);
+      await entered;
+      controller.abort(); // releaseShadows() aborts the pass (and unpins)
+      release(); // ...but the level was already past its own abort checks
+      await pending;
+    });
+    expect(pins).toBe(0);
+  });
+
+  it('stores no pin when the loader is disposed during the last level', async () => {
+    const { loader, sc, release, entered } = gatedPair();
+    const pins = await pinnedStores(sc, async () => {
+      const pending = loader.updateView(shadowView);
+      await entered;
+      loader.dispose();
+      release();
+      await pending;
+    });
+    expect(pins).toBe(0);
   });
 });

@@ -1,9 +1,8 @@
 /**
  * Worker dispatch perf counters (`worker.dispatches`, `worker.busyMs`,
  * `worker.misroutes`): the pure {@link DispatchTracker}, plus one WorkerPool
- * integration case showing the misroute the counter exists to expose — a
- * caller abort settles `activeQueries` while the worker is still busy, so the
- * least-busy picker re-selects it although another worker is idle.
+ * integration case showing that a caller abort keeps `activeQueries` busy
+ * until the worker settles, avoiding a misroute to that worker.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -105,7 +104,7 @@ describe('WorkerPool dispatch counters', () => {
     vi.restoreAllMocks();
   });
 
-  it('counts a misroute when a caller abort frees activeQueries but not the worker', async () => {
+  it('no misroute after a caller abort: the slot stays busy until the worker settles (B7)', async () => {
     const a = makeInstance('A');
     const b = makeInstance('B');
     const pool = new WorkerPool() as unknown as Record<string, unknown>;
@@ -119,15 +118,17 @@ describe('WorkerPool dispatch counters', () => {
     await flush();
     controller.abort();
     await expect(first).rejects.toBeInstanceOf(WorkerAbortError);
-    expect(a.activeQueries).toBe(0); // caller-side accounting released
+    // Before B7 the caller-side race released this slot while A still ran the
+    // abandoned task, so the next dispatch tied at A and was counted a misroute.
+    expect(a.activeQueries).toBe(1);
 
-    // Selection still ties at A (index 0) although A's task is running.
     const second = typed.runWithTimeout('op', 'decode', () => Promise.resolve('ok'));
     await expect(second).resolves.toBe('ok');
     expect(perfCounters.get('worker.dispatches')).toBe(2);
-    expect(perfCounters.get('worker.misroutes')).toBe(1);
+    expect(perfCounters.get('worker.misroutes')).toBe(0);
 
     stuck.resolve('late');
     await flush();
+    expect(a.activeQueries).toBe(0);
   });
 });

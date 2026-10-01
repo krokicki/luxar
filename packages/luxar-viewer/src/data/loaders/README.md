@@ -367,9 +367,13 @@ narrowly-scoped helpers each spatial-index loader composes:
   duplicate-free and the strict-ascent guard would fail it closed.
 - **`spatial-query/prefetch-ranges.ts`** — `prefetchRangesIntoCache(arrays, ranges)`:
   shared cache-warming read for the three loaders' `prefetchChunks`.
-  Fires a `readArray()` per (array × range), assembling and discarding each
-  output selection. Deliberately separate from `RangeLoader.loadDirectTyped`:
-  it warms future frames without using the active demand update's abort signal.
+  Computes the distinct chunk coordinates each array's ranges touch and warms
+  each once via the L0 proxy's `warmChunk` (fetch + decode into L0; no zarr
+  `get()`, so no output selection is assembled). Deliberately separate from
+  `RangeLoader.loadDirectTyped` — prefetch warms future frames, so it never
+  reads the demand load's per-update abort signal nor records into its
+  residency probe; it takes its own optional signal and counts its decodes as
+  `decode.count.prefetch`.
 - **`extend-to-all-preflight.ts`** — `warnExtendToAllNoDimensions` (warns when
   `extend_to_all` is set but the view state has no resolved dimensions) +
   `announceExtendToAllOnce` (one-shot BROADCAST emoji log on first load).
@@ -385,11 +389,17 @@ narrowly-scoped helpers each spatial-index loader composes:
   offsets and exact byte range, retains open array handles per node, and keeps
   decoded labels in a shared bounded LRU.
 - **`environment/environment-loader.ts`** — `loadBakedEnvironment(rootLoc,
-rootContentHash)`: reads the root-level `environment/` sidecar group a
+rootContentHash, storeKey?, indexFresh?)`: reads the root-level `environment/` sidecar group a
   `luxar env bake` left (six half-float cube faces as `uint16` bits, named by
   digest) and hands it to the scene environment; a missing group is silent, a
   stale one (its `scene_content_hash` is not the root's) or a malformed one is
-  ignored with a warning rather than failing the load.
+  ignored with a warning rather than failing the load. When the root index came
+  from the network this load (`indexFresh`) it decides presence (`luxar env
+attach` re-consolidates), so a scene without the sidecar costs NO request. An
+  index served from the L2 cache may predate an attach (attach keeps
+  `content_hash`, the only thing L2 revalidates by), so that case — like an
+  index-less store — is probed once and a not-found is remembered per `storeKey`
+  for the session.
 - **`overlays/overlay-loader.ts`** — `loadOverlayConfigs(store, rootLoc)`:
   enumerates the `overlays/` group and parses each child's `.zattrs` into an
   `OverlayConfig` (text / image / html, with per-type fields). Results are
@@ -490,7 +500,9 @@ src/data/loaders/
 │
 ├── progressive/                  # Shared helpers for additive-LOD progressive loaders
 │   ├── concat-helpers.ts         # Generic typed-array field concatenation across LOD parts
-│   ├── slice-cache-helper.ts     # Shared SliceCache key/snapshot/lookup helpers (S-cache)
+│   ├── lookahead-signal.ts       # 'lookahead'-tagged next-rung prefetch controller
+│   ├── slice-cache-helper.ts     # Shared SliceCache key/snapshot/lookup helpers (S-cache) +
+│   │                             # in-flight shadow-store handoff
 │   └── constants.ts              # CACHE_HIT_THRESHOLD_MS — shared streaming threshold
 │
 ├── environment/                  # Baked scene-environment loader
