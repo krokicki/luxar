@@ -93,6 +93,18 @@ def _resolve_lines_representation(kwargs: dict) -> tuple[str, Union[str, float],
                 "it controls Gaussian refinement, and same-type line "
                 "levels contain no Gaussians"
             ),
+            **{
+                key: (
+                    "it controls Gaussian partitioning, while same-type line "
+                    "levels use a separate sampler or merger"
+                )
+                for key in (
+                    "lloyd_iterations",
+                    "candidate_bins_k",
+                    "coverage_inflation",
+                    "color_weight",
+                )
+            },
         },
     )
 

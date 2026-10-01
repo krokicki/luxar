@@ -1154,6 +1154,34 @@ def resolve_coarsen_dims(
     return _finalize(idxs)
 
 
+def _gaussian_int_control(name: str, value: Any, *, minimum: int) -> int:
+    """Parse an integral Gaussian reduction control before lifting source data."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{name} must be an integer >= {minimum}, got {value!r}"
+        ) from exc
+    if (not isinstance(value, str) and value != parsed) or parsed < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    return parsed
+
+
+def _gaussian_float_control(name: str, value: Any, *, minimum: float) -> float:
+    """Parse a finite Gaussian reduction control before lifting source data."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{name} must be finite and >= {minimum:g}, got {value!r}"
+        ) from exc
+    if not math.isfinite(parsed) or parsed < minimum:
+        raise ValueError(f"{name} must be finite and >= {minimum:g}, got {value!r}")
+    return parsed
+
+
 def _resolve_lift_refine_controls(
     kwargs: Dict[str, Any], geometry: str
 ) -> tuple[str, Optional[int]]:
@@ -1206,8 +1234,10 @@ def resolve_substitutive_axis(
       ``max_aspect`` (per-splat anisotropy cap on the coarse levels, default 3.0;
       ``None`` disables — see :func:`luxar.gsplats.lift._cap_aspect`), and
       ``quality_stamps`` (measure per-level mixture quality, default ``True``),
-      ``refine`` (``"none"`` or volume-free ``"l2"``), and
-      ``refine_iters`` (positive integer Adam steps for ``"l2"``).
+      ``lloyd_iterations``, ``candidate_bins_k``, ``coverage_inflation``, and
+      ``color_weight`` (lifted-Gaussian reduction controls), ``refine``
+      (``"none"`` or volume-free ``"l2"``), and ``refine_iters`` (positive
+      integer Adam steps for ``"l2"``).
       Unrecognized keys raise. LOD switch thresholds are otherwise auto-derived by
       :func:`derive_coverage_fractions` (screen-occupancy halving, re-anchored at
       fills-screen when the insertion point is partition-bound) — no method
@@ -1301,6 +1331,18 @@ def resolve_substitutive_axis(
             )
 
     quality_stamps = _resolve_quality_stamps(kwargs)
+    lloyd_iterations = _gaussian_int_control(
+        "lloyd_iterations", kwargs.pop("lloyd_iterations", 5), minimum=0
+    )
+    candidate_bins_k = _gaussian_int_control(
+        "candidate_bins_k", kwargs.pop("candidate_bins_k", 12), minimum=1
+    )
+    coverage_inflation = _gaussian_float_control(
+        "coverage_inflation", kwargs.pop("coverage_inflation", 3.0), minimum=1.0
+    )
+    color_weight = _gaussian_float_control(
+        "color_weight", kwargs.pop("color_weight", 0.0), minimum=0.0
+    )
 
     refine, refine_iters = _resolve_lift_refine_controls(kwargs, geometry)
 
@@ -1316,6 +1358,10 @@ def resolve_substitutive_axis(
             "coarsen_dims",
             "max_aspect",
             "quality_stamps",
+            "lloyd_iterations",
+            "candidate_bins_k",
+            "coverage_inflation",
+            "color_weight",
             "refine",
             "refine_iters",
             *extra_valid_keys,
@@ -1336,6 +1382,10 @@ def resolve_substitutive_axis(
         "coarsen_dims": coarsen_dims,
         "max_aspect": max_aspect,
         "quality_stamps": quality_stamps,
+        "lloyd_iterations": lloyd_iterations,
+        "candidate_bins_k": candidate_bins_k,
+        "coverage_inflation": coverage_inflation,
+        "color_weight": color_weight,
         "refine": refine,
         "refine_iters": refine_iters,
     }

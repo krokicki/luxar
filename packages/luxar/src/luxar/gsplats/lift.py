@@ -1068,6 +1068,10 @@ def coarse_substitutive_levels(
     coarsen_dims: Optional[Sequence[int]] = None,
     max_aspect: Optional[float] = 3.0,
     quality_stamps: bool = True,
+    lloyd_iterations: int = 5,
+    candidate_bins_k: int = 12,
+    coverage_inflation: float = 3.0,
+    color_weight: float = 0.0,
     refine: str = "none",
     refine_iters: Optional[int] = None,
 ) -> "List[GSplatData]":
@@ -1113,6 +1117,10 @@ def coarse_substitutive_levels(
         seed=seed,
         coarsen_dims=coarsen_dims,
         amplitude="mass",
+        lloyd_iterations=lloyd_iterations,
+        candidate_bins_k=candidate_bins_k,
+        coverage_inflation=coverage_inflation,
+        color_weight=color_weight,
         refine=cast(Any, refine),
         refine_iters=refine_iters,
     )

@@ -223,6 +223,14 @@ iteration count requires `refine="l2"`, while omission uses the reducer default)
 `[0, MAX_COVERAGE_FRACTION]` = `[0, 4]`), `coarsen_dims`, `max_aspect`
 (per-splat anisotropy cap on the
 coarse levels, default 3.0; `None` disables)).
+The lifted-Gaussian path also accepts `lloyd_iterations` (default 5),
+`candidate_bins_k` (12), `coverage_inflation` (3.0), and `color_weight` (0.0),
+with the same reduction behavior as `make_substitutive_lod`. Values are validated
+before the lift. These controls are refused with `coarse="points"`, which uses a
+different reducer.
+`lloyd_iterations` and `candidate_bins_k` apply only when `method` resolves to
+`kmeans_lloyd` or `greedy_lloyd`; `auto` uses `greedy` for small inputs.
+
 `refine="volume"` is unavailable because Points have no source volume;
 `coarse="points"` has no Gaussian levels to refine. `conserve_mass` is not a
 lifted-path option: the reducer uses per-bin mass-preserving amplitudes, and
@@ -394,6 +402,10 @@ resolver — a thin wrapper over the shared
 `group.resolve_substitutive_axis(spec, "Lines")` (one body, shared with Points,
 so the two can't drift). `add_lines_substitutive_lod_wrapper_impl`
 (`adders/lines.py`) then:
+
+The lifted-Gaussian path accepts the same `lloyd_iterations`,
+`candidate_bins_k`, `coverage_inflation`, and `color_weight` controls as Points.
+They are refused with `coarse="lines"`.
 
 1. **Lifts** each segment to a string of isotropic **bead** Gaussians
    (`gsplats.lift.lift_lines_to_gsplats`): beads spaced `σ_perp = 2w/T` along the
