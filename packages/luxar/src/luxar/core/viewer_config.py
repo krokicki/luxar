@@ -1290,6 +1290,11 @@ class ViewerConfig:
     # proves otherwise; those are where the cap earns its keep.
     allow_high_dpr: Optional[bool] = None
 
+    # Whether the projected-density guard may thin node draws that pack more
+    # elements per pixel than the screen can show (the viewer's Performance
+    # popover toggle). Unset leaves the viewer default (on).
+    density_guard_enabled: Optional[bool] = None
+
     # UI panel visibility
     ui: Optional[UIConfig] = None
 
@@ -1459,6 +1464,7 @@ class ViewerConfig:
         "dynamic_clipping_enabled",
         "adaptive_dpr_enabled",
         "allow_high_dpr",
+        "density_guard_enabled",
         "theme",
     ]
 
