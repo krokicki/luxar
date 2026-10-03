@@ -149,6 +149,7 @@ import { log, Modules } from '../../utils/log';
 import { markSceneResourcesDirtyForContextRestore } from '../../scene/scene-manager/render-pipeline/webgl-context-recovery';
 import { configureRendererBackend } from '../../scene/scene-manager/render-pipeline/renderer-setup';
 import type { Renderer } from '../../rendering/renderer-capabilities';
+import { detachSceneGraphIndex } from '../../utils/scene-graph-index';
 import type { LoaderConfig } from '../../data/data-loader-types';
 import type { EmbedderDimensions } from '../app/embedder/events';
 
@@ -192,7 +193,10 @@ export interface LuxarLayerOptions {
    * Session-wide GPU geometry budget in bytes. `null` auto-sizes from device
    * memory, measured heap, and device class; `0` disables byte-budget eviction,
    * and a positive value pins the budget. Defaults to
-   * `config.dataLoading.performance.gpuPoolMaxBytes`.
+   * `config.dataLoading.performance.gpuPoolMaxBytes`. Page-wide: the first
+   * Luxar host to configure it wins (a later value is ignored with a warning),
+   * and each host evicts against it separately (see the README's multi-host
+   * notes).
    */
   gpuPoolMaxBytes?: number | null;
   /** Override for bundlers that can't resolve `import.meta.url` asset URLs. */
@@ -217,7 +221,12 @@ export interface LuxarLayerOptions {
    * it. Default true (and only while `config.densityGuard.enabled`).
    */
   densityGuard?: boolean;
-  /** Worker-based back-to-front sorting for order-dependent geometry. Default true. */
+  /**
+   * Worker-based back-to-front sorting for order-dependent geometry. Default
+   * true. `false` also skips the per-frame cross-node order pass (authored
+   * cross-layer bands, physical glass drawn first), which needs the
+   * coordinator's camera: the layer's nodes draw in plain three.js order.
+   */
   depthSort?: boolean;
   /**
    * `renderOrder` stamped onto every Group in the layer subtree. Three.js uses
@@ -358,9 +367,6 @@ export class LuxarLayer {
     this.options = options;
 
     applyModuleOverrides({ wasmPath: options.wasmPath, workerPath: options.workerPath });
-    retainWorkerPool(this);
-    registerBlendWarmupManager(this.blendWarmup);
-    warnIfSceneShared(options.scene, this, options.renderOrder ?? DEFAULT_RENDER_ORDER);
     initializeGpuByteBudget(options.gpuPoolMaxBytes);
 
     // Materials must know the renderer's capabilities BEFORE any node is
@@ -387,6 +393,13 @@ export class LuxarLayer {
     // The layer's loaders' commits report to the layer's coordinator.
     this.sceneLoaders.setDepthSortCoordinator(this.depthSort);
     this.installDepthSort();
+    // The page-wide holds come LAST, once nothing above can throw: a
+    // constructor that throws returns no layer to dispose(), so a hold taken
+    // earlier (the worker-pool lease, the blend warm-up registration, the
+    // shared-scene count) would leak for the life of the page.
+    retainWorkerPool(this);
+    registerBlendWarmupManager(this.blendWarmup);
+    warnIfSceneShared(options.scene, this, options.renderOrder ?? DEFAULT_RENDER_ORDER);
   }
 
   /** The loaded scene root, or null before {@link load} resolves. */
@@ -887,6 +900,9 @@ export class LuxarLayer {
   }
 
   private detachRoot(root: THREE.Group): void {
+    // The loader's path index (every member node holds its add/remove
+    // listeners) — the same release `SceneManager.clearSceneContent` does.
+    detachSceneGraphIndex(root);
     root.traverse((object) => {
       if (!(object instanceof THREE.Mesh)) return;
       releaseDepthSortNode(object);

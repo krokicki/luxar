@@ -1347,10 +1347,87 @@ describe('LuxarApp', () => {
 
       app.dispose();
       expect(() => app.switchDataset('http://example.com/retry.zarr')).toThrow(/before init/);
+      mockAddEventListener.mockClear();
 
       releaseInitialLoad();
       await initPromise;
+
+      // The init that the dispose overtook must not finish wiring a disposed
+      // app: no listeners installed after teardown, still uninitialized, and
+      // the instance can be initialized again.
+      expect(app.initialized).toBe(false);
+      expect(mockAddEventListener.mock.calls.map((call) => call[0])).toEqual([]);
+      await app.init({ canvas: mockCanvas, src: 'http://example.com/data.zarr' });
+      expect(app.initialized).toBe(true);
       app.dispose();
+    });
+
+    it('does not load the dataset when disposed during the routing probe', async () => {
+      // A URL without a `.zarr` suffix is probed for zarr metadata before
+      // routing; a dispose that lands during that probe must win.
+      let releaseProbe!: () => void;
+      mockFetch.mockImplementation(
+        () => new Promise((resolve) => (releaseProbe = () => resolve({ ok: true })))
+      );
+
+      const initPromise = app.init({ canvas: mockCanvas, src: 'http://example.com/data' });
+      await vi.waitFor(() => expect(mockFetch).toHaveBeenCalled());
+
+      app.dispose();
+      releaseProbe();
+      await initPromise;
+
+      expect(mockSceneManager.loadSceneData).not.toHaveBeenCalled();
+      expect(app.initialized).toBe(false);
+    });
+
+    it('releases a scene manager created by an init pipeline overtaken by dispose', async () => {
+      let releaseSceneInit!: () => void;
+      mockSceneManager.init.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (releaseSceneInit = resolve))
+      );
+
+      const initPromise = app.init({ canvas: mockCanvas, src: 'http://example.com/data.zarr' });
+      expect(mockSceneManager.init).toHaveBeenCalledTimes(1);
+      app.dispose();
+      mockAddEventListener.mockClear();
+
+      releaseSceneInit();
+      await initPromise;
+
+      expect(mockSceneManager.dispose).toHaveBeenCalledTimes(1);
+      expect(mockAnimationController.dispose).toHaveBeenCalledTimes(1);
+      expect(mockAddEventListener.mock.calls.map((call) => call[0])).toEqual([
+        'luxar-layers-changed',
+        'luxar-layers-changed',
+      ]);
+      for (const [event, listener] of mockAddEventListener.mock.calls) {
+        expect(mockRemoveEventListener).toHaveBeenCalledWith(event, listener);
+      }
+      expect(mockSceneManager.loadSceneData).not.toHaveBeenCalled();
+      expect(app.initialized).toBe(false);
+    });
+
+    it('does not route a prior init after dispose and re-init', async () => {
+      const probes = new Map<string, (value: { ok: boolean }) => void>();
+      mockFetch.mockImplementation(
+        (url: string) => new Promise((resolve) => probes.set(url, resolve))
+      );
+
+      const first = app.init({ canvas: mockCanvas, src: 'http://example.com/AAA' });
+      await vi.waitFor(() => expect(probes.has('http://example.com/AAA/.zgroup')).toBe(true));
+      app.dispose();
+      const second = app.init({ canvas: mockCanvas, src: 'http://example.com/BBB' });
+      probes.get('http://example.com/AAA/.zgroup')?.({ ok: true });
+      await vi.waitFor(() => expect(probes.has('http://example.com/BBB/.zgroup')).toBe(true));
+      for (const [url, resolve] of probes) {
+        if (url.includes('BBB')) resolve({ ok: true });
+      }
+      await Promise.all([first, second]);
+
+      expect(mockSceneManager.loadSceneData).toHaveBeenCalledTimes(1);
+      expect(mockSceneManager.loadSceneData.mock.calls[0]?.[0]).toBe('http://example.com/BBB');
+      expect(app.initialized).toBe(true);
     });
 
     it('does not call history.replaceState when updateBrowserUrl is false', async () => {
@@ -1937,6 +2014,28 @@ describe('LuxarApp', () => {
       );
       expect(additions).toHaveLength(1);
       expect(removals).toEqual([['webglcontextlost', additions[0][1]]]);
+    });
+
+    it('a superseded load never writes its viewer config into a newer session', async () => {
+      // dispose() + init() while a switch is still loading: the old load's
+      // config pass must land in ITS (disposed) session, not the new one.
+      await app.init({ canvas: mockCanvas, src: '' });
+      let releaseOld!: () => void;
+      mockSceneManager.loadSceneData.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (releaseOld = resolve))
+      );
+      const oldSwitch = app.switchDataset('http://example.com/old.zarr');
+      await vi.waitFor(() => expect(mockSceneManager.loadSceneData).toHaveBeenCalledTimes(1));
+      app.dispose();
+
+      await app.init({ canvas: mockCanvas, src: SRC });
+      mockSceneManager.getSceneViewerConfig.mockReturnValue({
+        control_panel: { title: 'Old scene', columns: 2 },
+      });
+      releaseOld();
+      await oldSwitch;
+
+      expect(app.getViewerState().controlPanel).toBeNull();
     });
 
     it('keeps authored scene overlays visible in kiosk mode', async () => {

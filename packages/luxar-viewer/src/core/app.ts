@@ -142,6 +142,10 @@ export class LuxarApp {
    * components (potentially double-freeing GPU resources). Reset by `init()`.
    */
   private isDisposed = false;
+  /** Invalidates work from an earlier init after dispose or re-init. */
+  private initGeneration = 0;
+  /** A new init waits until an overtaken init has released its partial pipeline. */
+  private pendingInit: Promise<void> | null = null;
   /**
    * App-level event listeners (beforeunload, focus, visibilitychange,
    * luxar-open-dataset-browser, plus the picking system's mousemove + control
@@ -234,7 +238,12 @@ export class LuxarApp {
    * @see {@link SceneManager} for rendering pipeline setup
    * @see README.md - initialization sequence section for detailed init flow
    */
-  async init(options: LuxarAppOptions): Promise<void> {
+  init(options: LuxarAppOptions): Promise<void> {
+    const pending = this.pendingInit;
+    return pending ? pending.then(() => this.init(options)) : this.startInit(options);
+  }
+
+  private async startInit(options: LuxarAppOptions): Promise<void> {
     if (this.isInitialized) {
       throw new Error('LuxarApp is already initialized. Call dispose() before initializing again.');
     }
@@ -291,6 +300,10 @@ export class LuxarApp {
     };
 
     this.isInitializing = true;
+    const generation = ++this.initGeneration;
+    let finishInit!: () => void;
+    const completion = new Promise<void>((resolve) => (finishInit = resolve));
+    this.pendingInit = completion;
     try {
       const result = await runInitPipeline(
         {
@@ -307,6 +320,12 @@ export class LuxarApp {
       );
 
       assignFromPartial();
+      if (this.isTornDown(generation)) {
+        // dispose() ran while the pipeline was awaiting scene-manager setup.
+        // Its first pass could not see the components accumulated in partial.
+        this.disposePartialInit();
+        return;
+      }
 
       // The layers panel edits a mesh's pick coverage (opacity/cutoff/blending)
       // with a stationary camera, which nothing else invalidates — give it a
@@ -326,19 +345,11 @@ export class LuxarApp {
       // The control client eagerly attaches the selection / element event
       // consumers that picking checks once, during dataset provisioning.
       this.installControlClient();
-      if (await this.shouldShowBrowser(result.sceneSrc)) {
-        try {
-          this.showDatasetBrowser();
-        } catch (error) {
-          log.warning(
-            Modules.APP,
-            'Dataset browser initialization had issues, but browser is shown:',
-            error
-          );
-        }
-      } else {
-        await this.loadInitialDataset(result.sceneSrc);
-      }
+      await this.routeInitialDataset(result.sceneSrc, generation);
+      // A dispose() that landed while routing awaited has already torn the app
+      // down: wiring the app-level hooks below would leak them onto a disposed
+      // instance and mark it initialized.
+      if (this.isTornDown(generation)) return;
 
       this.setupDisposeOnUnload();
       this.setupFocusHandling();
@@ -362,10 +373,40 @@ export class LuxarApp {
       // top-level error UI; any in-progress error UI from sub-loaders
       // is wiped along with everything else.
       assignFromPartial();
-      this.dispose();
+      this.disposePartialInit();
       throw error;
     } finally {
       this.isInitializing = false;
+      this.pendingInit = null;
+      finishInit();
+    }
+  }
+
+  private disposePartialInit(): void {
+    // A prior dispose may have run before the pipeline published its components.
+    this.isDisposed = false;
+    this.dispose();
+  }
+
+  /**
+   * Open the dataset browser, or load the initial dataset. A dispose() that
+   * lands during the zarr probe wins: nothing is loaded into a disposed app.
+   */
+  private async routeInitialDataset(src: string, generation: number): Promise<void> {
+    const showBrowser = await this.shouldShowBrowser(src);
+    if (this.isTornDown(generation)) return;
+    if (!showBrowser) {
+      await this.loadInitialDataset(src);
+      return;
+    }
+    try {
+      this.showDatasetBrowser();
+    } catch (error) {
+      log.warning(
+        Modules.APP,
+        'Dataset browser initialization had issues, but browser is shown:',
+        error
+      );
     }
   }
 
@@ -450,7 +491,9 @@ export class LuxarApp {
         initColormapLegend: () => this.initColormapLegend(),
         initOverlays: () => this.initOverlays(),
         initPicking: () => this.initPicking(),
-        applyViewerConfigState: (config) => this.applyViewerConfigState(config),
+        // THIS load's session: a load superseded mid-flight must never write
+        // its scene's waypoints / kiosk / control panel into a newer session.
+        applyViewerConfigState: (config) => this.applyViewerConfigState(config, session),
         openCacheStatsView: () => this.openCacheStatsView(),
       });
       session.markLoaded(getSceneLoader());
@@ -546,19 +589,22 @@ export class LuxarApp {
    * Only explicitly set fields (not undefined) are applied — unset fields
    * preserve the viewer's built-in defaults.
    */
-  private applyViewerConfigState(viewerConfig: ZarrViewerConfig | undefined): void {
+  private applyViewerConfigState(
+    viewerConfig: ZarrViewerConfig | undefined,
+    session: DatasetSession = this.session
+  ): void {
     this.applyViewerConfigStateCore(viewerConfig);
     // AFTER the core pass: `dimensions.current_step` has been applied, so the
     // load-time match sees the authored opening position and snaps to it.
-    this.installWaypoints(viewerConfig?.waypoints);
+    this.installWaypoints(viewerConfig?.waypoints, session);
     // AFTER the waypoints: the opening slice is final, so the first slab
     // evaluation starts exactly the sounds the opening story owns.
-    this.installAudio(viewerConfig?.audio);
+    this.installAudio(viewerConfig?.audio, session);
     // Kept rather than applied: nothing in THIS page reads it. The control
     // panel is a separate page and asks for it over the wire, so the display's
     // only job is to remember what the store said.
-    this.session.controlPanelConfig = extractControlPanelConfig(viewerConfig?.control_panel);
-    this.applyKiosk(viewerConfig);
+    session.controlPanelConfig = extractControlPanelConfig(viewerConfig?.control_panel);
+    this.applyKiosk(viewerConfig, session);
   }
 
   /**
@@ -567,12 +613,15 @@ export class LuxarApp {
    * session owns the watchdog, so switching scenes cannot accumulate listeners
    * on a long-running exhibit.
    */
-  private applyKiosk(viewerConfig: ZarrViewerConfig | undefined): void {
+  private applyKiosk(
+    viewerConfig: ZarrViewerConfig | undefined,
+    session: DatasetSession = this.session
+  ): void {
     // `this.options?` because this runs inside the viewer-config pass, which a
     // partially-constructed app can reach before its options are set — and a
     // missing option means "no ?kiosk", not a crash that aborts the rest of the
     // load (theme, dimension state, the render loop after it).
-    this.session.setKioskTeardown(
+    session.setKioskTeardown(
       applySceneKiosk(viewerConfig?.ui?.kiosk, this.options?.kiosk === true, () => ({
         setKeyboardEnabled: (enabled) => this.inputHandler.setEnabled(enabled),
         setControlsEnabled: (enabled) => this.sceneManager.controls?.setEnabled(enabled),
@@ -587,9 +636,9 @@ export class LuxarApp {
   }
 
   /** Bind the sound layer to the loaded scene (`viewer-config/install-audio.ts`). */
-  private installAudio(audio: unknown): void {
+  private installAudio(audio: unknown, session: DatasetSession = this.session): void {
     if (!this.audioEngine) return;
-    const driver = this.session.waypointDriver;
+    const driver = session.waypointDriver;
     installSceneAudio(audio, {
       audioEngine: this.audioEngine,
       sceneRoot: this.sceneManager.scene?.children?.find((c) => c.name === 'LuxarScene'),
@@ -602,9 +651,12 @@ export class LuxarApp {
    * Bind the scene's authored story waypoints (`camera/install-waypoints.ts`);
    * the session owns the binding.
    */
-  private installWaypoints(waypoints: ZarrWaypoint[] | undefined): void {
-    this.session.setWaypoints(null);
-    this.session.setWaypoints(
+  private installWaypoints(
+    waypoints: ZarrWaypoint[] | undefined,
+    session: DatasetSession = this.session
+  ): void {
+    session.setWaypoints(null);
+    session.setWaypoints(
       installStoryWaypoints(waypoints, {
         sceneManager: this.sceneManager,
         getCameraFlight: () => this.cameraFlight,
@@ -1412,6 +1464,7 @@ export class LuxarApp {
     // we are already tearing down, do nothing.
     if (this.isDisposing) return;
     this.isDisposing = true;
+    this.initGeneration++;
 
     // Flip initialized at entry so any concurrent observer of `app.initialized`
     // sees the correct state from the first instant of teardown, even if
@@ -1490,6 +1543,11 @@ export class LuxarApp {
 
     this.isDisposing = false;
     this.isDisposed = true;
+  }
+
+  /** True once {@link dispose} has started — an awaiting init() must bail. */
+  private isTornDown(generation: number): boolean {
+    return this.isDisposing || this.isDisposed || generation !== this.initGeneration;
   }
 
   /** Register cleanup owned by this app's current lifetime. */

@@ -124,11 +124,11 @@ The subfolders:
   entire retry call so retry-from-inside-retry cannot deadlock and a
   slider event mid-retry is queued in the pending slot instead of
   racing into a concurrent `updateView`.
-- **Dataset abort is wired into the worker pool.** A loader loads one
-  dataset (a second `loadScene` throws). `lifecycle/dispose.ts` aborts its
-  dataset signal so in-flight `runWithTimeout` callers settle immediately,
-  then clears the pool's signal so the next loader's workers see no signal
-  until its `lifecycle/load-scene.ts` installs the new one.
+- **Dataset abort belongs to each loader.** A loader loads one dataset
+  (a second `loadScene` throws). The shared worker pool holds no dataset
+  signal; each loader passes its own to worker calls. On dispose,
+  `lifecycle/dispose.ts` aborts that signal so its in-flight
+  `runWithTimeout` callers settle immediately without aborting other loaders.
 - **Best-effort prefetch.** Predictive prefetch errors are swallowed
   (`view-state/predicted-view-state.ts`, `view-state/view-state-queue.ts`)
   — a failed prefetch must never block the next demand fetch or
@@ -150,5 +150,5 @@ The subfolders:
   (used by `view-state/derive-node-view-state.ts`).
 - `../view-state-manager.ts` — dimension validation invoked by
   `nodes/initialize-scene-dimensions.ts`.
-- `../../workers/worker-pool.ts` — `setAbortSignal` consumed by
-  `lifecycle/load-scene.ts` and `lifecycle/dispose.ts`.
+- `../../workers/worker-pool.ts` — `runWithTimeout`, which the projection
+  helpers call under the loader's dataset signal (`withDatasetSignal`).
