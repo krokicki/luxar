@@ -1498,9 +1498,11 @@ chunk_packs/                        # a SIDECAR: no `type`, no `kind` attr
 A pack file is a 4-byte little-endian header length, a UTF-8 JSON header
 `{"members": {"additive_0/centers/c/0": [offset, length], …}}` (chunk keys
 relative to `prefix`, offsets into the data after the header), then the chunk
-bytes back to back. Every chunk object the node stores is a member, so the
-index needs no member list; it stays ~150 B per pack because it rides in the
-root's consolidated metadata, which every load fetches first. (A first design
+bytes back to back. Every chunk object the node stores is a member, except a
+broadcast array's row, which the viewer takes from the array's `encoding.value`
+and never requests. The index needs no member list; it stays ~150 B per pack
+because it rides in the root's consolidated metadata, which every load fetches
+first. (A first design
 listed the members in the attrs: +637 KB, +7.6%, on tp50's 8.4 MB root.)
 
 A node is packed whole, rungs included, when its stored chunk bytes are at most
@@ -1518,8 +1520,12 @@ warm cache keyed on it stay valid. A reader therefore uses the packs only when
 `scene_content_hash` equals the root `content_hash`; an edit that changes the
 chunks and restamps the hash makes them stale, and they are ignored. An attrs-only
 `luxar restamp-lod` keeps packs current only if they were current before the
-restamp; already-stale packs remain stale. The viewer also checks each pack's
-SHA-256 and reads the plain chunks when that fails.
+restamp; already-stale packs remain stale. `luxar optimize` recognises the
+sidecar by its attrs (`scene_content_hash` and `packs`, no `type`), so a
+same-named group in a generic store is copied as data; in a compiled scene the
+name is reserved.
+The viewer also checks each pack's SHA-256 and reads the plain chunks when that
+fails.
 Every plain chunk stays where it was, so zarr-python, napari and viewers that
 predate packs read the store as if the sidecar were absent (the pack files are
 plain keys in a group: a consolidated open never lists them, and an
