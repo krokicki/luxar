@@ -29,10 +29,17 @@ import {
   snapshotLodLoadStats,
 } from '../../../data/scene-loader/lod-load-stats';
 
+/** A log message as logged: a string, or the thunk `log.verbose` defers. */
+function messageOf(message: unknown): string {
+  return typeof message === 'function' ? (message as () => string)() : String(message);
+}
+
 interface SubLoaderStub {
   updateView: ReturnType<typeof vi.fn>;
   updateViewWithResidency: ReturnType<typeof vi.fn>;
   prefetchChunks: ReturnType<typeof vi.fn>;
+  prefetchChunkBoundary: ReturnType<typeof vi.fn>;
+  ensureInitialized: ReturnType<typeof vi.fn>;
   releaseAccumulator: ReturnType<typeof vi.fn>;
   dispose: ReturnType<typeof vi.fn>;
   getMetrics: ReturnType<typeof vi.fn>;
@@ -144,6 +151,8 @@ function makeSubLoader(
     updateView,
     updateViewWithResidency,
     prefetchChunks: vi.fn().mockResolvedValue(undefined),
+    prefetchChunkBoundary: vi.fn().mockResolvedValue(undefined),
+    ensureInitialized: vi.fn().mockResolvedValue(undefined),
     releaseAccumulator: vi.fn(),
     dispose: vi.fn(),
     getMetrics: vi.fn(() => stubMetrics(metrics)),
@@ -357,9 +366,9 @@ describe('PointsProgressiveLoader', () => {
       const result = await loader.loadPoints(baseViewState);
       const retained = (
         loader as unknown as {
-          loadedLODs: LoadedPointsData[];
+          core: { loadedLODs: LoadedPointsData[] };
         }
-      ).loadedLODs;
+      ).core.loadedLODs;
 
       expect(loader.loadedLODCount).toBe(3);
       expect(retained).toEqual([result]);
@@ -1621,13 +1630,17 @@ describe('PointsProgressiveLoader', () => {
       await expect(loader.loadPoints(baseViewState)).rejects.toThrow(/'colors' as Uint8Array/);
     });
 
-    it('drops colors entirely when at least one LOD lacks them (all-or-nothing policy)', async () => {
-      // PointsProgressiveLoader's all-or-nothing per-attr concatenation
-      // policy: any LOD missing an optional attribute → the merged result
-      // drops that attribute (no fill-with-default like gsplats).
+    it('white-fills the colors of an LOD that lacks them (the Lines/GSplats policy)', async () => {
+      // One colourless rung used to drop colours from the WHOLE merged ladder,
+      // so every coloured point turned to the node default the moment it
+      // landed; Lines and GSplats fill only that rung, with white.
       lodB.updateView.mockResolvedValue(makeLodData(50, 3)); // no colors
       const result = await loader.loadPoints(baseViewState);
-      expect(result.colors).toBeUndefined();
+      expect(result.colors).toBeInstanceOf(Uint8Array);
+      expect(result.colors!.length).toBe(175 * 3);
+      expect(result.colorComponents).toBe(3);
+      const levelB = Array.from(result.colors!.subarray(100 * 3, 150 * 3));
+      expect(levelB.every((v) => v === 255)).toBe(true);
     });
 
     it('keeps colors absent when no LOD has colors', async () => {
@@ -2463,7 +2476,7 @@ describe('PointsProgressiveLoader — per-pass logging', () => {
     await l.updateView(baseViewState);
     expect(info).not.toHaveBeenCalled();
     expect(
-      verbose.mock.calls.some((call) => String(call.at(-1)).includes('Progressive Points'))
+      verbose.mock.calls.some((call) => messageOf(call[2]).includes('Progressive Points'))
     ).toBe(true);
     info.mockRestore();
     verbose.mockRestore();

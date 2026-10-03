@@ -219,9 +219,6 @@
   },
   "src/data/gsplats/gsplats-progressive-loader.ts": {
     "complexity": {
-      "count": 3
-    },
-    "max-lines-per-function": {
       "count": 1
     }
   },
@@ -233,11 +230,6 @@
       "count": 1
     },
     "max-params": {
-      "count": 1
-    }
-  },
-  "src/data/gsplats/handler.ts": {
-    "complexity": {
       "count": 1
     }
   },
@@ -256,9 +248,6 @@
   },
   "src/data/lines/lines-progressive-loader.ts": {
     "complexity": {
-      "count": 3
-    },
-    "max-lines-per-function": {
       "count": 1
     }
   },
@@ -408,10 +397,7 @@
   },
   "src/data/points/points-progressive-loader.ts": {
     "complexity": {
-      "count": 4
-    },
-    "max-lines-per-function": {
-      "count": 1
+      "count": 2
     },
     "max-params": {
       "count": 2

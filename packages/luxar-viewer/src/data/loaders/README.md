@@ -427,22 +427,35 @@ attach` re-consolidates), so a scene without the sidecar costs NO request. An
   `loadSliceWithCache(ctx, viewState, loadInternal)` (the `loadX` template —
   S-cache restore → internal load → query close-out → S-cache store, with the
   abort-aware error branch), `recordLoadMetrics(ctx, arrayName, elements, output)`
-  (per-array load metrics + 'load' event), and
-  the abort-aware read path. The owning loader now keeps each call's signal
-  and residency probe in its own `ActiveLoadContext`.
-- **`active-load-context.ts`** — per-call signal and residency-probe context;
-  concurrent updates cannot overwrite each other's state.
-- **`loader-lifetime.ts`** — terminal dispose latch and lifetime signal for
-  shared initialization and fetches.
-- **`abortable-wait.ts`** — lets one caller leave a shared fetch on abort
-  without canceling another caller's read.
+  (per-array load metrics + 'load' event). Each used to exist as three
+  byte-identical private methods.
+- **`loader-lifetime.ts`** — `LoaderLifetime`: one leaf loader's lifetime. A
+  disposed latch (disposal is terminal: work that started before it bails as an
+  `AbortError`, new work is refused), the lifetime abort signal, the one-shot
+  `ensureInitialized(what, init, discard, priority?)` (shared in-flight attempt,
+  retry on failure, a prioritised warm-up riding a tagged child of the lifetime
+  signal and raised to `demand` by a later plain call) and `calls`, the per-call
+  demand-load context below. The mesh whole-node loader, whose disposal is
+  state-clearing by design, replaces its lifetime on dispose instead.
+- **`active-load-context.ts`** — `ActiveLoadContext`: the per-call abort signals
+  and residency probes the L0 proxies read on every chunk read
+  (`runWithSignal` / `runWithProbe`, the `updateView` /
+  `updateViewWithResidency` bodies). Reentrant: each call withdraws exactly its
+  own entry; while calls overlap, a read is cancelled only once every call is
+  aborted and is recorded into every call's probe.
+- **`pass-directives.ts`** — `PassDirectives` (`frameBudgetMs`, `ladderDepth`)
+  and `withPassDirectives(viewState, directives)`: the per-pass playback
+  directives every node handler injects into its DERIVED view state (the same
+  object when the pass has none).
+- **`abortable-wait.ts`** — `abortableWait(shared, signal)`: join a single-flight
+  promise while giving up on the caller's own signal, without cancelling the
+  shared work for the other joiners.
 - **`monitor-events.ts`** — `LoaderEventEmitter`: owns the listener `Set` for
   a `LoaderMonitor` implementation. Per-listener try/catch isolates one bad
   listener from the rest; `clear()` is called on dispose.
 - **`once-init.ts`** — `OnceInit.ensure(initFn)`: concurrent callers await a
   shared in-flight promise; a rejected init clears the cache so the next call
-  can retry from scratch. Centralizes the pattern previously duplicated four
-  times across the three loaders.
+  can retry from scratch. Wrapped by `LoaderLifetime.ensureInitialized`.
 - **`aggregate-loader-metrics.ts`** — `aggregateLoaderMetrics(inner, path)`:
   pure roll-up of N per-LOD `LoaderMetrics` into one snapshot for a progressive
   node. Counters are summed; `avgQueryTime` / `avgLoadTime` are query/load-weighted
@@ -473,7 +486,11 @@ src/data/loaders/
 ├── color-loader.ts               # Shared color-range loader with native-dtype preservation
 ├── element-ids.ts                # Slot → on-disk element index map (picking label lookups)
 ├── loader-metrics.ts             # Pure helpers for load/query metric bookkeeping
-├── spatial-facade.ts             # Shared loadX/updateView/metrics facade orchestration
+├── spatial-facade.ts             # Shared loadX/metrics facade orchestration
+├── loader-lifetime.ts            # Disposed latch, lifetime signal, init, per-call context
+├── active-load-context.ts        # Reentrant per-call signal/probe for the L0 proxies
+├── abortable-wait.ts             # Per-caller abortable wait on a shared promise
+├── pass-directives.ts            # withPassDirectives — playback directives into a node view
 ├── monitor-events.ts             # LoaderEventEmitter — listener fan-out with error isolation
 ├── once-init.ts                  # One-shot async initializer with retry-on-failure
 ├── extend-to-all-preflight.ts    # Shared extend_to_all warning + one-time announce
