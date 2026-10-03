@@ -490,8 +490,18 @@ export class PassScheduler {
    * held). An error escaping the orchestrator glue — each loop releases the
    * lock in its own `finally`, so this is a double fault — releases the lock
    * and drains whatever queued meanwhile, or the viewer would freeze.
+   *
+   * A disposed or archive-faulted loader runs no drain: the lock is released
+   * (and what queued drained) instead. The post-load kick calls in
+   * unconditionally, and a lazy LOD level can latch the fault during the load —
+   * a lock taken for a run that never starts would be held forever, parking
+   * every view and refusing every retry.
    */
   startRefinement(failureLabel: string): void {
+    if (this.host.isDisposed() || this.host.isFaulted()) {
+      this.releaseAndDrain();
+      return;
+    }
     this.locked = true;
     this.host.runRefinement().catch((error: unknown) => {
       log.error(Modules.SCENE_LOADER, `${failureLabel}: ${getErrorMessage(error)}`);
@@ -586,6 +596,11 @@ export class PassScheduler {
    * pre-empted the way a view change pre-empts it — its reads are aborted and
    * it hands the lock over as it unwinds. A view pass holding it (or one queued
    * behind the drain) keeps it: the retry is reported deferred.
+   *
+   * The pending check is made HERE, once: a view arriving after the
+   * pre-emption queues behind the retry (one loader's retry pass) instead of
+   * taking the lock from it. Yielding would turn a retry already accepted into
+   * a deferred one the user has to repeat, for a wait the size of one pass.
    *
    * @returns Whether the caller now holds the lock (release with {@link releaseRetry}).
    */
