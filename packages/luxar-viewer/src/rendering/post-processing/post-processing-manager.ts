@@ -24,6 +24,7 @@ import { FxaaPass } from './fxaa/pass';
 import { FullscreenPass } from './fullscreen/pass';
 import type { Renderer, RendererCapabilities } from '../renderer-capabilities';
 import { clamp } from '../../utils/clamp';
+import { raceTimeout } from '../../utils/race-timeout';
 import type { LuxarCamera } from '../../utils/camera-utils';
 import {
   computeEffectiveSize,
@@ -128,6 +129,7 @@ export class PostProcessingManager {
   private disposed = false;
   private captureDepth = 0;
   private onCaptureReleased: (() => void) | null = null;
+  private static readonly CAPTURE_TIMEOUT_MS = 60_000;
 
   // Wall-clock timestamp of the previous render() call, used to derive
   // the inter-frame delta for detector-noise time advancement. 0 means
@@ -879,7 +881,12 @@ export class PostProcessingManager {
   async suspendFrameRendersDuring<T>(capture: () => Promise<T>): Promise<T> {
     this.captureDepth++;
     try {
-      return await capture();
+      return await raceTimeout(
+        capture(),
+        PostProcessingManager.CAPTURE_TIMEOUT_MS,
+        () =>
+          new Error(`Capture timed out after ${PostProcessingManager.CAPTURE_TIMEOUT_MS / 1000} s`)
+      );
     } finally {
       this.captureDepth--;
       if (this.captureDepth === 0 && !this.disposed) this.onCaptureReleased?.();

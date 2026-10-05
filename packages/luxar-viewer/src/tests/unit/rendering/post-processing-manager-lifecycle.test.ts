@@ -120,6 +120,101 @@ function peek(mgr: PostProcessingManager): ManagerInternals {
 }
 
 describe('PostProcessingManager → capture guard', () => {
+  it('times out a capture that never settles and restarts rendering once', async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = makeManager();
+      const released = vi.fn();
+      mgr.setCaptureReleasedCallback(released);
+      let finish!: () => void;
+      const capture = mgr.suspendFrameRendersDuring(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          })
+      );
+
+      expect(mgr.isCaptureInProgress).toBe(true);
+      const settled = vi.fn();
+      void capture.then(
+        () => settled('resolved'),
+        () => settled('rejected')
+      );
+      const rejection = expect(capture).rejects.toThrow('Capture timed out after 60 s');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(settled).toHaveBeenCalledWith('rejected');
+      await rejection;
+      expect(mgr.isCaptureInProgress).toBe(false);
+      expect(released).toHaveBeenCalledTimes(1);
+      finish();
+      await Promise.resolve();
+      expect(released).toHaveBeenCalledTimes(1);
+      await mgr.suspendFrameRendersDuring(async () => {});
+      expect(released).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+      mgr.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases only the timed-out capture when another capture is still pending', async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = makeManager();
+      const released = vi.fn();
+      mgr.setCaptureReleasedCallback(released);
+      let finish!: () => void;
+      const stalled = mgr.suspendFrameRendersDuring(() => new Promise<void>(() => {}));
+      const stalledSettled = vi.fn();
+      void stalled.then(
+        () => stalledSettled('resolved'),
+        () => stalledSettled('rejected')
+      );
+      const stalledRejection = expect(stalled).rejects.toThrow('timed out');
+      await vi.advanceTimersByTimeAsync(1_000);
+      const healthy = mgr.suspendFrameRendersDuring(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          })
+      );
+
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(stalledSettled).toHaveBeenCalledWith('rejected');
+      await stalledRejection;
+      expect(mgr.isCaptureInProgress).toBe(true);
+      expect(released).not.toHaveBeenCalled();
+
+      finish();
+      await healthy;
+      expect(mgr.isCaptureInProgress).toBe(false);
+      expect(released).toHaveBeenCalledTimes(1);
+      mgr.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not restart rendering when a capture times out after disposal', async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = makeManager();
+      const released = vi.fn();
+      mgr.setCaptureReleasedCallback(released);
+      const capture = mgr.suspendFrameRendersDuring(() => new Promise<void>(() => {}));
+      const rejection = expect(capture).rejects.toThrow('timed out');
+
+      mgr.dispose();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await rejection;
+      expect(mgr.isCaptureInProgress).toBe(false);
+      expect(released).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('requests one repaint when the outermost capture releases, including on failure', async () => {
     const mgr = makeManager();
     const released = vi.fn();
