@@ -39,8 +39,13 @@ A killed check still stops immediately. If a failed coverage run produced no
 summary, the dependent slack check is reported as skipped instead of adding a
 misleading second failure. Local runs can request fail-fast behavior with
 `--bail`. The static checks include the `check:overrides` pnpm security-pin
-guard, dependency-cruiser layer rules, and the `check:knip:ci`
-unused-export/unused-file gate. Coverage thresholds and their last accepted
+guard, dependency-cruiser layer rules, the `check:knip:ci`
+unused-file/unused-dependency gate, and the `check:knip:ratchet` unused-export
+ratchet (`scripts/check-knip-ratchet.mjs` against `knip-baseline.json`: a new
+unused export, type or enum member fails; so does a paid-down or moved entry
+until `pnpm run check:knip:ratchet --update-baseline` refreshes it, and a
+`knip.json` or issue-type change fails closed). Delete dead code rather than
+baselining it; tag a deliberate unimported export `@internal`. Coverage thresholds and their last accepted
 measurements live together in `coverage-thresholds.mjs`; after coverage moves,
 run `pnpm check:coverage-slack -- --print`, update floors when required, and
 refresh the recorded measurements when accepting the new state. A downward
@@ -646,6 +651,34 @@ Full browser tests using Playwright that exercise the complete pipeline.
 ```bash
 pnpm test:e2e:report  # Opens HTML report with all screenshots/videos
 ```
+
+---
+
+## Structural Guards
+
+Tests that fail on the PR introducing a whole KIND of bug, rather than one
+instance. Each is a declared table, a runner over it, and a check that keeps the
+table honest.
+
+- **Every shown Layers-panel control has an effect** —
+  `unit/ui/layers/control-effect.test.ts` over `LAYER_CONTROL_RULES`
+  (`src/ui/layers/layer-control-rules.ts`). One fixture per layer kind (points,
+  lines, gsplats, house mesh, physical mesh, sound, LOD, partition, labelled,
+  custom LUT) with real materials: the shown controls must equal both the table's
+  answer and the fixture's declared `shows` list; each shown control is driven
+  through its DOM and must move observable state (uniforms, defines, material
+  flags, render-order slot, audio gain, LOD selector); "Reset this layer" must
+  restore it; every `data-control` element needs a rule. A new control needs a
+  rule row, a `data-control` id and a `PROBES` entry (keyed by the id type).
+- **README claims are checked** — `unit/readme/readme-claims.test.ts` (extractors
+  in `helpers/readme-claims.ts`). Every code-shaped name in an inline code span of
+  a `src/**/README.md` (camelCase, PascalCase, UPPER_SNAKE; dotted or called) must still
+  be used by the viewer's sources (`src/`, `scripts/`, `tools/`; comments do not
+  count) or by three / the DOM / Playwright; the rest sit in the test's
+  allowlist with a reason (Python names, the launcher's env var, names a README cites as REMOVED).
+  A list fenced by `<!-- mirrors: <file>#exports -->` or
+  `<!-- mirrors: <file>#<Class>.getters -->` … `<!-- /mirrors -->` must list exactly
+  that code set (the loaders README's factory helpers and registry accessors).
 
 ---
 
