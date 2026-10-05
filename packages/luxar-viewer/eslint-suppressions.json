@@ -1501,6 +1501,11 @@
       "count": 1
     }
   },
+  "src/wasm/typescript/points-membership.ts": {
+    "max-params": {
+      "count": 1
+    }
+  },
   "src/workers/data-worker/decode/lut.ts": {
     "complexity": {
       "count": 1
