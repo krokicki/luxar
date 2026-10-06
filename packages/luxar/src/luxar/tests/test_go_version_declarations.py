@@ -176,13 +176,15 @@ def test_old_local_go_reports_reinstall_remedy(tmp_path: Path) -> None:
     go.chmod(0o755)
     tools = tmp_path / "tools"
     tools.mkdir()
-    for name in ("make", "bash", "awk", "sed", "cut"):
+    for name in ("awk", "bash", "cut", "sed", "uname"):
         binary = shutil.which(name)
         assert binary is not None
         (tools / name).symlink_to(binary)
+    make = shutil.which("make")
+    assert make is not None
     env = os.environ | {"HOME": str(home), "PATH": str(tools)}
     result = subprocess.run(
-        ["make", "--silent", "install-go", "OS=linux"],
+        [make, "--silent", "install-go", "OS=linux"],
         cwd=REPO,
         env=env,
         text=True,
