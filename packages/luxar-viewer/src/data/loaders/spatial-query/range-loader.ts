@@ -25,18 +25,22 @@ import { loadLUT } from './range-loader/lut';
 import { loadPerChannel } from './range-loader/perchannel';
 import { loadDirect } from './range-loader/direct';
 import { loadArrayRef } from './range-loader/array-ref';
-import { resolveArrayRef } from './range-loader/ref-resolution';
+import { RefTargetMemo, type RefTargetWrapper } from './range-loader/ref-resolution';
+import { isVerboseLogging } from '../../../utils/log';
 
-export type { LoadRange, RangeLoaderConfig, EncodingType };
+export type { LoadRange, RangeLoaderConfig, EncodingType, RefTargetWrapper };
 
 export class RangeLoader {
   private decoder: ArrayDecoder;
   private config: ResolvedRangeLoaderConfig;
   private _verbose = true;
-  // Source of the owning loader's per-update abort signal. Resolved once at
+  // Source of the owning loader's abort signal. Resolved once at
   // the top of each loadRanges call and forwarded into the worker-decode
   // calls so a superseded update's LUT/quantized/broadcasted decode bails.
   private _getSignal?: () => AbortSignal | null;
+  // Resolved array_ref targets, opened once per (store, target path) and
+  // wrapped through the owning loader's L0 wrapper (see setRefTargetWrapper).
+  private readonly refTargets = new RefTargetMemo();
 
   constructor(refRegistry: ArrayRefRegistry, config: RangeLoaderConfig = {}) {
     this.decoder = new ArrayDecoder(refRegistry);
@@ -49,12 +53,32 @@ export class RangeLoader {
   }
 
   /**
-   * Wire the owning loader's per-update abort signal source. The thunk reads
-   * the loader's transient `_activeSignal`, so worker decodes started by a
-   * superseded update bail before dispatch (see WorkerPool.runWithTimeout).
+   * Whether this load prints its per-array decode detail: on a loader's first
+   * load, and only under `?verboseLog` — every partition part is a loader, and
+   * a slice step can bring several into the slice for the first time.
+   */
+  private get verbose(): boolean {
+    return this._verbose && isVerboseLogging();
+  }
+
+  /**
+   * Wire the owning loader's abort signal source. A per-call signal wins when
+   * present; an initial build uses the loader lifetime signal, so disposal
+   * also settles its worker decodes (see WorkerPool.runWithTimeout).
    */
   setSignalSource(getSignal: () => AbortSignal | null): void {
     this._getSignal = getSignal;
+  }
+
+  /**
+   * Wire how resolved array_ref targets are wrapped — the owning loader passes
+   * its L0 proxy (`wrapWithCache` with its probe/signal hooks) and the L0
+   * cache's `generation` as the epoch, so target reads are L0-cached like the
+   * loader's own arrays and re-opened after an L0 clear. `null` (or never
+   * calling this) reads targets unwrapped; they are still opened only once.
+   */
+  setRefTargetWrapper(wrapper: RefTargetWrapper | null): void {
+    this.refTargets.setWrapper(wrapper);
   }
 
   /**
@@ -70,7 +94,7 @@ export class RangeLoader {
     ranges: LoadRange[],
     output: DirectOutputBuffer
   ): Promise<number> {
-    const ctx = { config: this.config, verbose: this._verbose, signal: this._getSignal?.() };
+    const ctx = { config: this.config, verbose: this.verbose, signal: this._getSignal?.() };
     return loadDirect(ctx, array, ranges, output);
   }
 
@@ -92,7 +116,7 @@ export class RangeLoader {
     totalElements: number,
     elementsPerItem: number = 1
   ): Promise<number> {
-    const ctx = { config: this.config, verbose: this._verbose, signal: this._getSignal?.() };
+    const ctx = { config: this.config, verbose: this.verbose, signal: this._getSignal?.() };
     switch (detectEncoding(attrs)) {
       case 'broadcasted':
         await loadBroadcasted(ctx, array, attrs!, output, totalElements, elementsPerItem);
@@ -113,8 +137,9 @@ export class RangeLoader {
 
   /**
    * Like {@link loadRanges} but transparently resolves `array_ref` encodings
-   * by opening the target array and delegating against it. The standard
-   * entry point for spatial-index loaders.
+   * by delegating against the target array — opened (and L0-wrapped, see
+   * {@link setRefTargetWrapper}) once per (store, target path), not per call.
+   * The standard entry point for spatial-index loaders.
    */
   async loadRangesResolvingRef(
     array: zarr.Array<zarr.DataType, zarr.Readable>,
@@ -126,8 +151,8 @@ export class RangeLoader {
     zarrStore: zarr.Readable,
     logPrefix?: string
   ): Promise<number> {
-    const ctx = { config: this.config, verbose: this._verbose };
-    const resolved = await resolveArrayRef(ctx, attrs, zarrStore, logPrefix);
+    const ctx = { config: this.config, verbose: this.verbose };
+    const resolved = await this.refTargets.resolve(ctx, attrs, zarrStore, logPrefix);
     return resolved
       ? this.loadRanges(
           resolved.array,

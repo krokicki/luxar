@@ -27,7 +27,7 @@ import {
   writePointTexels,
   type PointTexelSource,
 } from '../point-geometry';
-import { writeSortedIndexIdentity } from '../element-storage';
+import { writeFreshElementStorage, writeSortedIndexIdentity } from '../element-storage';
 import { clampPointCapacity } from '../element-texture-layout';
 import { widenToFloat32 } from '../widen-to-float32';
 import type { LoadedPointsData, DataLoader } from '../../data/data-loader-types';
@@ -36,7 +36,7 @@ import { log, Modules } from '../../utils/log';
 import type { PickingSystem } from '../picking/picking-system';
 import { applyTransform } from './transforms';
 import { validateLoadedPointsData, validateColorMode } from './validation';
-import { resolveColormapWindow } from '../display-range';
+import { resolveColormapWindow, type DisplayUniforms } from '../display-range';
 import { DEFAULT_POINT_RADIUS } from '../../config/constants';
 
 /**
@@ -145,17 +145,10 @@ export function createPointsGeometry(
     sharpness: sharpnessF32,
     scalars: scalarsF32,
   };
-  try {
+  writeFreshElementStorage(geometry, () => {
     writePointTexels(texture, texelSrc, pointCount);
     writeSortedIndexIdentity(geometry, pointCount);
-  } catch (err) {
-    // The texture was attached above; a guard-throwing write would
-    // otherwise leak the fresh geometry+texture pair (nobody owns it
-    // yet — the commit's create-then-swap keeps the mesh on its OLD
-    // geometry when this throws).
-    geometry.dispose();
-    throw err;
-  }
+  });
 
   // WebGLRenderer only issues an instanced draw when instanceCount is set.
   geometry.instanceCount = pointCount;
@@ -251,7 +244,8 @@ export function createPointsMaterial(
         const ptScalarRange = resolveColormapWindow(
           attrs.scalar_data_range ?? [0, 1],
           { intensity: leaf.intensity ?? 1.0, offset: leaf.offset ?? 0.0 },
-          { intensity: composedIntensity, offset: composedOffset }
+          { intensity: composedIntensity, offset: composedOffset },
+          (attrs as { windowOwnerGain?: DisplayUniforms }).windowOwnerGain
         );
         material.updateScalarRange(ptScalarRange[0], ptScalarRange[1]);
         // The window now drives the LUT lookup; clear the post-LUT gain the
@@ -378,14 +372,14 @@ export function createEmptyPointsNode(
       dtypes: {},
     },
   };
-  // When the node carries a scalar field + colormap, stamp an empty
-  // scalars field on the placeholder data. `createPointsGeometry` turns
+  // When the node carries a scalar field, stamp an empty scalars field
+  // on the placeholder data. `createPointsGeometry` turns
   // field presence into the `userData.hasScalars` stamp that the
   // fail-closed colormap guard (`supportsScalarColormap`) reads at
   // material-creation time — the texture-storage analog of the
-  // interleaved era's empty `aScalar` pre-bind, so scalar+colormap
-  // nodes are built colormap-enabled before real data streams in.
-  if (attrs.has_scalars && attrs.colormap) {
+  // interleaved era's empty `aScalar` pre-bind. A colormap selected later
+  // in the Layers panel must pass the same guard before data streams in.
+  if (attrs.has_scalars) {
     emptyData.scalars = new Float32Array(0) as LoadedPointsData['scalars'];
   }
   return createPointsNode(

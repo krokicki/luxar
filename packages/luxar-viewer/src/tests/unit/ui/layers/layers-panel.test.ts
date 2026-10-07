@@ -31,6 +31,13 @@ import type { AnimationController } from '../../../../scene/animation/animation-
 import type { FailedLoadsProviderPort } from '../../../../data/scene-loader-monitor-port';
 import { MESH_DEFAULTS } from '../../../../rendering/materials/mesh/appearance';
 import { PhysicalMeshMaterial } from '../../../../rendering/materials/mesh-physical/material-glsl';
+import { PointMaterial } from '../../../../rendering/materials/point/material-glsl';
+import { PointPickingMaterial } from '../../../../rendering/picking/point/material';
+import { clearChildFailure } from '../../../../utils/lod-child-failure';
+import type { LODGroupChild } from '../../../../scene/lod-group-registry';
+import { failedLoadsVersion } from '../../../../utils/failed-loads-version';
+import { DensityGuard } from '../../../../scene/density-guard';
+import { SceneNodeIndex } from '../../../../data/scene-loader/view-state/scene-node-index';
 
 // `showToast` lives in src/ui/toast; mock so the empty-scene branch
 // is observable.
@@ -93,6 +100,8 @@ import {
   absorptionSliderRange,
 } from '../../../../ui/layers/absorption-range';
 import { getColormapTexture } from '../../../../rendering/colormap-textures';
+import type { ContextMenuItem } from '../../../../ui/overlay-widgets/context-menu';
+import type { LayerInfo } from '../../../../ui/layers/layer-state';
 
 /**
  * Normalised thumb position for a κ value on a log track — the inverse of
@@ -217,6 +226,17 @@ function makeSoundSceneGraph(soundLayer = true, storyVisible = true): SceneNode 
   } as unknown as SceneNode;
 }
 
+/** The items a right-click on `path`'s row would open (the panel's own builder). */
+function rowMenu(panel: LayersPanel, path: string): ContextMenuItem[] {
+  const builder = panel as unknown as { buildRowMenuItems(layer: LayerInfo): ContextMenuItem[] };
+  return builder.buildRowMenuItems(panel.layerState.getLayer(path)!);
+}
+
+/** Run the row-menu item labelled `label` on `path`'s row. */
+function runRowMenuItem(panel: LayersPanel, path: string, label: string): void {
+  rowMenu(panel, path).find((item) => item.label === label)!.action!();
+}
+
 describe('LayersPanel — sound rows', () => {
   let container: HTMLElement;
   let panel: LayersPanel;
@@ -323,6 +343,42 @@ describe('LayersPanel — sound rows', () => {
     expect(summary.type).toBe('sound');
     expect(summary.gain).toBe(2);
     expect(panel.getLayerSummaries().find((l) => l.path === '/story')!.gain).toBeUndefined();
+  });
+
+  it('offers a sound row neither Blending nor "Apply appearance to all layers"', () => {
+    // A sound row has no material: the appearance section already steps aside for
+    // it, so its context menu must not offer the same controls by another door.
+    const labels = rowMenu(panel, '/story/hum').map((item) => item.label);
+    expect(labels).not.toContain('Blending');
+    expect(labels).not.toContain('Apply appearance to all layers');
+    // The geometry-backed group row above it keeps both.
+    expect(rowMenu(panel, '/story').map((item) => item.label)).toEqual(
+      expect.arrayContaining(['Blending', 'Apply appearance to all layers'])
+    );
+  });
+
+  it('"Apply appearance to all layers" leaves a sound row untouched', () => {
+    // Its appearance fields are inert placeholders; stamping them would also mark
+    // the row's blend mode as user-owned.
+    const before = { ...panel.layerState.getLayer('/story/hum')! };
+    panel.layerState.setGamma('/story', 2.5);
+    runRowMenuItem(panel, '/story', 'Apply appearance to all layers');
+    const hum = panel.layerState.getLayer('/story/hum')!;
+    expect(hum.gamma).toBe(before.gamma);
+    expect(hum.blendingMode).toBe(before.blendingMode);
+    expect(hum.blendingModeExplicit).toBe(false);
+  });
+
+  it('a reset restores the authored gain on the audio graph, not just on the slider', () => {
+    panel.layerState.setSoundGain('/story/hum', 1.5);
+    port.setNodeGain.mockClear();
+    runRowMenuItem(panel, '/story/hum', 'Reset this layer');
+    expect(port.setNodeGain).toHaveBeenCalledWith('/story/hum', 0.5);
+
+    panel.layerState.setSoundGain('/story/hum', 1.5);
+    port.setNodeGain.mockClear();
+    panel.resetAllLayers();
+    expect(port.setNodeGain).toHaveBeenCalledWith('/story/hum', 0.5);
   });
 
   it('a slider click does not select the row', () => {
@@ -472,6 +528,24 @@ describe('LayersPanel.initFromScene', () => {
     const panel = new LayersPanel(container, animationController);
     panel.initFromScene(new THREE.Group(), makeLayeredSceneGraph());
 
+    expect(panel.layerState.count).toBe(1);
+  });
+
+  it("reuses the loader's SceneNodeIndex only when it indexes the same graph", () => {
+    const indexOf = (p: LayersPanel) =>
+      (p as unknown as { sceneNodeIndex: SceneNodeIndex | null }).sceneNodeIndex;
+    const graph = makeLayeredSceneGraph();
+    const shared = new SceneNodeIndex(graph);
+    const panel = new LayersPanel(container, animationController);
+    panel.initFromScene(new THREE.Group(), graph, shared);
+    expect(indexOf(panel)).toBe(shared);
+
+    // An index over ANOTHER graph (a stale one from the previous dataset) is
+    // not trusted: the panel builds its own over the graph it was given.
+    const next = makeLayeredSceneGraph();
+    panel.initFromScene(new THREE.Group(), next, shared);
+    expect(indexOf(panel)).not.toBe(shared);
+    expect(indexOf(panel)?.root).toBe(next);
     expect(panel.layerState.count).toBe(1);
   });
 
@@ -1875,6 +1949,26 @@ describe('LayersPanel — blend select drives the leaf material', () => {
     expect(findControlGroup(container, 'Alpha cutoff')!.style.display).not.toBe('none');
   });
 
+  it('a physical mesh row menu offers no Blending, like its controls; a house mesh keeps it', () => {
+    // Three's PBR material implements none of the house modes (applyBlendingMode is
+    // a no-op on it), so the controls hide the Blend dropdown. The row menu must
+    // agree rather than offer a submenu that changes nothing.
+    const physical = new LayersPanel(container, animationController);
+    physical.initFromScene(
+      new THREE.Group(),
+      makeLayeredSceneGraph('mesh', { material: 'physical' })
+    );
+    const labels = rowMenu(physical, '/cloud').map((item) => item.label);
+    expect(labels).not.toContain('Blending');
+    expect(labels).toContain('Apply appearance to all layers');
+    physical.dispose();
+
+    const house = new LayersPanel(container, animationController);
+    house.initFromScene(new THREE.Group(), makeLayeredSceneGraph('mesh'));
+    expect(rowMenu(house, '/cloud').map((item) => item.label)).toContain('Blending');
+    house.dispose();
+  });
+
   it("a material='physical' mesh swaps the house sliders for the live physical knob sliders", () => {
     // The physical family runs none of the house shader: the four lighting sliders
     // have no uniform to write, the cutoff and blend mode are the material's own
@@ -2496,6 +2590,116 @@ describe('LayersPanel — blend select drives the leaf material', () => {
     panel.resetAllLayers();
 
     expect(getColormapTexture).toHaveBeenCalledWith('custom', lut);
+  });
+
+  it('names an authored custom palette in the dropdown and the row menu, and can return to it', () => {
+    // Any non-builtin palette is stored as `colormap: 'custom'` + its LUT. The
+    // dropdown used to show a blank value for it, and the row menu checked nothing
+    // and offered no way back once the user tried another palette.
+    const lut = new Uint8Array(768).fill(40);
+    const panel = new LayersPanel(container, animationController);
+    panel.initFromScene(
+      new THREE.Group(),
+      makeLayeredSceneGraph('gsplats', { colormap: 'custom', customLutBytes: lut })
+    );
+    panel.show();
+    panel.layerState.select('/cloud', 'single');
+
+    const colormapSelect = Array.from(
+      container.querySelectorAll<HTMLElement>('.luxar-layers-panel__control-group')
+    )
+      .find(
+        (g) => g.querySelector('.luxar-layers-panel__control-label')?.textContent === 'Colormap'
+      )!
+      .querySelector('select')!;
+    expect(colormapSelect.value).toBe('custom');
+    expect(colormapSelect.selectedOptions[0].textContent).toBe('custom (authored)');
+
+    const submenu = () =>
+      rowMenu(panel, '/cloud').find((item) => item.label === 'Colormap')!.submenu!;
+    expect(submenu().find((item) => item.checked)?.label).toBe('custom (authored)');
+
+    submenu().find((item) => item.label === 'viridis')!.action!();
+    expect(panel.layerState.getLayer('/cloud')!.colormap).toBe('viridis');
+    submenu().find((item) => item.label === 'custom (authored)')!.action!();
+    expect(panel.layerState.getLayer('/cloud')!.colormap).toBe('custom');
+    panel.dispose();
+  });
+
+  it('offers no custom entry to a layer without an authored LUT', () => {
+    const panel = new LayersPanel(container, animationController);
+    panel.initFromScene(
+      new THREE.Group(),
+      makeLayeredSceneGraph('gsplats', { colormap: 'viridis' })
+    );
+    panel.show();
+    panel.layerState.select('/cloud', 'single');
+
+    expect(container.querySelector('option[value="custom"]')).toBeNull();
+    const submenu = rowMenu(panel, '/cloud').find((item) => item.label === 'Colormap')!.submenu!;
+    expect(submenu.map((item) => item.label)).not.toContain('custom (authored)');
+    panel.dispose();
+  });
+
+  describe('an authored palette never spreads to a layer without the same LUT', () => {
+    const lut = new Uint8Array(768).fill(40);
+    const twoLayers = (): SceneNode =>
+      ({
+        name: 'root',
+        path: '/',
+        type: 'group',
+        attrs: {},
+        children: [
+          {
+            name: 'a',
+            path: '/a',
+            type: 'gsplats',
+            attrs: { layer: true, colormap: 'custom', customLutBytes: lut },
+            children: [],
+          },
+          {
+            name: 'b',
+            path: '/b',
+            type: 'gsplats',
+            attrs: { layer: true, colormap: 'viridis' },
+            children: [],
+          },
+        ],
+      }) as unknown as SceneNode;
+
+    it('"Apply appearance to all layers" from a custom-palette row leaves the others', () => {
+      // `'custom'` names a layer's OWN authored LUT; stamped on a layer without one it
+      // renders viridis under that name and blanks the dropdown again.
+      const panel = new LayersPanel(container, animationController);
+      panel.initFromScene(new THREE.Group(), twoLayers());
+
+      runRowMenuItem(panel, '/a', 'Apply appearance to all layers');
+
+      expect(panel.layerState.getLayer('/b')!.colormap).toBe('viridis');
+      panel.dispose();
+    });
+
+    it('picking "custom (authored)" on a multi-selection leaves a layer without a LUT', () => {
+      const panel = new LayersPanel(container, animationController);
+      panel.initFromScene(new THREE.Group(), twoLayers());
+      panel.show();
+      panel.layerState.select('/b', 'single');
+      panel.layerState.select('/a', 'add');
+      const colormapSelect = Array.from(
+        container.querySelectorAll<HTMLElement>('.luxar-layers-panel__control-group')
+      )
+        .find(
+          (g) => g.querySelector('.luxar-layers-panel__control-label')?.textContent === 'Colormap'
+        )!
+        .querySelector('select')!;
+
+      colormapSelect.value = 'custom';
+      colormapSelect.dispatchEvent(new Event('change'));
+
+      expect(panel.layerState.getLayer('/a')!.colormap).toBe('custom');
+      expect(panel.layerState.getLayer('/b')!.colormap).toBe('viridis');
+      panel.dispose();
+    });
   });
 
   it('resetAllLayers clears label colouring and filtering on the material', () => {
@@ -3234,6 +3438,76 @@ describe('LayersPanel — blend select drives the leaf material', () => {
     expect(updateOpacity).not.toHaveBeenCalled();
   });
 
+  it('a panel opacity edit on a density-thinned node that is no LOD child reaches the drawn opacity', () => {
+    // The guard compensates a thinned sum-projected node as `base / keep` and
+    // re-applies only when keep steps; nothing recomposes a non-LOD node per
+    // frame. Rebasing `_lodFadeBase` without rewriting the uniform left the
+    // edit invisible until the density crossed a ladder step.
+    const stubMat: Record<string, unknown> = {
+      userData: { blendingMode: 'additive' },
+      uniforms: {
+        uOpacity: { value: 1.0 },
+        uDensityDrop: { value: 0 },
+        uDensityAlphaExp: { value: 1 },
+      },
+      defines: {},
+      updateIntensity: vi.fn(),
+      updateOffset: vi.fn(),
+      updateGamma: vi.fn(),
+      updateOpacity(v: number) {
+        (this as { uniforms: { uOpacity: { value: number } } }).uniforms.uOpacity.value = v;
+      },
+      getOpacity() {
+        return (this as { uniforms: { uOpacity: { value: number } } }).uniforms.uOpacity.value;
+      },
+      updateAbsorption: vi.fn(),
+      applyBlendingMode: vi.fn(),
+    };
+    stubMat.clone = vi.fn(() => stubMat);
+    const mesh = new THREE.Mesh(new THREE.BufferGeometry(), stubMat as unknown as THREE.Material);
+    mesh.name = '/cloud';
+    mesh.userData._layerMaterialCloned = true;
+    const rootGroup = new THREE.Group();
+    rootGroup.add(mesh);
+    const guard = new DensityGuard();
+    guard.configure({
+      config: () => ({
+        capElementsPerPixel: 4,
+        minKeepFraction: 1 / 64,
+        enterRatio: 1.5,
+        leaveRatio: 0.75,
+      }),
+      energyComp: () => false,
+    });
+    const rec = {
+      path: '/cloud',
+      areaPx: 1000,
+      elements: 8000,
+      elementsPerPixel: 8,
+      onScreen: true,
+      frame: 1,
+      keep: 1,
+      blendable: true,
+    };
+    guard.observe(mesh, rec);
+    const live = (): number => (stubMat.getOpacity as () => number).call(stubMat);
+    expect(live()).toBeCloseTo(2, 12); // 1 / keep 1/2
+
+    const panel = new LayersPanel(container, animationController);
+    panel.initFromScene(rootGroup, makeLayeredSceneGraph('gsplats'));
+    panel.show();
+    panel.layerState.select('/cloud', 'single');
+    panel.layerState.applyToSelected((l) => {
+      l.opacity = 0.6;
+    });
+    const layer = panel.layerState.getLayer('/cloud')!;
+    (
+      panel as unknown as { applyEngine: { applyOpacity(l: unknown): void } }
+    ).applyEngine.applyOpacity(layer);
+    guard.observe(mesh, { ...rec, frame: 2 }); // same density: keep holds
+    expect(live()).toBeCloseTo(0.6 * 2, 6);
+  });
+
   it('an opacity edit on a MESH also moves its pick material, so a dissolved surface stops being pickable', () => {
     // The wiring test, not a unit test of either half. A mesh's pick pass computes
     // the SAME coverage as its visual shader — node opacity times per-vertex alpha
@@ -3547,35 +3821,16 @@ describe('LayersPanel — blend select drives the leaf material', () => {
     }
   });
 
-  it('a non-mesh opacity edit does not touch the pick buffer', () => {
-    // The converse: a points/lines/gsplat pick material is not mesh-pick-aware, so
-    // the sync is a no-op and there is nothing new to render. Invalidating the
-    // buffer anyway would churn an offscreen render on every non-mesh slider drag.
+  it('a non-mesh opacity or gain edit invalidates the cached pick buffer once', () => {
     const invalidate = vi.fn();
-    const pickMat: Record<string, unknown> = { updateOpacityUniform: vi.fn() };
-    const visualMat: Record<string, unknown> = {
-      userData: { blendingMode: 'additive' },
-      uniforms: { uOpacity: { value: 1.0 } },
-      defines: {},
-      updateIntensity: vi.fn(),
-      updateOffset: vi.fn(),
-      updateGamma: vi.fn(),
-      updateOpacity: vi.fn(),
-      applyBlendingMode: vi.fn(),
-    };
-    visualMat.clone = vi.fn(() => visualMat);
+    const visualMat = new PointMaterial({ blendingMode: 'additive' });
+    const pickMat = new PointPickingMaterial({ nodeId: 1 });
 
-    const points = new THREE.Points(
-      new THREE.BufferGeometry(),
-      visualMat as unknown as THREE.Material
-    );
+    const points = new THREE.Points(new THREE.BufferGeometry(), visualMat);
     points.name = '/cloud';
     points.userData._layerMaterialCloned = true;
     points.userData.nodeType = 'points';
-    points.userData.pickNode = new THREE.Mesh(
-      points.geometry,
-      pickMat as unknown as THREE.Material
-    );
+    points.userData.pickNode = new THREE.Mesh(points.geometry, pickMat);
     const rootGroup = new THREE.Group();
     rootGroup.add(points);
 
@@ -3594,7 +3849,21 @@ describe('LayersPanel — blend select drives the leaf material', () => {
       panel as unknown as { applyEngine: { applyOpacity(l: unknown): void } }
     ).applyEngine.applyOpacity(layer);
 
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(visualMat.uniforms.uOpacity.value).toBe(0.3);
+
+    invalidate.mockClear();
+    (
+      panel as unknown as { applyEngine: { applyOpacity(l: unknown): void } }
+    ).applyEngine.applyOpacity(layer);
     expect(invalidate).not.toHaveBeenCalled();
+
+    layer.displayMax = 0.5;
+    (
+      panel as unknown as { applyEngine: { applyDisplayRange(l: unknown): void } }
+    ).applyEngine.applyDisplayRange(layer);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    expect(visualMat.uniforms.uIntensity.value).toBe(2);
   });
 });
 
@@ -3709,6 +3978,70 @@ describe('LayersPanel — per-row load-failure badge', () => {
       (r) => r.querySelector('.luxar-layer-row__name')?.textContent === name
     );
   }
+
+  it('does not read failed paths again on unchanged frames with a versioned provider', () => {
+    const panel = new LayersPanel(container, animationController);
+    panel.initFromScene(new THREE.Group(), makeGroupPlusSiblingScene());
+    panel.show();
+    let version = 0;
+    let reason = 'network 503';
+    let paths = Array.from({ length: 1000 }, (_, i) => `/pyramid/tile_${i}`);
+    const getFailedPaths = vi.fn(() => paths);
+    const provider: FailedLoadsProviderPort = {
+      getFailedPaths,
+      getFailedLoadsVersion: () => version,
+      getFailedReason: () => reason,
+      retryAll: async () => ({ succeeded: [], failed: [] }),
+    };
+    panel.setFailedLoadsProvider(provider);
+    const firstReads = getFailedPaths.mock.calls.length;
+    const badge = errorBadge(rowFor(container, 'pyramid'))!;
+    const setAttribute = vi.spyOn(badge, 'setAttribute');
+    const frame = perFrameCallbacks(animationController).get('layers-lod-status')!;
+    for (let i = 0; i < 10; i++) frame();
+    expect(getFailedPaths).toHaveBeenCalledTimes(firstReads);
+    expect(setAttribute).not.toHaveBeenCalled();
+    expect(errorBadge(rowFor(container, 'pyramid'))?.title).toContain('network 503');
+
+    reason = 'decode error';
+    version++;
+    frame();
+    expect(getFailedPaths).toHaveBeenCalledTimes(firstReads + 1);
+    expect(setAttribute).toHaveBeenCalled();
+    expect(errorBadge(rowFor(container, 'pyramid'))?.title).toContain('decode error');
+
+    paths = [];
+    version++;
+    frame();
+    expect(errorBadge(rowFor(container, 'pyramid'))).toBeNull();
+  });
+
+  it('clears a versioned lazy-child badge on explicit retry', async () => {
+    const panel = new LayersPanel(container, animationController);
+    panel.initFromScene(new THREE.Group(), makeGroupPlusSiblingScene());
+    panel.show();
+    const child = {
+      nodePath: '/pyramid/lod_1',
+      permanentlyFailed: true,
+      failureReason: 'archive fault',
+    } as LODGroupChild;
+    const provider: FailedLoadsProviderPort = {
+      getFailedPaths: () => (child.permanentlyFailed ? [child.nodePath!] : []),
+      getFailedLoadsVersion: failedLoadsVersion,
+      getFailedReason: () => child.failureReason,
+      retryAll: async () => {
+        clearChildFailure(child);
+        return { succeeded: [child.nodePath!], failed: [] };
+      },
+    };
+    panel.setFailedLoadsProvider(provider);
+    expect(errorBadge(rowFor(container, 'pyramid'))?.title).toContain('archive fault');
+
+    await provider.retryAll();
+    perFrameCallbacks(animationController).get('layers-lod-status')!();
+    expect(errorBadge(rowFor(container, 'pyramid'))).toBeNull();
+    expect(rowFor(container, 'pyramid')?.classList.contains('luxar-layer-row--error')).toBe(false);
+  });
 
   it('an exact-path failure lights up its row with a reason in the badge label', () => {
     const panel = new LayersPanel(container, animationController);

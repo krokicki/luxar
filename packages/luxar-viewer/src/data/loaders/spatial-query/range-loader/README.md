@@ -29,17 +29,29 @@ precomputes every range's destination offset up front (`rangeDestOffsets` —
 element counts are deterministic per range) and issues all `zarr.get()` calls
 concurrently via `Promise.all`; ranges write into disjoint output spans, so
 resolution order doesn't matter. Network concurrency stays bounded by the
-global data fetch lane (`utils/fetch-concurrency.ts`, 24 slots) and decode
-concurrency by the worker pool. A decoded chunk whose length mismatches the
-precomputed span is clamped with a warning (`clampRangeData`) — over-long data
-is truncated (never corrupts a neighbour's span), short data leaves the tail
-of its span zeroed, mirroring the historical graceful-fallback behavior.
+global fetch gate (`utils/fetch-concurrency.ts`, 24 data + 4 metadata slots in
+TLS-only sessions, shrinking to 4 data + 2 metadata once an `http:` URL is
+seen) and decode concurrency by the worker pool. A decoded chunk whose length
+mismatches the precomputed span is clamped with a warning (`clampRangeData`) —
+over-long data is truncated (never corrupts a neighbour's span), short data
+leaves the tail of its span zeroed, mirroring the historical graceful-fallback
+behavior.
 
 CPU-heavy decodes (broadcast replication, LUT lookup, dequantization) are
 offloaded to the worker pool when `config.dataLoading.performance.useWebWorkers`
 is set and the element count exceeds `workerThreshold` (default 1000), with a
 main-thread fallback through `ArrayDecoder` on worker failure. `WorkerAbortError`
 is re-thrown rather than swallowed so cancelled loads propagate cleanly.
+
+The per-channel, quantized (linear / log / geolog scalar) and LUT loaders send
+ONE worker call per attribute, not one per range (`packed-ranges.ts`): every
+range is read concurrently, then packed at its precomputed destination offset
+(in stored units — `offsets / k` for LUT row mode) and decoded as one buffer.
+The decodes are element-wise, and the packed index is the global flattened
+index, so the result — per-channel column phase included — is identical to the
+per-range decode; a short range's gap decodes to junk that is never copied out.
+Measured motivation: ~40k `decodePerChannel` messages per 6 s playback loop on a
+Points timelapse.
 
 ## File Structure
 
@@ -51,9 +63,10 @@ range-loader/
 ├── quantized.ts         # loadQuantized — uint8/uint16 → float (linear or log)
 ├── perchannel.ts        # loadPerChannel — per-column (col_lo/col_hi) dequant → float32
 ├── lut.ts               # loadLUT       — index → palette row/scalar lookup
+├── packed-ranges.ts     # readRanges / packRanges / scatterDecoded — one decode call per attribute
 ├── broadcasted.ts       # loadBroadcasted — one value replicated to N items
 ├── array-ref.ts         # loadArrayRef  — unresolved ref guard (throws)
-├── ref-resolution.ts    # resolveArrayRef — opens an array_ref target array
+├── ref-resolution.ts    # RefTargetMemo / resolveArrayRef — array_ref targets
 └── shared-instance.ts   # getSharedRangeLoader / getSharedRefRegistry singletons
 ```
 
@@ -97,10 +110,18 @@ keeping `uint8` colors as bytes for THREE.js 0–255→0–1 normalization); and
 `array_ref` encodings point one array at another (the encoder deduplicates
 identical arrays). They must be resolved **before** reaching `RangeLoader`:
 
-- `resolveArrayRef` (called by the spatial-index loaders) opens the target via
+- `RefTargetMemo` (behind `RangeLoader.loadRangesResolvingRef`, the entry point
+  the spatial-index loaders use) opens the target via
   `zarr.root(store).resolve(target)`, reads its attrs, and derives
   `elementsPerItem` from the target shape (product of the trailing axes, or 1 for
-  1-D). Returns `null` when no resolution is needed.
+  1-D). Returns `null` when no resolution is needed. The resolved target is
+  memoised per (store, target path) — it is opened ONCE, not per update — and,
+  when the owning loader has called `setRefTargetWrapper`, wrapped through that
+  loader's L0 proxy (keyed on the store-absolute target path) so revisits are L0
+  hits. Invalidation: a new store object misses the `WeakMap`; the wrapper's
+  `epoch()` (the L0 cache's `generation`, bumped by `clear()`) re-opens; a failed
+  open is not memoised. `resolveArrayRef` remains as the un-memoised, unwrapped
+  primitive.
 - `loadArrayRef` is a guard: if an unresolved `array_ref` ever reaches the
   dispatcher it throws with the offending `target`/`hash`, signalling a code path
   that bypassed resolution.

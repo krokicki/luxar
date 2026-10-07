@@ -139,7 +139,7 @@ make check-record-attribution   # opt-in OFFLINE audit: does the captured Zenodo
                   # the audit FINDS would gate on prose only Zenodo can change.
 make check-cold-fetch           # opt-in hosted demo cold-fetch gate before payload removal
 make check-external-references  # aggregate external audits (report-only, non-gating)
-make check-knip   # REPORT only (non-gating): unused viewer files/exports/deps
+make check-knip   # REPORT only; check:ci gates files/deps + RATCHETS unused exports (knip-baseline.json; --update-baseline)
 make check-gallery-staleness  # REPORT only; requires full Git history
 make format-all   # Format all code (Python, TypeScript, Rust, Go, CUDA)
 
@@ -346,6 +346,17 @@ luxar optimize scene.luxar.zarr --dry-run                  # report the plan, wr
 luxar optimize scene.luxar.zarr out.luxar.zarr --profile hosting  # hosting 256 KB / local 64 KB / archive 1 MB
 luxar optimize scene.luxar.zarr out.luxar.zarr --verify    # re-read the output, compare every array
 luxar optimize arbitrary.zarr out.zarr --generic           # a plain (non-Luxar) zarr store
+# `--pack` (opt-in, compiled scenes only) also writes a `chunk_packs/` sidecar:
+# per geometry node of <= 64 KB of chunks, ONE extra object holding copies of
+# them, so the viewer reads the node in one request instead of one per chunk —
+# the win for many-tiny-node stores (laddered timelapse partitions), nothing
+# for nodes already at the chunk target. Plain chunks stay (still a plain zarr
+# store), and packing does not change content_hash (the sidecar is excluded
+# from it; optimize still stamps its output's fresh hash, as without --pack).
+# The sidecar records the hash it was built for, so an edit that restamps the
+# hash makes the viewer ignore it. `restamp-lod` rebinds packs only when every
+# packed copy still matches its plain chunk; stale packs stay unbound.
+luxar optimize scene.luxar.zarr out.luxar.zarr --pack
 # Re-derive a store's LOD switch thresholds IN PLACE — attrs only, no chunk data
 # moves. Every `kind=lod` group still on the legacy `coverage` diagonal metric
 # (or carrying no `selector`) gets screen-occupancy-halved thresholds and a
@@ -887,7 +898,8 @@ luxar gsplat lod in.gsplats.zarr out.gsplats.zarr --recipe levels --coarsen-dims
 # LOD switch thresholds (ANY recipe with a kind=lod group — overview,
 # levels, adaptive) are auto-derived by SCREEN-OCCUPANCY HALVING (count-
 # independent), stamped as selector="screen-area": each coverage_fraction is a
-# literal screen-area fraction (projected bbox rect area / viewport area). For
+# literal screen-area fraction (projected area of the box's inscribed
+# ellipsoid, sized at its near depth, over the viewport area). For
 # `levels` (a WHOLE-OBJECT ladder) the finest level shows while the object
 # occupies at least HALF THE SCREEN (finest anchor 0.5) and each halving of
 # occupied area steps one level coarser (NDC-fraction metric → identical on

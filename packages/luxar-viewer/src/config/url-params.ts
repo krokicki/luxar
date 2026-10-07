@@ -1,11 +1,13 @@
 /**
  * Centralized URL parameter parsing.
  *
- * `window.location.search` is read in exactly one place — `main.ts` — and the
- * result flows through the application as a typed object. Components that need
- * a flag declare it on their options, rather than reaching back to
- * `window.location` themselves. URL writing is centralized here for the same
- * reason.
+ * The query string is parsed in one place — `readUrlParams()` here, whose
+ * standalone caller is the bootstrap (`core/bootstrap.ts`, which also re-reads
+ * it for a same-document `#view=` hash change) — and the result flows through
+ * the application as a typed object. Components that need a flag declare it on
+ * their options, rather than reaching back to `window.location` themselves.
+ * URL writing is centralized here for the same reason
+ * (`replaceBrowserDataSourceUrl`, called by `LuxarApp.switchDataset`).
  *
  * This makes consumers testable (no need to mock `window.location`), the URL
  * contract auditable (every recognized parameter is listed in `UrlParams`),
@@ -41,11 +43,13 @@ export const URL_PARAM_KEYS = {
   src: 'src',
   theme: 'theme',
   title: 'title',
+  view: 'view',
   control: 'control',
   controlToken: 'controlToken',
   controlAllowCrossOrigin: 'controlAllowCrossOrigin',
   panel: 'panel',
   debug: 'debug',
+  verboseLog: 'verboseLog',
   kiosk: 'kiosk',
   noCache: 'noCache',
   noSliceCache: 'noSliceCache',
@@ -64,10 +68,15 @@ export const URL_PARAM_KEYS = {
   densityCap: 'densityCap',
   noPrefetch: 'noPrefetch',
   prefetchDebug: 'prefetchDebug',
+  // Deliberately NOT a `UrlParams` field: read once, via `hasUrlFlag`, where
+  // the worker pool installs its codec backend (`workers/worker-pool.ts`).
+  mainThreadCodecs: 'mainThreadCodecs',
   cacheStats: 'cacheStats',
   renderer: 'renderer',
   webgpuForceWebgl: 'webgpuForceWebgl',
   perfTimestamp: 'perfTimestamp',
+  renderAlways: 'renderAlways',
+  renderAudit: 'renderAudit',
   gpuBudgetMB: 'gpuBudgetMB',
   cacheBudgetMB: 'cacheBudgetMB',
   dpr: 'dpr',
@@ -132,6 +141,18 @@ export function hasParam(
   aliases: Readonly<Record<string, UrlParamKey>> = URL_PARAM_ALIASES
 ): boolean {
   return resolveParamKey(params, key, aliases) !== null;
+}
+
+/**
+ * Whether flag `key` is present in the page URL (or in `search`, for tests).
+ *
+ * For the rare module-scope safety valve that has no options path to receive
+ * {@link UrlParams} through (the worker pool's `?mainThreadCodecs`, whose pool
+ * is a lazily created singleton). Everything else takes the parsed snapshot.
+ */
+export function hasUrlFlag(key: UrlParamKey, search?: string): boolean {
+  const raw = search ?? (typeof window !== 'undefined' ? window.location?.search : '') ?? '';
+  return hasParam(new URLSearchParams(raw), key);
 }
 
 /**
@@ -387,6 +408,8 @@ export interface UrlParams {
    * a scene's authored `viewer_config.title` overrides it at load.
    */
   title: string | null;
+  /** Shareable view bookmark JSON (`?view=...`). */
+  view: string | null;
   /**
    * Remote-control socket URL, already resolved and validated
    * (`?control`, or `?control=ws://host/control` to split the origin).
@@ -420,6 +443,12 @@ export interface UrlParams {
   /** Enable the `window.__luxarDebug` interface (`?debug`). */
   debug: boolean;
   /**
+   * `?verboseLog` — also print per-query / per-part detail lines
+   * (`log.verbose`). Off by default: on huge partition trees they reach tens
+   * of thousands of console calls per slice step.
+   */
+  verboseLog: boolean;
+  /**
    * `?kiosk` — lock this display down for unattended public use.
    *
    * A hard override over the scene's authored `ui.kiosk` block, because this
@@ -445,12 +474,13 @@ export interface UrlParams {
   /** Clear caches on init (`?clearCache`). */
   clearCache: boolean;
   /**
-   * Whether the substitutive-LOD cross-fade is enabled: blend adjacent LOD
-   * levels' opacity as the camera zooms across their boundary instead of a hard
-   * visibility swap, for blendable (additive/luminous/volumetric) layers
-   * (anti-popping). **On by
-   * default**; pass `?noLodFade` to disable it (e.g. to compare against the
-   * hard swap or isolate a rendering issue).
+   * Whether the substitutive-LOD level dissolve is enabled: when a blendable
+   * (additive/luminous/volumetric) group changes its displayed level, dissolve
+   * the outgoing level into the incoming one over `config.lod.fadeMs` instead
+   * of a hard visibility swap (anti-popping). Driven by time since the change,
+   * not by the camera's distance to a threshold, so a parked camera always
+   * settles on one level. **On by default**; pass `?noLodFade` to disable it
+   * (e.g. to compare against the hard swap or isolate a rendering issue).
    */
   lodFade: boolean;
   /**
@@ -469,8 +499,8 @@ export interface UrlParams {
    * (additive/luminous/volumetric)
    * LOD leaf's additive ladder streams in, scale its opacity by `1/e(k)` so the
    * partial prefix renders at full-level brightness instead of brightening up as
-   * chunks arrive (anti-popping on the time axis, orthogonal to `lodFade`'s
-   * distance axis). **On by default**; pass `?noLodEnergy` to disable it (e.g.
+   * chunks arrive (anti-popping WITHIN one level's stream, orthogonal to
+   * `lodFade`'s dissolve BETWEEN levels). **On by default**; pass `?noLodEnergy` to disable it (e.g.
    * to compare against the uncompensated brightening ramp).
    */
   lodEnergyComp: boolean;
@@ -568,6 +598,18 @@ export interface UrlParams {
    */
   perfTimestamp: boolean;
   /**
+   * `?renderAlways` — render every loop tick (the pre-render-on-change loop).
+   * A kill switch: the pixels are identical, only the redundant re-renders of
+   * an unchanged frame come back.
+   */
+  renderAlways: boolean;
+  /**
+   * `?renderAudit` — debug only (needs `?debug`): render every tick and count,
+   * in the perf counter `render.missedDirty`, ticks the scheduler would have
+   * skipped whose pixels nonetheless changed.
+   */
+  renderAudit: boolean;
+  /**
    * Override the adaptive GPU-geometry byte budget, in megabytes
    * (`?gpuBudgetMB=1536`). Pins the single VRAM budget shared by the
    * buffer pool and LOD-group retention, bypassing the auto-size
@@ -656,14 +698,25 @@ export interface UrlParams {
   envResolution: number | null;
 }
 
+function readBookmarkFragment(hash: string | undefined, queryView: string | null): string | null {
+  const fragment = hash ?? (typeof window !== 'undefined' ? window.location?.hash : '') ?? '';
+  if (!fragment.startsWith('#view=')) return queryView;
+  return new URLSearchParams(fragment.slice(1)).get(URL_PARAM_KEYS.view) ?? queryView;
+}
+
 /**
  * Parse the supplied query string (or `window.location.search` by default)
- * into a typed `UrlParams` snapshot.
+ * into a typed `UrlParams` snapshot. Bookmarks use the URL fragment so their
+ * larger payload never enters the server request.
  *
  * Pass an explicit `search` string in tests; in production main.ts calls this
  * once with no argument and threads the result through the rest of the app.
  */
-export function readUrlParams(search?: string, origin?: ControlSocketOrigin): UrlParams {
+export function readUrlParams(
+  search?: string,
+  origin?: ControlSocketOrigin,
+  hash?: string
+): UrlParams {
   const raw = search ?? (typeof window !== 'undefined' ? window.location?.search : '') ?? '';
   const params = new URLSearchParams(raw);
   // The control socket's address is derived from the page's own origin, so the
@@ -683,11 +736,13 @@ export function readUrlParams(search?: string, origin?: ControlSocketOrigin): Ur
     src: normalizeDataSourceUrl(get(K.src)),
     theme: get(K.theme),
     title: trimmedParam(params, K.title),
+    view: readBookmarkFragment(hash ?? (search === undefined ? undefined : ''), get(K.view)),
     control: normalizeControlSocketUrl(get(K.control), pageOrigin, allowCrossOriginControl),
     controlToken: trimmedParam(params, K.controlToken),
     controlAllowCrossOrigin: allowCrossOriginControl,
     panel: normalizePanelModuleUrl(get(K.panel), pageOrigin),
     debug: has(K.debug),
+    verboseLog: has(K.verboseLog),
     kiosk: has(K.kiosk),
     noCache: has(K.noCache),
     noSliceCache: has(K.noSliceCache),
@@ -710,6 +765,8 @@ export function readUrlParams(search?: string, origin?: ControlSocketOrigin): Ur
     renderer: normalizeRendererParam(get(K.renderer)),
     webgpuForceWebGL: has(K.webgpuForceWebgl),
     perfTimestamp: has(K.perfTimestamp),
+    renderAlways: has(K.renderAlways),
+    renderAudit: has(K.renderAudit),
     gpuBudgetMB: parseNonNegativeInt(get(K.gpuBudgetMB)),
     cacheBudgetMB: parseNonNegativeInt(get(K.cacheBudgetMB)),
     dpr: parsePositiveFloat(get(K.dpr)),
@@ -848,9 +905,26 @@ export function buildDataSourceBrowserUrl(src: string, location: BrowserUrlLocat
   const params = new URLSearchParams(location.search);
   params.set(URL_PARAM_KEYS.src, normalizeSrcForUrl(src));
   params.delete(URL_PARAM_KEYS.title);
+  // A bookmark belongs to the previous dataset. Keeping it would send a
+  // reload back to that view, undoing the user's dataset selection.
+  params.delete(URL_PARAM_KEYS.view);
   const query = params.toString();
-  const hash = location.hash ?? '';
+  const hash = location.hash?.startsWith('#view=') ? '' : (location.hash ?? '');
   return `${location.pathname}${query ? `?${query}` : ''}${hash}`;
+}
+
+/** Build a share link without carrying remote-control connection details. */
+export function buildViewBookmarkUrl(base: string, src: string, view: string): string {
+  const url = new URL(base);
+  url.searchParams.set(URL_PARAM_KEYS.src, src);
+  url.searchParams.delete(URL_PARAM_KEYS.view);
+  // Fragments stay client-side; even a scene with many layers never exceeds
+  // the server's request-line limit when someone opens its shared link.
+  url.hash = new URLSearchParams({ [URL_PARAM_KEYS.view]: view }).toString();
+  url.searchParams.delete(URL_PARAM_KEYS.controlToken);
+  url.searchParams.delete(URL_PARAM_KEYS.control);
+  url.searchParams.delete(URL_PARAM_KEYS.controlAllowCrossOrigin);
+  return url.toString();
 }
 
 /**

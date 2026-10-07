@@ -25,13 +25,21 @@ export interface DataLoadingPerformanceConfig {
    * pool init runs *before* the worker is in the pool, so the
    * standard handleWorkerFailure path can't evict it. The guard
    * rejects the init promise so the caller can fall back gracefully.
+   * A slot that only missed this deadline is respawned after a backoff
+   * (3 attempts in all): a busy main thread can delay the reply.
    */
   workerInitTimeoutMs: number;
 
   // GPU buffer pool
   useGPUBufferPool: boolean;
   gpuPoolMaxSize: number;
-  gpuPoolEvictionFrames: number;
+  /**
+   * LRU age, in ATOMIC COMMITS (not rendered frames),
+   * after which a pooled GPU buffer is disposed — `GPUBufferPool`'s
+   * `evictionCommits` (#2939). An idle or orbiting view runs no commit, so
+   * pooled buffers do not age then.
+   */
+  gpuPoolEvictionCommits: number;
   /**
    * Per-call eviction-batch cap for the GPU buffer pool. When many
    * pooled buffers cross the eviction threshold in the same frame

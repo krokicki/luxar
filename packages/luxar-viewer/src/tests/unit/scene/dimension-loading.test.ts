@@ -33,7 +33,7 @@ import {
 function makeCtx(overrides: Partial<DimensionLoadingContext> = {}): DimensionLoadingContext {
   return {
     sceneManager: { scene: {} } as never,
-    animationController: { startAnimation: vi.fn() } as never,
+    animationController: { startAnimation: vi.fn(), requestTick: vi.fn() } as never,
     getAnimationManager: () => undefined,
     ...overrides,
   };
@@ -57,18 +57,28 @@ describe('updateAllNDNodes', () => {
     expect(updateSceneForDimensions).not.toHaveBeenCalled();
   });
 
-  it('forwards dims + scene to the loader and kicks the animation loop', async () => {
+  it('forwards dims + scene to the loader and keeps the loop ticking without a render', async () => {
     const dims = { ndim: 4, displayed: [0, 1, 2], currentStep: [0, 0, 0, 5], metadata: undefined };
     (sceneDimsManager.getDims as ReturnType<typeof vi.fn>).mockReturnValue(dims);
     const startAnimation = vi.fn();
-    const ctx = makeCtx({ animationController: { startAnimation } as never });
+    const requestTick = vi.fn();
+    const ctx = makeCtx({ animationController: { startAnimation, requestTick } as never });
 
     await updateAllNDNodes(ctx);
 
-    expect(updateSceneForDimensions).toHaveBeenCalledWith(dims, expect.anything(), undefined, {
-      frameBudgetMs: undefined,
-    });
-    expect(startAnimation).toHaveBeenCalledTimes(1);
+    expect(updateSceneForDimensions).toHaveBeenCalledWith(
+      expect.anything(),
+      dims,
+      expect.anything(),
+      undefined,
+      {
+        frameBudgetMs: undefined,
+      }
+    );
+    // The pass's commits request their own render; a trailing wake would draw
+    // a second identical frame per data step.
+    expect(requestTick).toHaveBeenCalledTimes(1);
+    expect(startAnimation).not.toHaveBeenCalled();
   });
 
   describe('t+1 shadow prefetch trigger', () => {
@@ -101,11 +111,17 @@ describe('updateAllNDNodes', () => {
 
       await updateAllNDNodes(ctx);
 
-      expect(updateSceneForDimensions).toHaveBeenCalledWith(dims, expect.anything(), undefined, {
-        frameBudgetMs: 60,
-      });
+      expect(updateSceneForDimensions).toHaveBeenCalledWith(
+        expect.anything(),
+        dims,
+        expect.anything(),
+        undefined,
+        {
+          frameBudgetMs: 60,
+        }
+      );
       expect(prefetchSceneForDimensions).toHaveBeenCalledTimes(1);
-      const [predictedDims, , loaderId, opts] = (
+      const [, predictedDims, , loaderId, opts] = (
         prefetchSceneForDimensions as ReturnType<typeof vi.fn>
       ).mock.calls[0];
       expect(predictedDims.currentStep).toEqual([0, 0, 0, 6]);
@@ -122,11 +138,17 @@ describe('updateAllNDNodes', () => {
 
       await updateAllNDNodes(ctx);
 
-      expect(updateSceneForDimensions).toHaveBeenCalledWith(dims, expect.anything(), undefined, {
-        frameBudgetMs: 60,
-        ladderDepth: 6,
-      });
-      const [, , , opts] = (prefetchSceneForDimensions as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(updateSceneForDimensions).toHaveBeenCalledWith(
+        expect.anything(),
+        dims,
+        expect.anything(),
+        undefined,
+        {
+          frameBudgetMs: 60,
+          ladderDepth: 6,
+        }
+      );
+      const [, , , , opts] = (prefetchSceneForDimensions as ReturnType<typeof vi.fn>).mock.calls[0];
       expect(opts).toEqual({ budgetMs: 60, ladderDepth: 6 });
     });
 
@@ -193,10 +215,16 @@ describe('scrub pinning (not playing)', () => {
 
     await updateAllNDNodes(ctx);
 
-    expect(updateSceneForDimensions).toHaveBeenCalledWith(dims, expect.anything(), undefined, {
-      frameBudgetMs: undefined,
-      ladderDepth: 6,
-    });
+    expect(updateSceneForDimensions).toHaveBeenCalledWith(
+      expect.anything(),
+      dims,
+      expect.anything(),
+      undefined,
+      {
+        frameBudgetMs: undefined,
+        ladderDepth: 6,
+      }
+    );
     expect(prefetchSceneForDimensions).not.toHaveBeenCalled();
     const setValue = sceneDimsManager.setDimensionValue as ReturnType<typeof vi.fn>;
     expect(setValue).not.toHaveBeenCalled();
@@ -204,7 +232,7 @@ describe('scrub pinning (not playing)', () => {
     // The settle pass re-notifies at the current position once the scrub is quiet,
     // through the first NON-displayed dimension (3 here), never a displayed axis.
     vi.advanceTimersByTime(SCRUB_SETTLE_MS + 1);
-    expect(setValue).toHaveBeenCalledWith(3, 5);
+    expect(setValue).toHaveBeenCalledWith(3, 5, { force: true });
   });
 
   it('a settle pass carries no directive (the listener runs while the settle flag is set)', async () => {
@@ -216,13 +244,13 @@ describe('scrub pinning (not playing)', () => {
     listener = () => updateAllNDNodes(ctx);
 
     await updateAllNDNodes(ctx);
-    expect((updateSceneForDimensions as ReturnType<typeof vi.fn>).mock.calls[0][3]).toEqual({
+    expect((updateSceneForDimensions as ReturnType<typeof vi.fn>).mock.calls[0][4]).toEqual({
       frameBudgetMs: undefined,
       ladderDepth: 'auto',
     });
 
     vi.advanceTimersByTime(SCRUB_SETTLE_MS + 1);
-    expect((updateSceneForDimensions as ReturnType<typeof vi.fn>).mock.calls[1][3]).toEqual({
+    expect((updateSceneForDimensions as ReturnType<typeof vi.fn>).mock.calls[1][4]).toEqual({
       frameBudgetMs: undefined,
       ladderDepth: undefined,
     });
@@ -231,10 +259,16 @@ describe('scrub pinning (not playing)', () => {
   it('a Fast (null) scrub detail pins nothing and schedules no settle pass', async () => {
     const ctx = makeCtx({ getAnimationManager: () => makeIdleAnim(null) });
     await updateAllNDNodes(ctx);
-    expect(updateSceneForDimensions).toHaveBeenCalledWith(dims, expect.anything(), undefined, {
-      frameBudgetMs: undefined,
-      ladderDepth: undefined,
-    });
+    expect(updateSceneForDimensions).toHaveBeenCalledWith(
+      expect.anything(),
+      dims,
+      expect.anything(),
+      undefined,
+      {
+        frameBudgetMs: undefined,
+        ladderDepth: undefined,
+      }
+    );
     vi.advanceTimersByTime(SCRUB_SETTLE_MS + 1);
     expect(sceneDimsManager.setDimensionValue).not.toHaveBeenCalled();
   });

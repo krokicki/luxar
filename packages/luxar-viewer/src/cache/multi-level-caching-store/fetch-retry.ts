@@ -4,11 +4,20 @@ import {
   getActiveFetchCount,
   getFetchProgressEpoch,
   noteFetchProgress,
+  noteFetchUrl,
+  originOfUrl,
   type FetchLane,
+  type FetchPriority,
+  type FetchPriorityCell,
   withFetchGate,
 } from '../../utils/fetch-concurrency';
 import { getErrorMessage } from '../../utils/format-error';
+import { combineAbortSignals } from '../../utils/abort-signals';
 import { sha256Hex } from './sha256';
+import { perfCounters } from '../../profiling/perf-counters';
+
+/** Perf counter: response-body bytes fully materialised by the network tier. */
+const S_FETCH_BYTES = perfCounters.slot('fetch.bytes');
 
 const INITIAL_RETRY_DELAY_MS = 50;
 const MAX_RETRY_DELAY_MS = 500;
@@ -17,13 +26,6 @@ const BODY_DEADLINE_FALLBACK_MULTIPLIER = 8;
 const MAX_BODY_DEADLINE_FALLBACK_CONCURRENCY_SCALE = 4;
 const MAX_BODY_DEADLINE_CONCURRENCY_SCALE = 8;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
-const NOOP_DISPOSE = (): void => {};
-
-/** A merged abort signal plus the cleanup for fallback source listeners. */
-export interface AbortSignalScope {
-  signal: AbortSignal;
-  dispose: () => void;
-}
 
 /** A response whose body must be consumed inside the fetch-gate lease. */
 export interface FetchAttempt {
@@ -34,9 +36,22 @@ export interface FetchAttempt {
 export interface FetchRetryOptions {
   timeoutMsOverride?: number;
   signal?: AbortSignal;
+  /** HTTP method (default `GET`); the zip reader's length fallback sends `HEAD`. */
+  method?: string;
   headers?: HeadersInit;
   onExhausted?: (error: unknown) => void;
   lane?: FetchLane;
+  /**
+   * HTTP cache mode for the request. The zip range reader passes `no-store`:
+   * with the default mode Chrome serialises same-URL `Range` GETs through its
+   * HTTP-cache writer lock, which held a hosted archive at two reads in flight.
+   */
+  cache?: RequestCache;
+  /**
+   * Gate priority class (default `demand`), or a cell a coalescing caller may
+   * raise while the request is queued. See `utils/fetch-concurrency.ts`.
+   */
+  priority?: FetchPriority | FetchPriorityCell;
 }
 
 class FetchConsumerError {
@@ -159,9 +174,11 @@ async function readBodyWithStallWatchdog(
     const reader = response.body?.getReader();
     if (!reader) {
       armWatchdog();
-      return new Uint8Array(
+      const whole = new Uint8Array(
         await Promise.race([response.arrayBuffer(), abortPromise])
       ) as Uint8Array<ArrayBuffer>;
+      perfCounters.add(S_FETCH_BYTES, whole.byteLength);
+      return whole;
     }
 
     const chunks: Uint8Array[] = [];
@@ -184,6 +201,7 @@ async function readBodyWithStallWatchdog(
       reader.releaseLock();
     }
 
+    perfCounters.add(S_FETCH_BYTES, byteLength);
     return joinBodyChunks(chunks, byteLength);
   } catch (error) {
     throw new FetchBodyError(error);
@@ -191,45 +209,6 @@ async function readBodyWithStallWatchdog(
     if (stallTimeoutId !== undefined) clearTimeout(stallTimeoutId);
     if (absoluteTimeoutId !== undefined) clearTimeout(absoluteTimeoutId);
   }
-}
-
-/**
- * Merge two AbortSignals into one that fires when either source aborts.
- *
- * Uses native `AbortSignal.any` when available (Node 22+, modern browsers).
- * The fallback registers listeners on both sources, so callers must invoke
- * `dispose()` when the operation using `signal` settles. An abort disposes
- * both source listeners immediately before relaying the cancellation.
- */
-export function mergeAbortSignals(primary: AbortSignal, caller?: AbortSignal): AbortSignalScope {
-  if (!caller) return { signal: primary, dispose: NOOP_DISPOSE };
-  type StaticAny = { any?: (signals: AbortSignal[]) => AbortSignal };
-  const anyImpl = (AbortSignal as unknown as StaticAny).any;
-  if (typeof anyImpl === 'function') {
-    return { signal: anyImpl([primary, caller]), dispose: NOOP_DISPOSE };
-  }
-
-  const relay = new AbortController();
-  let listening = false;
-  const dispose = (): void => {
-    if (!listening) return;
-    listening = false;
-    primary.removeEventListener('abort', onAbort);
-    caller.removeEventListener('abort', onAbort);
-  };
-  const onAbort = (): void => {
-    dispose();
-    relay.abort(primary.aborted ? primary.reason : caller.reason);
-  };
-
-  if (primary.aborted || caller.aborted) {
-    relay.abort(primary.aborted ? primary.reason : caller.reason);
-  } else {
-    listening = true;
-    primary.addEventListener('abort', onAbort, { once: true });
-    caller.addEventListener('abort', onAbort, { once: true });
-  }
-  return { signal: relay.signal, dispose };
 }
 
 function sleep(delayMs: number): Promise<void> {
@@ -291,42 +270,55 @@ async function runFetchAttempt<T>(
   consume: (attempt: FetchAttempt) => Promise<T>
 ): Promise<T> {
   const lane = options?.lane ?? 'data';
-  return withFetchGate(async () => {
-    // Start the per-attempt timer only after acquiring the gate. Queue wait is
-    // controlled by the caller signal and must not consume the request budget.
-    const timeoutController = new AbortController();
-    const timeoutId = setTimeout(
-      () =>
-        timeoutController.abort(
-          new Error(`response headers timed out after ${timeoutPerAttemptMs} ms`)
-        ),
-      timeoutPerAttemptMs
-    );
-    const abortScope = mergeAbortSignals(timeoutController.signal, options?.signal);
-    let response: Response | undefined;
-    try {
-      response = await fetch(url, {
-        signal: abortScope.signal,
-        ...(options?.headers ? { headers: options.headers } : {}),
-      });
-      clearTimeout(timeoutId);
-      if (isRetryableResponse(response)) throw new Error(`HTTP ${response.status} for ${url}`);
-      return await consumeResponse(
-        response,
-        {
-          timeoutController,
-          signal: abortScope.signal,
-          stallTimeoutMs: timeoutPerAttemptMs,
-          lane,
-        },
-        consume
+  noteFetchUrl(url);
+  return withFetchGate(
+    async () => {
+      // Start the per-attempt timer only after acquiring the gate. Queue wait is
+      // controlled by the caller signal and must not consume the request budget.
+      // That holds only while the gate is no wider than the browser's socket
+      // pool, which `noteFetchUrl` keeps true on HTTP/1.1 origins.
+      const timeoutController = new AbortController();
+      const timeoutId = setTimeout(
+        () =>
+          timeoutController.abort(
+            new Error(`response headers timed out after ${timeoutPerAttemptMs} ms`)
+          ),
+        timeoutPerAttemptMs
       );
-    } finally {
-      clearTimeout(timeoutId);
-      if (response) releaseUnconsumedBody(response);
-      abortScope.dispose();
-    }
-  }, lane);
+      const abortScope = combineAbortSignals(timeoutController.signal, options?.signal);
+      let response: Response | undefined;
+      try {
+        response = await fetch(url, {
+          signal: abortScope.signal,
+          ...(options?.method ? { method: options.method } : {}),
+          ...(options?.headers ? { headers: options.headers } : {}),
+          ...(options?.cache ? { cache: options.cache } : {}),
+        });
+        clearTimeout(timeoutId);
+        if (isRetryableResponse(response)) throw new Error(`HTTP ${response.status} for ${url}`);
+        return await consumeResponse(
+          response,
+          {
+            timeoutController,
+            signal: abortScope.signal,
+            stallTimeoutMs: timeoutPerAttemptMs,
+            lane,
+          },
+          consume
+        );
+      } finally {
+        clearTimeout(timeoutId);
+        if (response) releaseUnconsumedBody(response);
+        abortScope.dispose();
+      }
+    },
+    lane,
+    options?.priority ?? 'demand',
+    originOfUrl(url),
+    // An abort while still queued frees the queue place (a dead read-ahead
+    // must not hold one ahead of live speculative requests).
+    options?.signal
+  );
 }
 
 /**

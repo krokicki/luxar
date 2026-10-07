@@ -77,6 +77,28 @@ describe('estimateGeometryBytes', () => {
   });
 });
 
+describe('committed mesh byte accounting', () => {
+  it('follows the WebGPU backend widening a mesh index to Uint32 in place', () => {
+    // The WebGPU backend assigns a Uint32Array straight into
+    // `index.array` at first upload (`applyMeshIndices` documents it) — after
+    // the commit registered the mesh, with no caller left to invalidate a
+    // cached byte size. A static mesh would otherwise be charged at the
+    // narrow width for the rest of the session.
+    const pool = new GPUBufferPool();
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(30, 3)); // 120 B
+    g.setIndex(new THREE.BufferAttribute(new Uint16Array(300), 1)); // 600 B
+    pool.registerMeshGeometry('mesh', g);
+    const before = pool.getResidentBytes();
+    expect(before).toBe(120 + 600);
+
+    g.index!.array = new Uint32Array(g.index!.array);
+
+    expect(pool.getResidentBytes()).toBe(before + 600);
+    pool.dispose();
+  });
+});
+
 describe('GPU pool getStats() byte counters', () => {
   it('reports activeBytes for an acquired buffer', () => {
     const pool = new GPUBufferPool(20, 300, 5, () => 0); // byte budget disabled
@@ -203,18 +225,18 @@ describe('byte-budget eviction', () => {
     expect(after.pooledBytes).toBe(before.pooledBytes);
   });
 
-  it('acquire-triggered sweep graces buffers RELEASED this frame, even when last acquired frames ago', () => {
-    // Regression: releaseGeometry must stamp lastUsedFrame with the
-    // release frame — without the stamp, a buffer acquired at frame 0
-    // and released at frame 3 carries lastUsedFrame=0, the grace
-    // (graceFrame=3) never matches, and the dataset-switch sweep
+  it('acquire-triggered sweep graces buffers RELEASED this commit, even when last acquired commits ago', () => {
+    // Regression: releaseGeometry must stamp lastUsedCommit with the
+    // release commit — without the stamp, a buffer acquired at commit 0
+    // and released at commit 3 carries lastUsedCommit=0, the grace
+    // (graceCommit=3) never matches, and the dataset-switch sweep
     // disposes the very buffer the grace exists to preserve.
     let budget = 1_000_000_000;
     const gracePool = new GPUBufferPool(20, 300, 5, () => budget);
-    gracePool.acquirePointsGeometry('old', 500); // stamped frame 0
-    gracePool.beginFrame();
-    gracePool.beginFrame();
-    gracePool.beginFrame(); // frame 3
+    gracePool.acquirePointsGeometry('old', 500); // stamped commit 0
+    gracePool.beginCommit();
+    gracePool.beginCommit();
+    gracePool.beginCommit(); // commit 3
     gracePool.releasePointsGeometry('old'); // release sweep: under budget, survives
     expect(gracePool.getStats().pooledBuffers).toBe(1);
 
@@ -225,7 +247,7 @@ describe('byte-budget eviction', () => {
     gracePool.acquirePointsGeometry('fresh', 5000);
     expect(gracePool.getStats().pooledBuffers).toBe(1); // 'old' spared by the grace
 
-    // A release-triggered sweep (graceFrame -1) still enforces the budget.
+    // A release-triggered sweep (graceCommit -1) still enforces the budget.
     gracePool.releasePointsGeometry('fresh');
     expect(gracePool.getStats().pooledBytes).toBe(0);
   });
@@ -396,12 +418,12 @@ describe('byte-budget eviction', () => {
       // whole block is skipped, so a counter mis-wired to `evictUnused`'s TOTAL
       // would still read 0 and this would prove nothing. Verified by mutation —
       // `byteBudgetEvictions += evicted` survives at budget 0 and fails here.
-      // Eviction age 1 frame, so the LRU pass disposes the pooled buffer while
+      // Eviction age 1 commit, so the LRU pass disposes the pooled buffer while
       // the byte pass finds the pool comfortably under budget and does nothing.
       const lruPool = new GPUBufferPool(20, 1, 5, () => 100_000_000);
       lruPool.acquirePointsGeometry('p1', 100);
       lruPool.releasePointsGeometry('p1');
-      for (let i = 0; i < 5; i++) lruPool.beginFrame();
+      for (let i = 0; i < 5; i++) lruPool.beginCommit();
 
       expect(lruPool.evictUnused()).toBeGreaterThan(0);
       const stats = lruPool.getStats();
@@ -414,7 +436,7 @@ describe('byte-budget eviction', () => {
       const countOnly = new GPUBufferPool(20, 1, 5, () => 0);
       countOnly.acquirePointsGeometry('p1', 500);
       countOnly.releasePointsGeometry('p1');
-      for (let i = 0; i < 5; i++) countOnly.beginFrame();
+      for (let i = 0; i < 5; i++) countOnly.beginCommit();
       countOnly.evictUnused();
 
       expect(countOnly.getStats().byteBudgetEvictions).toBe(0);
@@ -434,8 +456,8 @@ describe('post-grow reclaim (#2426 pool retention)', () => {
    *    pre-growth active bytes, sees headroom that no longer exists, and
    *    evicts nothing;
    *  - the acquire-side sweep does see the new accounting, but runs with
-   *    `graceFrame = frameCount` while the release just stamped the pair with
-   *    that same frame — so the grace skips precisely the buffer that needs
+   *    `graceCommit = commitCount` while the release just stamped the pair with
+   *    that same commit — so the grace skips precisely the buffer that needs
    *    taking. (On the ADOPT path there is no acquire sweep at all.)
    *
    * A SINGLE node is the discriminating case: multi-node scenes hid this,
@@ -502,6 +524,7 @@ describe('post-grow reclaim (#2426 pool retention)', () => {
 
   // Contrast gpu-buffer-pool.test.ts's "Grow-path OOM re-claim window":
   // those throws occur inside the grow try and must restore the released buffer.
+  // geometry-subset: the pool grows only the instanced types; a mesh registers its bytes but is never grown
   it.each([
     ['points', 100, 5000], // 66,764 → 453,164 B
     ['lines', 100, 5000], // 66,716 → 780,236 B

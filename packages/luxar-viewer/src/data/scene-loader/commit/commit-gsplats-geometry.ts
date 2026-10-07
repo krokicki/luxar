@@ -12,15 +12,16 @@
  * @module data/scene-loader/commit/commit-gsplats-geometry
  */
 
+import { findObjectByName } from '../../../utils/scene-graph-index';
 import * as THREE from 'three';
 import { updateInstancedGSplatsMesh } from '../../../rendering/gsplat-geometry';
-import { noteDepthSortCommit } from '../../../rendering/depth-sort-coordinator';
+import type { GeometryCommitHost } from './commit-host';
 import { clampSplatCapacity } from '../../../rendering/element-texture-layout';
 import { syncGSplatMaterialWithGeometry } from '../../../rendering/material-sync-helpers';
 import { isGSplatsUserData } from '../../../types/gsplats';
-import { log, Modules } from '../../../utils/log';
+import { log, LogEmoji, Modules } from '../../../utils/log';
 import type { UpdateSession } from '../../../profiling/update-profiler';
-import type { GPUBufferPool } from '../../../rendering/gpu-buffer-pool';
+import { planInstancedOrdering } from './plan-instanced-ordering';
 import { invalidateRenderObjectFor } from './invalidate-render-object';
 import { stampLadderComplete, stampLoadedViewVersion } from './stamp-view-version';
 import { markFirstCommit } from '../../../profiling/load-timeline';
@@ -57,14 +58,14 @@ function readTruncate(mesh: THREE.Mesh): number {
  */
 export function commitGSplatsGeometry(
   staged: StagedGSplatsCommit,
-  rootGroup: THREE.Group | null,
-  gpuBufferPool: GPUBufferPool | null,
+  host: GeometryCommitHost,
   session: UpdateSession | undefined,
   loadedViewVersion: number
 ): void {
+  const { rootGroup, gpuBufferPool, depthSort } = host;
   if (!rootGroup) return;
 
-  const mesh = rootGroup.getObjectByName(staged.path) as THREE.Mesh;
+  const mesh = findObjectByName(rootGroup, staged.path) as THREE.Mesh;
   if (!mesh || !isGSplatsUserData(mesh.userData)) return;
 
   if (staged.noop) {
@@ -91,6 +92,9 @@ export function commitGSplatsGeometry(
   // BEFORE the writers run: the pool branch reassigns `mesh.geometry`,
   // and `visibleSplatCount` is overwritten near the end of this function.
   const prevGeometry = mesh.geometry;
+  // A pool grow releases the old geometry without ending its held draw.
+  // Preserve the count that was actually on screen.
+  const prevDrawnCount = (prevGeometry as THREE.InstancedBufferGeometry).instanceCount;
   const hadCommittedData = hasCommittedData(mesh);
   const prevCount = mesh.userData.visibleSplatCount;
 
@@ -100,84 +104,29 @@ export function commitGSplatsGeometry(
       const geometry = gpuBufferPool.acquireGSplatsGeometry(staged.path, splatCount);
       const attributesRebuilt = gpuBufferPool.didLastAcquireRebuildAttributes();
       const truncationRadius = readTruncate(mesh);
-      // Keep the previous depth-sort permutation on a same-node same-count
-      // in-place recommit (timepoint scrub): a permutation of [0,count) is a
-      // strictly-no-worse prior than storage order for the ≥1 frame until the
-      // re-sort dispatched by noteDepthSortCommit below lands. Every guard is
-      // load-bearing:
-      // - !attributesRebuilt / geometry === prevGeometry: pool best-fit reuse
-      //   can hand this node a geometry holding ANOTHER node's permutation
-      //   over a different prior count — entries could point at texels never
-      //   rewritten for this commit.
-      // - hadCommittedData: covers this node's own first commit after LOD
-      //   demotion (stamp cleared) — the retained geometry's ordering is no
-      //   longer vouched for.
-      // - prevCount === splatCount: a permutation of [0,prevCount) is not a
-      //   permutation of [0,count).
-      // No blending-mode gate: under commutative modes / depth-sort-off the
-      // ordering is identity anyway (never permuted), so skipping the
-      // redundant rewrite is a no-op; under normal mode the sort corrects
-      // draw order within ~a frame.
-      // The same-buffer prior splits in two on the count.
-      //
-      // Equal count: keep the permutation verbatim (`preserveOrdering`).
-      //
-      // CHANGED count: hand the adapter the previous count so it can REBUILD
-      // the permutation over the new population (`repairSortedIndexForCount`)
-      // instead of falling back to storage order. This closes exactly the gap
-      // the third bullet above names — "a permutation of [0,prevCount) is not a
-      // permutation of [0,count)" is true, and rebuilding it is cheaper than
-      // giving it up. It is also the branch a timelapse actually takes: an nD
-      // re-slice changes the resident count at almost every step, so the
-      // equal-count guard alone never fired and every timepoint drew at least
-      // one unsorted frame — a flash per timepoint under an order-dependent
-      // blending mode (#2290). Measured on the `cloud` demo at a frozen camera
-      // pose, as the fraction of sampled element pairs composited in correct
-      // back-to-front order: storage order 0.617, repaired 0.858, a real sort
-      // 1.000.
-      //
-      // The other three conjuncts are what make the buffer's contents
-      // meaningful at all, and are unchanged.
-      const sameBuffers = hadCommittedData && !attributesRebuilt && geometry === prevGeometry;
-      const preserveOrdering = sameBuffers && prevCount === splatCount;
-      const repairFromCount =
-        sameBuffers && prevCount !== undefined && prevCount !== splatCount ? prevCount : undefined;
-      // Append fast path (depth-sorting Phase 4 Stage 2): when this commit
-      // merely EXTENDS the prefix already on the GPU, write & upload only the
-      // new `[prevCount, splatCount)` suffix. Correctness rests on the
-      // projected prefix being byte-identical to what the GPU holds, which
-      // every conjunct below establishes:
-      // - !attributesRebuilt && geometry === prevGeometry: the pool reused
-      //   THIS node's buffers in place (a grow/best-fit/fresh acquire sets
-      //   attributesRebuilt and may hand back another node's texels). This
-      //   also guarantees splatCount ≤ the existing capacity (the pool only
-      //   grows via release+reacquire, which rebuilds).
-      // - gpuPrefixIntact: a WebGL context restore zeroed the GPU buffers;
-      //   the restore hook clears this so the next commit does a full rewrite.
-      // - splatCount > prevCount: a genuine append (equal → preserveOrdering
-      //   path; shrink/first-commit → full write).
-      // - prefix lineage === committedData: the new concat result forward-
-      //   chains to the exact object last committed here — proving same
-      //   generation (view unchanged: a view change resets the generation, so
-      //   the post-reset concat has no parent), a genuine extension, and that
-      //   the GPU still holds that parent's projection.
-      // - committedTruncate === truncationRadius: `truncate` is a material
-      //   uniform outside the loader view state; a change would restyle the
-      //   prefix's frustum sizing, so a mismatch forces a full rewrite.
-      // Unlike the points/lines gates there is NO optional-field presence
-      // conjunct. Colors white-fill missing parts, while the progressive
-      // GSplat loader requires every concatenated level to agree on label
-      // presence and vocabulary. A valid append therefore preserves both
-      // optional channels across the proven prefix lineage.
-      const canAppend =
-        hadCommittedData &&
-        !attributesRebuilt &&
-        geometry === prevGeometry &&
-        mesh.userData.gpuPrefixIntact === true &&
-        splatCount > (prevCount ?? 0) &&
-        getPrefixParent(staged.sourceData) !== undefined &&
-        getPrefixParent(staged.sourceData) === getCommittedData(mesh) &&
-        mesh.userData.committedTruncate === truncationRadius;
+      // Ordering + append gate, shared with points/lines
+      // (plan-instanced-ordering.ts). The suffix-only upload needs the GPU
+      // prefix intact (a WebGL context restore clears the flag) and the same
+      // `truncate`: a material uniform outside the loader view state, whose
+      // change restyles the prefix's frustum sizing. Unlike the points/lines
+      // gates there is NO optional-field parity conjunct: colors white-fill
+      // missing parts, and the progressive GSplat loader requires every
+      // concatenated level to agree on label presence and vocabulary, so a
+      // proven lineage already preserves both optional channels.
+      const orderingOptions = planInstancedOrdering({
+        geometry,
+        prevGeometry,
+        prevDrawnCount,
+        hadCommittedData,
+        prevCount,
+        count: splatCount,
+        attributesRebuilt,
+        prefixParent: getPrefixParent(staged.sourceData),
+        committedData: getCommittedData(mesh),
+        prefixReusable:
+          mesh.userData.gpuPrefixIntact === true &&
+          mesh.userData.committedTruncate === truncationRadius,
+      });
       // Consume-and-clear (see prefix-lineage.ts retention contract): the
       // lineage entry existed solely for the gate check above — clearing it
       // unpins the parent concat's CPU arrays. A retry after a throwing
@@ -197,7 +146,7 @@ export function commitGSplatsGeometry(
           },
           splatCount,
           truncationRadius,
-          { preserveOrdering, repairFromCount, fromInstance: canAppend ? (prevCount ?? 0) : 0 }
+          orderingOptions
         );
       } catch (err) {
         // Defense-in-depth: a throwing write leaves the buffer content
@@ -234,6 +183,10 @@ export function commitGSplatsGeometry(
         }
       }
     } else {
+      // Consume-and-clear on this path too (prefix-lineage.ts retention
+      // contract): no append gate reads the lineage here, and leaving it set
+      // would keep the parent concat's CPU arrays pinned for the payload's life.
+      setPrefixParent(staged.sourceData, null);
       // Non-pool path: a size change swaps in a fresh geometry+texture
       // pair — evict Three's cached RenderObject exactly like the pool
       // branch above (stale `vertexBuffers` on the WebGPU backend
@@ -241,12 +194,12 @@ export function commitGSplatsGeometry(
       //
       // Same preserve-ordering predicate as the pool branch (see the
       // comment there), minus the pool-reuse guards: nothing has swapped
-      // `mesh.geometry` yet at this point (a size change swaps it INSIDE
+      // `mesh.geometry` at this point (a size change swaps it INSIDE
       // updateInstancedGSplatsMesh, whose rebuild branch always writes
       // identity regardless of the flag — fresh geometries are
-      // zero-filled), so geometry identity + count are the guards.
-      const sameMeshBuffers = hadCommittedData && mesh.geometry === prevGeometry;
-      const preserveOrdering = sameMeshBuffers && prevCount === splatCount;
+      // zero-filled), so geometry identity holds by construction and the
+      // count is the only guard.
+      const preserveOrdering = hadCommittedData && prevCount === splatCount;
       const rebuilt = updateInstancedGSplatsMesh(
         mesh,
         {
@@ -271,47 +224,48 @@ export function commitGSplatsGeometry(
     // chokepoint decomposition as points/lines. The pick material has no
     // such uniform: picking stays brightness-as-depth, alpha-free.)
 
-    if (isGSplatsUserData(mesh.userData)) {
-      mesh.userData.visibleSplatCount = splatCount;
-      mesh.userData.requestedElementCount = processed.splatCount;
-      mesh.userData.droppedElementCount = processed.splatCount - splatCount;
-      // Append-fast-path bookkeeping (depth-sorting Phase 4 Stage 2): record
-      // the truncate baked into the GPU texels and mark the GPU prefix intact.
-      // A full rewrite re-establishes both, so the next commit may append; a
-      // context restore clears gpuPrefixIntact to force a full rewrite.
-      mesh.userData.committedTruncate = readTruncate(mesh);
-      mesh.userData.gpuPrefixIntact = true;
-      mesh.userData.labelIndices = processed.labelIndices;
-      mesh.userData.labelVocabulary = processed.labelVocabulary;
-      // Stamp the view-version this geometry was loaded for so the LOD registry
-      // can distinguish "fresh for the current slice" from merely "ready" (a
-      // re-slice overwrites the buffers in place above without flipping any
-      // readiness flag). Shared with the points/lines commits via the helper.
-      stampLoadedViewVersion(mesh.userData, loadedViewVersion);
-      // Ladder-completeness stamp for the never-downgrade display gate
-      // (see stamp-view-version.ts) — commit-synchronized with the count above.
-      stampLadderComplete(mesh.userData);
-      markFirstCommit('gsplats');
-      // Record the committed data reference — a later update returning the
-      // SAME reference (memoized progressive concat) can then take the
-      // stamp-only no-op path instead of re-projecting + re-uploading.
-      setCommittedData(mesh, staged.sourceData);
-      // The slot → on-disk map is only known after projection, so it is a
-      // MESH-level stamp written here rather than a field on the payload:
-      // `staged.sourceData` may be a SliceCache-owned snapshot handed back by
-      // reference on a cache hit, whose byte size was measured at store time —
-      // mutating it would under-count the cache and break its never-mutated
-      // invariant. Written in lockstep with `setCommittedData` above (no early
-      // return between them) so the map always describes the buffers now on
-      // the GPU, and cleared when this commit has none, so a previous commit's
-      // map can never outlive the geometry it described. The stamp-only noop
-      // branch at the top touches neither: its geometry is unchanged, so the
-      // existing pair still describes exactly what the GPU holds.
-      setElementIdMap(mesh, staged.processed.elementIds);
-    }
+    // `mesh.userData` is GSplats userData: the guard at the top of this
+    // function returned otherwise, and nothing above reassigns it.
+    mesh.userData.visibleSplatCount = splatCount;
+    mesh.userData.requestedElementCount = processed.splatCount;
+    mesh.userData.droppedElementCount = processed.splatCount - splatCount;
+    // Append-fast-path bookkeeping (depth-sorting Phase 4 Stage 2): record
+    // the truncate baked into the GPU texels and mark the GPU prefix intact.
+    // A full rewrite re-establishes both, so the next commit may append; a
+    // context restore clears gpuPrefixIntact to force a full rewrite.
+    mesh.userData.committedTruncate = readTruncate(mesh);
+    mesh.userData.gpuPrefixIntact = true;
+    mesh.userData.labelIndices = processed.labelIndices;
+    mesh.userData.labelVocabulary = processed.labelVocabulary;
+    // Stamp the view-version this geometry was loaded for so the LOD registry
+    // can distinguish "fresh for the current slice" from merely "ready" (a
+    // re-slice overwrites the buffers in place above without flipping any
+    // readiness flag). Shared with the points/lines commits via the helper.
+    stampLoadedViewVersion(mesh.userData, loadedViewVersion);
+    // Ladder-completeness stamp for the never-downgrade display gate
+    // (see stamp-view-version.ts) — commit-synchronized with the count above.
+    stampLadderComplete(mesh.userData);
+    markFirstCommit('gsplats');
+    // Record the committed data reference — a later update returning the
+    // SAME reference (memoized progressive concat) can then take the
+    // stamp-only no-op path instead of re-projecting + re-uploading.
+    setCommittedData(mesh, staged.sourceData);
+    // The slot → on-disk map is only known after projection, so it is a
+    // MESH-level stamp written here rather than a field on the payload:
+    // `staged.sourceData` may be a SliceCache-owned snapshot handed back by
+    // reference on a cache hit, whose byte size was measured at store time —
+    // mutating it would under-count the cache and break its never-mutated
+    // invariant. Written in lockstep with `setCommittedData` above (no early
+    // return between them) so the map always describes the buffers now on
+    // the GPU, and cleared when this commit has none, so a previous commit's
+    // map can never outlive the geometry it described. The stamp-only noop
+    // branch at the top touches neither: its geometry is unchanged, so the
+    // existing pair still describes exactly what the GPU holds.
+    setElementIdMap(mesh, staged.processed.elementIds);
 
     if (splatCount === 0) {
-      log.info(
+      log.verbose(
+        LogEmoji.INFO,
         Modules.SCENE_LOADER,
         `Clearing gsplats for ${staged.path} (no visible splats at current slice)`
       );
@@ -325,7 +279,15 @@ export function commitGSplatsGeometry(
     // detaches it (safe — the memoized-concat noop keys on `sourceData`).
     // The CLAMPED count keeps the SortWorker's permutation values inside
     // [0, textureCapacity) — the worker clamps its own count to it.
-    noteDepthSortCommit(mesh, processed.centers3D, splatCount);
+    // SHARED buffers (retained by the post-projection stage cache and handed
+    // to every later commit of this slice) must never be detached: hand the
+    // coordinator a lazy COPY instead, paid only when the node actually sorts.
+    const { centers3D } = processed;
+    depthSort?.noteCommit(
+      mesh,
+      processed.sharedBuffers ? () => centers3D.slice(0, splatCount * 3) : centers3D,
+      splatCount
+    );
   } finally {
     bufferSession?.end();
   }

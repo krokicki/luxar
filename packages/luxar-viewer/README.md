@@ -82,6 +82,8 @@ group table.
 | `renderer`         | `'webgl' \| 'webgpu'` | `'webgl'`       | Force the rendering backend. `'webgpu'` uses `WebGPURenderer` + TSL `NodeMaterial`, falling back to WebGL2 when no adapter.                                                                                                                  |
 | `webgpuForceWebGL` | `boolean`             | `false`         | Diagnostic: with `renderer: 'webgpu'`, route through Three.js's internal WebGL2 backend while keeping the WebGPU/TSL API surface.                                                                                                            |
 | `perfTimestamp`    | `boolean`             | `false`         | Opt in to WebGPU `timestamp-query` GPU profiling. Tiny runtime cost; ignored under WebGL.                                                                                                                                                    |
+| `renderAlways`     | `boolean`             | `false`         | Render every animation-loop tick instead of only when something changed (`config.animation.renderOnChange`). Kill switch; the pixels are the same either way.                                                                                |
+| `renderAudit`      | `boolean`             | `false`         | Debug only (needs `debug`): render every tick and count ticks the render-on-change scheduler would have skipped whose pixels changed, in the perf counter `render.missedDirty`.                                                              |
 | `openCacheStats`   | `boolean`             | `false`         | Open the data-loading monitor (Cache tab, expanded) once the scene is wired up — useful for profiling cache behaviour.                                                                                                                       |
 | `pinnedDPR`        | `number`              | —               | Pin DPR to `[0.25, native]` and disable adaptive DPR; intended for deterministic tests, captures, and bug reproduction.                                                                                                                      |
 | `lodFade`          | `boolean`             | `true`          | Cross-fade adjacent replacement LOD levels instead of swapping abruptly.                                                                                                                                                                     |
@@ -89,6 +91,13 @@ group table.
 | `lodFinest`        | `boolean`             | `false`         | Force the finest replacement LOD regardless of projected coverage; useful for high-quality still or video capture.                                                                                                                           |
 | `lodBias`          | `number`              | `1`             | Bias replacement LOD selection in screen-area units; `2` selects one occupancy-halved level finer and `4` selects two. Below `1`, a partition-anchored ladder cannot reach its finest level; below `0.5`, neither can a whole-object ladder. |
 | `depthSort`        | `boolean`             | `true`          | Enable worker-based back-to-front sorting for order-dependent geometry; disable for deterministic comparisons.                                                                                                                               |
+| `blendWarmup`      | `boolean`             | device          | WebGL blend-program warm-up (one variant compile per macrotask). On for laptops/desktops, off on phones/tablets; `false` opts out (`?noBlendWarmup`).                                                                                        |
+| `densityGuard`     | `boolean`             | `true`          | Projected-density guard: thin blendable nodes packing more elements per pixel than `config.densityGuard` allows (brightness compensated) and cap refinement rungs (`?noDensityGuard`).                                                       |
+| `densityCap`       | `number`              | config          | Session-only override of the density guard's blendable cap, in elements per drawing-buffer pixel (`?densityCap=8`).                                                                                                                          |
+| `bakeEnvironment`  | `object`              | —               | `{ probe?, resolution? }`: bake the scene-derived environment once the load settles, for `luxar env bake` (`?bakeEnv&probe=…&envResolution=…`). Omit for normal viewing.                                                                     |
+| `control`          | `string \| null`      | —               | Attach to a remote-control hub at this WebSocket URL (`?control`). The embedder is responsible for the URL; see [`docs/guides/specs/REMOTE_CONTROL_SPEC.md`](../../docs/guides/specs/REMOTE_CONTROL_SPEC.md).                                |
+| `controlToken`     | `string \| null`      | —               | Shared secret presented to the hub (`luxar serve --control-token`).                                                                                                                                                                          |
+| `kiosk`            | `boolean`             | `false`         | Lock the display down for unattended use (`?kiosk`); a hard override over the scene's authored `ui.kiosk` block — it can lock, never unlock.                                                                                                 |
 | `allowLinks`       | `boolean`             | `true`          | Allow element-authored links to navigate. Set `false` to keep `element-click` / `element-contextmenu` events and copy actions while suppressing navigation and link menu items.                                                              |
 | `factories`        | `AppFactories`        | —               | Construction overrides for the heavy components built by `init()` (scene manager, recording panel, …). For tests and advanced embedders; omit for the production path.                                                                       |
 
@@ -96,8 +105,10 @@ group table.
 
 Beyond `init()`/`dispose()`, `LuxarApp` exposes flat methods so a host page can
 drive the viewer without the built-in UI. All throw if called before `init()`,
-except `shortcutForAction()` and `getDatasetFault()`. The former returns
-`undefined` until input is available; the latter returns `null` until a dataset is loaded.
+except `on()`, `onDispose()`, `awaitDimensionUpdate()`, `shortcutForAction()` and
+`getDatasetFault()`: the first three only register or wait, `shortcutForAction()`
+returns `undefined` until input is available, and `getDatasetFault()` returns
+`null` until a dataset is loaded.
 
 ```ts
 // Dataset
@@ -121,6 +132,20 @@ app.resize();
 // Screenshot (async — WebGPU readback is async)
 const blob = await app.screenshot({ format: 'png' }); // 'png' | 'webp' | 'jpeg'
 
+// Share-a-view snapshot (camera placement + slice position, JSON-serializable)
+const view = app.captureSnapshot();
+app.restoreSnapshot(view); // { cameraApplied, dimsApplied }
+
+// Remote control: flight, rendering, layers, sound, one-call state
+const { completed } = await app.flyTo(pose, { durationMs: 2000 });
+app.setRenderingSettings({ exposure: 0.5 }); // getRenderingSettings() reads them
+app.setLayer(app.getLayers()[0].path, { opacity: 0.3 });
+const state = app.getViewerState(); // { src, title, camera, dimensions, rendering, layers, audio, controlPanel }
+app.setAudio({ muted: true }); // getAudioState(), playSound(name), stopSound(name)
+
+// Lifetime-scoped cleanup, run by dispose()
+app.onDispose(() => myOverlay.remove());
+
 // Keyboard input
 app.registerContext('annotation', {
   priority: 100,
@@ -143,6 +168,9 @@ app.setInputEnabled(false);
 const helpKey = app.shortcutForAction('help.toggle');
 ```
 
+See [`src/core/app/embedder/README.md`](src/core/app/embedder/README.md) for each
+method's contract (the remote-control table) and the full event table.
+
 **Events** — subscribe with `on(event, listener)`, which returns an unsubscribe:
 
 ```ts
@@ -153,6 +181,10 @@ app.on('dimensions-changed', (dims) => updateMyUI(dims));
 app.on('selection', (sel) => console.log(sel)); // { nodeName, elementIndex, hitNodeName } | null
 app.on('element-click', (event) => console.log(event));
 app.on('element-contextmenu', (event) => console.log(event));
+app.on('camera-changed', (pose) => mirror(pose)); // frame rate while moving; throttle if relaying
+app.on('sound-started', ({ name }) => console.log('playing', name)); // and 'sound-ended'
+app.on('waypoint-arrived', ({ index, completed }) => console.log(index, completed)); // and 'waypoint-departed'
+app.on('webgpu-device-lost', ({ reason }) => location.reload()); // unrecoverable in this release
 // off();
 ```
 
@@ -239,13 +271,15 @@ Note that a scene's `tone_mapping` does **not** apply in layer mode: Luxar
 tone-maps in a post-processing pass the layer does not own, so a host wanting a
 filmic rolloff over additive geometry must set `renderer.toneMapping` itself.
 
-Same single-instance rule as `LuxarApp`, and the two are mutually exclusive. See
+One `LuxarApp` and any number of `LuxarLayer`s may share a page (each layer owns
+its loaders, dimension, material and depth-sort state; the worker pools are
+shared and lease-counted); two `LuxarApp`s may not. See
 [`docs/specs/LUXAR_LAYER_SPEC.md`](../../docs/specs/LUXAR_LAYER_SPEC.md) for the normative public
 contract and [`src/core/layer/README.md`](src/core/layer/README.md) for implementation rationale.
 
 ### What's NOT supported in v1
 
-- **Multiple viewers on the same page.** `ThemeManager`, the worker pool, and several UI components are still page-singletons. Mounting two `LuxarApp` instances at once will share state.
+- **Two `LuxarApp`s on the same page.** The app owns page-global UI (`ThemeManager`, `document.title`, `__luxarDebug`, DOM panels, the keyboard), so a second instance would share it. One app plus any number of `LuxarLayer`s is supported (see Layer mode above).
 - **Shadow DOM isolation.** The viewer uses regular DOM. The CSS is prefixed under `.luxar-*` classnames, but a host page that already styles `.luxar-foo` will collide.
 - **SSR / non-browser rendering.** `LuxarApp.init()` throws a friendly error if `window`/`document` are unavailable.
 
@@ -811,6 +845,8 @@ the native WKWebView launcher fall back to L1-only caching; see the
 - `?src=<path>` — Path to a Zarr dataset (trailing slashes are normalized away)
 - `?theme=<id>` — Select `dark`, `light`, `frosted-glass`, or `liquid-glass`
 - `?debug` — Expose `window.__luxarDebug` for Playwright / dev console
+- `?verboseLog` — Also print per-query / per-part detail log lines (off by default; they reach tens of thousands per slice step on large partitions)
+- `#view=<JSON>` — Restores a shared view bookmark after the dataset loads (camera, slices, rendering and layers)
 - `?title=<text>` — Browser tab title; `luxar serve --open` derives it from the dataset file name, a scene's authored `viewer_config.title` overrides it, and it is dropped when you switch datasets
 - `?kiosk` — Force kiosk mode on as a hard operator override (locks a scene; cannot unlock authored kiosk mode)
 - `?control` / `?control=<ws-url>` — Attach to the serving app's remote-control hub; an explicit URL must be same-origin unless `?controlAllowCrossOrigin` is also present
@@ -829,6 +865,7 @@ the native WKWebView launcher fall back to L1-only caching; see the
 - `?cacheStats` — Open the data-loading monitor on its Cache tab after initialization
 - `?noPrefetch` — Disable adjacent-chunk prefetching (caches still active)
 - `?prefetchDebug` — Verbose prefetch logging
+- `?mainThreadCodecs` — Decompress zarr blosc chunks on the main thread instead of the data workers (safety valve / A/B switch; decoded bytes are identical either way)
 - `?noLodFade` — Disable replacement-LOD cross-fading (enabled by default)
 - `?noLodEnergy` — Disable stream-ladder energy compensation (enabled by default)
 - `?lodFinest` — Force the finest replacement LOD regardless of projected coverage
@@ -841,6 +878,8 @@ the native WKWebView launcher fall back to L1-only caching; see the
 - `?renderer=webgpu` — Use `WebGPURenderer` (TSL `NodeMaterial`) instead of the default `WebGLRenderer`
 - `?renderer=webgpu&webgpuForceWebgl` — Keep the WebGPU/TSL API surface while Three.js routes through its internal WebGL2 backend (diagnostic)
 - `?perfTimestamp` — Enable WebGPU timestamp-query profiling for performance tests
+- `?renderAlways` — Render every animation-loop tick, as before render-on-change (kill switch; pixels are identical, only the redundant re-renders of an unchanged frame come back)
+- `?renderAudit` — Debug only (needs `?debug`): render every tick and count, in the perf counter `render.missedDirty`, ticks the render-on-change scheduler would have skipped whose pixels nonetheless changed
 - `?dpr=<value>` — Pin a fixed device pixel ratio for the session (clamped to `[0.25, native]`) and lock adaptive resolution off
 - `?input=<touch|mouse>` — Force the session's JS input profile: pointer flags, hover capability, touch points, and device tier. This changes device-class fallback budgets (`touch` only — `mouse` keeps the detected tier), primary-tip pen routing, the Safari gesture-canceller gate, and whether the help overlay lists its Touch section; `touch` additionally applies the mobile rendering budgets (adaptive-DPR floor and refresh ceiling, high-DPR cap, GPU-byte and element-texture ceilings, data-worker count) and skips the blend-variant program warm-up. Stylesheets and non-pen gesture routing still follow the real media features and `PointerEvent.pointerType`, so a faithful check needs device emulation or a real device. Detected by default, including iPadOS masquerading as macOS
 - `?lineJoin=<none|miter>` — Force the line join style for the session; applies only to `linePrimitive=screen-space` (the capsule partitions joints unconditionally)

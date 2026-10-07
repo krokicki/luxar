@@ -19,6 +19,7 @@ import type {
   ProjectedDensityProvider,
 } from '../../../data/scene-loader/progressive/density-gate';
 import { DensityGuard, getDensityGuard } from '../../../scene/density-guard';
+import type { ViewContext } from '../../../scene/view-context';
 import {
   ProjectedDensityTracker,
   getProjectedDensityTracker,
@@ -42,6 +43,13 @@ export interface DensityGuardWiringDeps {
   capOverride?: number;
   /** The `?noLodEnergy` flag, passed through to `applyLodFade`. */
   energyComp: boolean;
+  /** The frame's shared camera snapshot (the tracker builds its own without it). */
+  getViewContext?: () => ViewContext;
+  /**
+   * The walk's live sources, read on every frame (the app passes its
+   * SceneManager; layer mode a getter-backed view over its own root, the host
+   * camera and the host drawing buffer).
+   */
   sceneManager: {
     readonly scene: THREE.Object3D | null;
     readonly camera: THREE.Camera | null;
@@ -58,7 +66,13 @@ export interface DensityGuardWiringDeps {
   /** The adaptive-DPR controller, read per frame (constructed after this wiring). */
   getAdaptiveDpr(): { notifyContentChanged(): void } | null | undefined;
   requestRender(): void;
-  /** Injection points for tests; production uses the module singletons. */
+  /**
+   * Invalidate the cached pick buffer (`PickingSystem.markDirty` of the
+   * current dataset's picking system, when there is one). A keep step changes
+   * which elements are pickable, and a still camera dirties nothing else.
+   */
+  invalidatePickBuffer?(): void;
+  /** The app uses module singletons; layers pass their own instances. */
   tracker?: ProjectedDensityTracker;
   guard?: DensityGuard;
 }
@@ -70,8 +84,12 @@ export interface DensityGuardWiring extends DensityGuardControl {
    * (bytes-only admission) while it is off.
    */
   provider: ProjectedDensityProvider;
-  /** Register as the `'projected-density'` per-frame callback. */
-  perFrame(): void;
+  /**
+   * Register as the `'projected-density'` per-frame callback. Returns true
+   * when a keep-fraction step changed what the frame draws (the
+   * render-on-change loop's per-frame callback contract).
+   */
+  perFrame(): boolean;
   /** Per-path snapshot for the data monitor's lattice-glyph `1/K` density chip. */
   densityStates(): Map<string, NodeDensityState>;
 }
@@ -172,6 +190,7 @@ export function wireDensityGuard(deps: DensityGuardWiringDeps): DensityGuardWiri
       const canvas = deps.sceneManager.renderer?.domElement;
       return canvas ? { width: canvas.width, height: canvas.height } : null;
     },
+    getViewContext: deps.getViewContext,
     onVisit: (mesh, record) => guard.observe(mesh, record),
   });
 
@@ -214,15 +233,18 @@ export function wireDensityGuard(deps: DensityGuardWiringDeps): DensityGuardWiri
     thinning: () => summarizeThinning(tracker),
     densityStates: () => collectDensityStates(tracker),
     perFrame: () => {
-      if (!tracker.evaluate()) return;
+      if (!tracker.evaluate()) return false;
       // A keep-step change is a CONTENT change for the DPR controller (its
       // probe baseline no longer describes the scene) and needs a frame.
-      if (guard.takeChanged()) {
+      const changed = guard.takeChanged();
+      if (changed) {
         deps.getAdaptiveDpr()?.notifyContentChanged();
+        deps.invalidatePickBuffer?.();
         deps.requestRender();
       }
       // Deferred rungs resume once the camera has moved in.
       deps.getDefaultLoader()?.resumeDensityDeferredRefinement();
+      return changed;
     },
   };
 }

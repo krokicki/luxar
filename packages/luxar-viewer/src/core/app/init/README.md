@@ -13,9 +13,10 @@ sibling `lifecycle/`, `dataset/`, `debug/`, `overlays/` folders).
 | File                      | Role                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `build-rail-items.ts`     | `buildRailItems(deps)` — assembles the left control-rail's `ControlRailItem` descriptors. Extracted from the pipeline so the rail's wiring lives in one focused, independently-testable place. Buttons dispatch through `inputHandler.getUiActions()` so on-screen and keyboard behaviour share one command surface; rich controls open rail popovers (see `ui/rail-panels/`). Two gates are read here, not in CSS: `getInputProfile().coarsePointer` adds a momentary **Hide panels** item that always closes the open surfaces and makes Help/Monitor activation close the docked panels (one floating surface on a phone); the Fullscreen chip is emitted only when `document.fullscreenEnabled` (or the WebKit flag) is true — the API is absent on iPhone Safari. |
-| `density-guard-wiring.ts` | Wires projected-density tracking into materials, refinement caps, and the per-frame scheduler without making the pipeline restate that policy.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `density-guard-wiring.ts` | Wires projected-density tracking into materials, refinement caps, and the per-frame scheduler without making the pipeline restate that policy. Shared with layer mode (`core/layer/luxar-layer.ts`), which hands it a getter-backed `sceneManager` view over its own root, host camera and drawing buffer.                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `environment-guards.ts`   | Two upfront fail-fast checks: `assertBrowserEnvironment()` (rejects SSR / non-browser callers when `window` / `document` is missing) and `assertThreeRevision(min=185)` (parses `THREE.REVISION`, rejects hosts whose `three` peer is below what the viewer's Timer / post-processing APIs require). Both throw with a remediation message instead of letting a cryptic `ReferenceError` surface mid-init.                                                                                                                                                                                                                                                                                                                                                             |
 | `environment-wiring.ts`   | Wires scene-environment capture, settled-state refresh triggers, and the one-shot `?bakeEnv` path.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `lod-registry-deps.ts`    | `buildLodRegistryDeps(owner, wiring)` — the one `LODGroupRegistryDeps` builder for the app pipeline AND layer mode, so the two cannot drift. Loader-derived deps read the OWNING loader; `getViewContext` / `getPlaybackPeriodMs` / `requestTick` are forwarded when the render-loop owner has them and omitted otherwise (the registry's own fallbacks apply).                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `load-activity.ts`        | Builds the shared predicate for active loader passes and refinement work used by adaptive DPR and scene-environment capture.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `module-overrides.ts`     | `applyModuleOverrides({ wasmPath, workerPath })` — forwards optional asset-URL overrides into the `wasm/` and `workers/worker-pool` module singletons via `setWasmJsUrl` / `setDataWorkerUrl`. Each call is skipped when the option is undefined so default `import.meta.url` resolution still kicks in. Overrides are module-level and persist across `init()` calls (one `LuxarApp` per page in v1).                                                                                                                                                                                                                                                                                                                                                                 |
 | `pipeline.ts`             | `runInitPipeline(ports, partial)` — builds the full subsystem graph in order, populating a `Partial<InitPipelineResult>` accumulator the orchestrator pre-allocates so a thrown step still leaves disposable references behind. Returns the same object cast to the full `InitPipelineResult` once every field is set.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -38,26 +39,35 @@ runInitPipeline(ports, partial)
 │                              awaiting init so a throw stays disposable
 ├── 5. AnimationController    factories.animationController(controls,
 │                              postProcessing); setContextLostPredicate
-│                              → sceneManager.isWebGLContextLost
+│                              → sceneManager.isWebGLContextLost;
+│                              render-on-change: setRenderOnChange
+│                              (?renderAlways), setViewSignatureSource
+│                              (camera + canvas), ?debug&renderAudit
 ├── 6. PerformanceMonitor     subscribes to controller's per-frame bus
 ├── 7. DebugConsole
 ├── 8. Per-frame callback     'dynamic-clipping' → updateDynamicClippingPlanes
 ├── 9. LOD registry factory   SceneLoaderManager.setLODGroupRegistryFactory
-│                              (→ new LODGroupRegistry closing over live
-│                              sceneManager: camera, viewport, displayDims via
-│                              sceneDimsManager, byte budget via
-│                              getGpuByteBudget, resident bytes via the default
-│                              loader's gpuBufferPool)
+│                              (→ new LODGroupRegistry(buildLodRegistryDeps(
+│                              owner, …)) over the live camera, the shared view
+│                              context and the animation manager's playback
+│                              period; byte budget via getGpuByteBudget,
+│                              resident bytes via the OWNING loader's pool)
 ├── 10. Density-guard wiring  wireDensityGuard; register projected-density
 │                              material/refinement hooks and per-frame callback
 ├── 11. LOD-group selector    'lod-group-selector' per-frame callback that
 │                              calls evaluatePerFrame() on the current default
-│                              loader and refreshVisibleCounts() on a swap
+│                              loader → { levelChanged, cullChanged };
+│                              refreshVisibleCounts() + redraw on either,
+│                              adaptive-DPR notifyContentChanged() on a
+│                              level swap ONLY (a partition cull flip is
+│                              camera motion, not new content)
 ├── 12. AdaptiveDPRManager    wired to sceneManager + controller
 ├── 13. Load-activity         buildLoadActivityPredicate; suppress adaptive-DPR
 │                              learning while loaders/refinement are active
 ├── 14. Scene environment     wireSceneEnvironment with the inverse settled
 │                              predicate for capture/refresh/bake scheduling
+│                              (buildEnvironmentSettledPredicate: also waits
+│                              out a LOD level dissolve)
 ├── 15. ResolutionIndicator   targetFPS = ceil(maxFPS/5)*5; show/reset
 │                              on DPR change callback (shown value is
 │                              dpr/nativeDPR — percent of native)
@@ -82,7 +92,8 @@ runInitPipeline(ports, partial)
 │                              (idle native-DPR restore gated on the panel
 │                              not currently recording),
 │                              setRenderSkipPredicate (loop render skipped
-│                              while panel.isLoopRenderSuppressed()) and
+│                              while panel.isLoopRenderSuppressed() or a
+│                              pixel readback is pending) and
 │                              setPacingSuspendPredicate (frame pacing off
 │                              while panel.isCurrentlyRecording())
 ├── 21. LayersPanel           factories.layersPanel(document.body, ctrl);

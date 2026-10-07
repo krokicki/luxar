@@ -2,7 +2,7 @@
 
 Per-slice configuration storage for the unified config package. Each immediate subfolder is one section of the `AppConfig` object — the parent [../README.md](../README.md) composes their literals in `../index.ts`, re-exports their public types through `../types.ts`, and dispatches per-section validation from `../validation.ts`. This folder owns no top-level source files of its own; it exists purely to group the section trios.
 
-Every section conforms to the section-trio pattern: `data.ts` exports the literal (e.g. `cameraConfig: CameraConfig`), `types.ts` defines the interface, and — when the section has cross-field invariants — `validate.ts` exports a section validator (`validateCamera`, `validateBloomConsistency`, `validateAdaptiveDPR`, …) that the central dispatcher invokes. Sections without invariants (`animation/`, `dimension-animation/`, `ui/`) deliberately omit `validate.ts`.
+Every section conforms to the section-trio pattern: `data.ts` exports the literal (e.g. `cameraConfig: CameraConfig`), `types.ts` defines the interface, and — when the section has cross-field invariants — `validate.ts` exports a section validator (`validateCamera`, `validateBloomConsistency`, `validateAdaptiveDPR`, …) that the central dispatcher invokes. Sections without invariants (`animation/`, `dimension-animation/`, `input/`, `ui/`) deliberately omit `validate.ts`.
 
 ## Layout
 
@@ -21,10 +21,11 @@ sections/
 │   └── performance/       # Accumulators, workers, WASM, GPU buffer pool
 ├── depth-sort/            # GSplat camera-motion re-sort scheduling thresholds
 ├── dimension-animation/   # FPS-based playback through dimension ranges
-├── input/                 # Sensitivity + keyboard shortcuts + fly/dim keys
+├── input/                 # Keyboard shortcuts
+├── lod/                   # LOD display policy: level-change dissolve (fadeMs), preload band
 ├── rendering-controls/    # User-adjustable rendering settings (single source of truth)
 ├── scene/                 # Background color, fit ratio, ShaderConfig placeholder
-├── ui/                    # z-index, timings, spinner, debug console, components
+├── ui/                    # panel z-index, timings, debug-console resize, scale bar
 └── webgl/                 # Context attrs, renderer options, render-target config
 ```
 
@@ -39,6 +40,7 @@ sections/
 - **[depth-sort/](depth-sort/README.md)** — depth-sort scheduling: the master `enabled` switch (URL escape hatch `?depthSort=0`), camera-motion re-sort thresholds (`angleThresholdDeg`, `translationFraction`), SortWorker startup deadline (`workerInitTimeoutMs`), and synchronous first-sort frame budget (`syncSortMaxElements`).
 - **[dimension-animation/](dimension-animation/README.md)** — defaults and presets for FPS-based playback through dimension ranges, including loop mode (`once` / `loop` / `bounce`), direction, frame-time floors, and target-vs-actual FPS feedback.
 - **[input/](input/README.md)** — default adjustment sensitivity and the global keyboard shortcut map.
+- **[lod/](lod/README.md)** — LOD display policy: `fadeMs`, the duration of the time-based dissolve between the outgoing and incoming level of a blendable `kind=lod` group (a parked camera settles on one level); `preloadBandFraction`, the band around a threshold in which the level across it is loaded hidden so the dissolve starts on crossing.
 - **[rendering-controls/](rendering-controls/README.md)** — the single source of truth for user-adjustable rendering settings: camera FOV/clipping, bloom, global EOG, anti-aliasing, tone mapping, vignette, detector noise, lens distortion, navigation mode, and adaptive-DPR toggles.
 - **[scene/](scene/README.md)** — canvas background color, default fit-to-bounds framing ratio, and a forward-compatible `ShaderConfig` placeholder reserved for future per-geometry shader knobs.
 - **[ui/](ui/README.md)** — z-index layering, timing constants for transient UI, loading-spinner geometry, debug-console panel/style settings, the scale-bar overlay, and per-component border-radius/padding tokens.

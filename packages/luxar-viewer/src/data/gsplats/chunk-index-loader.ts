@@ -22,7 +22,7 @@
  */
 
 import * as zarr from '../zarr';
-import { log, Modules } from '../../utils/log';
+import { log, LogEmoji, Modules } from '../../utils/log';
 import { fetchChunkBoundsArray, type ChunkSpatialIndex } from '../loaders';
 import type { ChunkPrefetcher } from '../../cache/chunk-prefetcher';
 import type { GSplatsMetadata } from '../../types/gsplats';
@@ -42,7 +42,8 @@ import type { GSplatsMetadata } from '../../types/gsplats';
  */
 export async function loadGSplatsChunkIndex(
   zarrLocation: zarr.Location<zarr.Readable>,
-  attrs: GSplatsMetadata
+  attrs: GSplatsMetadata,
+  signal?: AbortSignal
 ): Promise<ChunkSpatialIndex | null> {
   if (attrs.ordering === 'none') {
     log.info(
@@ -52,11 +53,27 @@ export async function loadGSplatsChunkIndex(
     return null;
   }
 
+  if (attrs.n_splats <= attrs.chunk_size) {
+    // One chunk: its bounds can only decide "load chunk 0 or not", and the
+    // load-all fallback is the superset answer — splats outside the slice are
+    // still dropped per splat by the projection, whose truncation the bounds
+    // were padded by. The probe is a whole extra (serial) request for one
+    // tiny array, and coarse rungs are routinely single-chunk: playback of a
+    // 4-rung partitioned timelapse paid one per rung per timepoint.
+    log.verbose(
+      LogEmoji.QUERY,
+      Modules.GSPLATS_SPATIAL_INDEX_LOADER,
+      `GSplats node fits one chunk (${attrs.n_splats} <= ${attrs.chunk_size}) — no chunk_bounds probe`
+    );
+    return null;
+  }
+
   const result = await fetchChunkBoundsArray(
     zarrLocation,
     'chunk_bounds',
     Modules.GSPLATS_SPATIAL_INDEX_LOADER,
-    'No chunk bounds found - GSplats dataset has no spatial indexing'
+    'No chunk bounds found - GSplats dataset has no spatial indexing',
+    signal
   );
   if (!result) return null;
 
@@ -82,9 +99,8 @@ export async function loadGSplatsChunkIndex(
 }
 
 /**
- * Register a child array's shape with the prefetcher so subsequent
- * range fetches that exceed the array's bounds can be short-circuited
- * (no spurious 404s). No-op when no prefetcher is wired up.
+ * Register a child array's shape to enable adjacency prefetch within
+ * its chunk bounds. No-op when no prefetcher is wired up.
  *
  * The path normalization mirrors the original inline call site: the
  * leading `/` (if present) is stripped from the node path, then

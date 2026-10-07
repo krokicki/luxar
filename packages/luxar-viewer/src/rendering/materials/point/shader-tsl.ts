@@ -65,9 +65,12 @@ import {
   sanitizeAlpha,
   sanitizeNonNegative,
   perspectiveNearFadeTSL,
+  isOrthoProjectionTSL,
+  projectionSizeScaleTSL,
   type TSLNode,
   sortedIndexNode,
   densityDroppedNode,
+  densityAlphaNode,
 } from '../_shared/tsl-helpers';
 import {
   ALPHA_CLAMP,
@@ -128,6 +131,13 @@ export interface PointTSLConfig {
    * match the GLSL wrapper class.
    */
   readonly blendingMode?: BlendingMode;
+  /**
+   * The point texture's width, baked into the vertex addressing as a
+   * literal. Defaults to the width resolved from `nodes.uPointTex.value`;
+   * a wrapper building a SHARED graph (`shared-graph-tsl.ts`) passes it so
+   * it is part of the graph's configuration key.
+   */
+  readonly elementTextureWidth?: number;
 }
 
 /**
@@ -160,13 +170,16 @@ export interface PointTSLNodes {
    * `updatePointTexture`.
    */
   readonly uPointTex: TSLNode;
-  readonly pointSizeFactor: TSLNode;
   readonly maxPointSize: TSLNode;
   readonly radiusScale: TSLNode;
-  readonly uIsOrtho: TSLNode;
   /** Active ordering buffer: 0 = aSortedIndex, 1 = aSortedIndexB. */
   readonly uSortedIndexSlot: TSLNode;
   readonly uDensityDrop: TSLNode;
+  /**
+   * Alpha-over compensation exponent of a thinned `normal` node (1 = identity;
+   * absent on graphs that never read it, e.g. picking).
+   */
+  readonly uDensityAlphaExp?: TSLNode;
   /** Refraction split (glass-partition-tsl.ts): mode + shared glass depth texture. */
   readonly uGlassPartition: GlassPartitionTSLNodes['uGlassPartition'];
   readonly uGlassDepth: GlassPartitionTSLNodes['uGlassDepth'];
@@ -231,14 +244,12 @@ export function pointWebGPUFactory(
   // wrapper class (or by `buildPointTSLNodesFromUniforms` for the
   // harness path). Mutations on `material.uniforms.X.value` go via
   // `proxyIUniform` straight to `node.value` — no per-render
-  // `.onUpdate` callbacks needed. Unlike lines, `uIsOrtho` stays a
-  // RUNTIME uniform here (the graph selects the ortho branch per
-  // vertex), so no rebuild is needed on camera-mode flips.
+  // `.onUpdate` callbacks needed. The ortho branch and the size scale
+  // are read per draw from `cameraProjectionMatrix`, so no rebuild is
+  // needed on camera-mode flips.
   const uPointTex = nodes.uPointTex;
-  const uPointSizeFactor = nodes.pointSizeFactor;
   const uMaxPointSize = nodes.maxPointSize;
   const uRadiusScale = nodes.radiusScale;
-  const uIsOrtho = nodes.uIsOrtho;
   const uNearCull = nodes.uNearCull;
   const uPixelRatio = nodes.uPixelRatio;
   const uResolution = nodes.uResolution;
@@ -324,10 +335,11 @@ export function pointWebGPUFactory(
     // Safe because the width is a per-layout session constant, capped
     // at 4096 on every device (element-texture-layout.ts).
     const pointTexW: TSLNode = int(
-      resolveElementTextureWidth(
-        POINT_TEXTURE_LAYOUT,
-        (nodes.uPointTex as unknown as { value?: { image?: { width?: number } } }).value ?? null
-      )
+      config.elementTextureWidth ??
+        resolveElementTextureWidth(
+          POINT_TEXTURE_LAYOUT,
+          (nodes.uPointTex as unknown as { value?: { image?: { width?: number } } }).value ?? null
+        )
     ).toVar();
     const texelX: TSLNode = pointBase.mod(pointTexW).toVar();
     const texelY: TSLNode = pointBase.div(pointTexW).toVar();
@@ -380,10 +392,13 @@ export function pointWebGPUFactory(
     // absolute 1e-4 clamped VALID depths on tiny-unit scenes
     // (-z ~ 1e-6), shrinking every sprite ~100×. GLSL twin:
     // shader-glsl.ts.
-    const invDistance: TSLNode = int(uIsOrtho)
+    // One ortho test per vertex, shared by the size and near-fade branches.
+    const isOrtho: TSLNode = isOrthoProjectionTSL().toVar();
+    const invDistance: TSLNode = isOrtho
       .equal(int(1))
       .select(float(1.0), mvPos.z.negate().max(float(1e-20)).reciprocal());
-    const basePointSize: TSLNode = normalizedRadius.mul(uPointSizeFactor).mul(invDistance).toVar();
+    const sizeFactor: TSLNode = float(2.0).mul(uResolution.y).mul(projectionSizeScaleTSL());
+    const basePointSize: TSLNode = normalizedRadius.mul(sizeFactor).mul(invDistance).toVar();
 
     // No size compensation: the shifted-truncated super-Gaussian truncates at
     // the sprite edge (rho = 1), so basePointSize already IS the visible extent.
@@ -406,7 +421,7 @@ export function pointWebGPUFactory(
     // floor overrode the scene-relative value on tiny-unit scenes and
     // faded out the whole scene. GLSL twin: shader-glsl.ts.
     const depthFade: TSLNode = perspectiveNearFadeTSL(
-      uIsOrtho,
+      isOrtho,
       mvPos.z,
       max(uNearCull, float(1e-20))
     ).toVar();
@@ -546,6 +561,10 @@ export function pointWebGPUFactory(
       // RGB premultiplied by alpha — CustomBlending + MaxEquation.
       return vec4(finalColor.mul(alpha), alpha);
     }
+    if (config.blendingMode === 'normal' && nodes.uDensityAlphaExp) {
+      // Alpha-over density-guard compensation (GLSL luxarDensityAlpha twin).
+      return vec4(finalColor, densityAlphaNode(alpha, nodes.uDensityAlphaExp));
+    }
     return vec4(finalColor, alpha);
   });
 
@@ -555,21 +574,32 @@ export function pointWebGPUFactory(
   // modelViewProjection chain.
   material.vertexNode = clipPos;
   material.colorNode = colorNode();
-  material.toneMapped = false;
-
-  // Wire blending state from the shared helper. The shader-output
-  // shape (premultiplied RGB vs alpha-weighted) is derived from the
-  // blending mode unless the caller passed an explicit override.
-  // This factory tail is the ONLY state writer at TSL construction
-  // (the ctor never calls applyBlendingMode, unlike the GLSL twin) AND
-  // re-runs on every rebuildGraph — so it must derive the state from
-  // the same mode the output branch above used.
-  const blendingMode: BlendingMode = config.blendingMode ?? 'additive';
-  const opacityValue = (nodes.uOpacity.value as number | undefined) ?? 1.0;
-  // Points never depth-write in `normal` (see `getPointBlendingState`).
-  const blendingState = getPointBlendingState(blendingMode, opacityValue);
-  applyBlendingStateToMaterial(material, blendingState);
+  applyPointMaterialState(
+    material,
+    config.blendingMode ?? 'additive',
+    (nodes.uOpacity.value as number | undefined) ?? 1.0
+  );
   return material;
+}
+
+/**
+ * The non-graph material state the factory derives from the mode
+ * (`toneMapped` + blending). Exported so a wrapper taking its graph from a
+ * shared build (`shared-graph-tsl.ts`) applies the same state to itself.
+ *
+ * This tail is the ONLY state writer at TSL construction (the ctor never
+ * calls applyBlendingMode, unlike the GLSL twin) AND re-runs on every
+ * rebuildGraph — so it must derive the state from the same mode the
+ * graph's output branch used.
+ */
+export function applyPointMaterialState(
+  material: NodeMaterial,
+  blendingMode: BlendingMode,
+  opacityValue: number
+): void {
+  material.toneMapped = false;
+  // Points never depth-write in `normal` (see `getPointBlendingState`).
+  applyBlendingStateToMaterial(material, getPointBlendingState(blendingMode, opacityValue));
 }
 
 /**
@@ -596,12 +626,11 @@ export function buildPointTSLNodesFromUniforms(
     uPointTex: texture(
       (uniforms.uPointTex?.value as THREE.Texture | null) ?? getPlaceholderElementTexture()
     ),
-    pointSizeFactor: uniform((uniforms.pointSizeFactor?.value as number) ?? 1.0),
     maxPointSize: uniform((uniforms.maxPointSize?.value as number) ?? 1.0),
     radiusScale: uniform((uniforms.radiusScale?.value as number) ?? 1.0),
-    uIsOrtho: uniform((uniforms.uIsOrtho?.value as number) ?? 0),
     uSortedIndexSlot: uniform((uniforms.uSortedIndexSlot?.value as number) ?? 0),
     uDensityDrop: uniform((uniforms.uDensityDrop?.value as number) ?? 0),
+    uDensityAlphaExp: uniform((uniforms.uDensityAlphaExp?.value as number) ?? 1),
     ...glassPartitionNodesFromUniforms(uniforms),
     uNearCull: uniform((uniforms.uNearCull?.value as number) ?? 0.1),
     uPixelRatio: uniform((uniforms.uPixelRatio?.value as number) ?? 1),

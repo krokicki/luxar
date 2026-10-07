@@ -6,7 +6,7 @@
  * and resource management without requiring actual WebGL rendering.
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 import * as THREE from 'three';
 import {
   boundingBoxToSphere,
@@ -36,6 +36,8 @@ vi.mock('three', async () => {
       return canvas;
     })();
     shadowMap = { enabled: false, type: actual.PCFShadowMap };
+    // three's default; `createWebGLRenderer` sets the flag from debug mode.
+    debug = { checkShaderErrors: true, onShaderError: null };
     outputColorSpace = actual.SRGBColorSpace;
     toneMapping = actual.NoToneMapping;
 
@@ -289,29 +291,47 @@ vi.mock('../../../rendering/post-processing/post-processing-manager', () => ({
 // The dead mock was silently ignored — SceneManager was being constructed
 // with the real ControlsManager, defeating test isolation.
 vi.mock('../../../controls/controls-manager', () => ({
-  ControlsManager: vi.fn().mockImplementation(() => ({
-    update: vi.fn(),
-    dispose: vi.fn(),
-    setCamera: vi.fn(),
-    setControlType: vi.fn(),
-    returnAutoDollyToBaseline: vi.fn(),
-    getControlType: vi.fn(() => 'orbit'),
-    getControls: vi.fn(() => ({
-      target: new THREE.Vector3(),
+  ControlsManager: vi.fn().mockImplementation(() => {
+    // A minimal working event dispatcher: commitCameraChange counts the
+    // `change` events a write fires and dispatches one itself when none did,
+    // and SceneManager relays controls `change` onto its own `change`.
+    const listeners = new Map<string, Set<(event: { type: string }) => void>>();
+    return {
       update: vi.fn(),
-    })),
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-    saveState: vi.fn(),
-    reset: vi.fn(),
-    lookAt: vi.fn(),
-    getFocusTarget: vi.fn(() => new THREE.Vector3()),
-    setSceneScale: vi.fn(),
-    setTarget: vi.fn(),
-    setDistanceLimits: vi.fn(),
-    setZoomLimits: vi.fn(),
-    reinitialize: vi.fn(),
-  })),
+      dispose: vi.fn(),
+      setCamera: vi.fn(),
+      setControlType: vi.fn(),
+      returnAutoDollyToBaseline: vi.fn(),
+      getControlType: vi.fn(() => 'orbit'),
+      getControls: vi.fn(() => ({
+        target: new THREE.Vector3(),
+        update: vi.fn(),
+      })),
+      addEventListener: vi.fn((type: string, fn: (event: { type: string }) => void) => {
+        let set = listeners.get(type);
+        if (!set) {
+          set = new Set();
+          listeners.set(type, set);
+        }
+        set.add(fn);
+      }),
+      removeEventListener: vi.fn((type: string, fn: (event: { type: string }) => void) => {
+        listeners.get(type)?.delete(fn);
+      }),
+      dispatchEvent: vi.fn((event: { type: string }) => {
+        for (const fn of [...(listeners.get(event.type) ?? [])]) fn(event);
+      }),
+      saveState: vi.fn(),
+      reset: vi.fn(),
+      lookAt: vi.fn(),
+      getFocusTarget: vi.fn(() => new THREE.Vector3()),
+      setSceneScale: vi.fn(),
+      setTarget: vi.fn(),
+      setDistanceLimits: vi.fn(),
+      setZoomLimits: vi.fn(),
+      reinitialize: vi.fn(),
+    };
+  }),
 }));
 
 // Mock the data module (scene-manager imports from '../data', not '../data/zarr-loader')
@@ -412,7 +432,10 @@ vi.mock('../../../scene/scene-manager/render-pipeline/renderer-setup', async () 
 // Import after mocks are set up
 import { SceneManager } from '../../../scene/scene-manager';
 import { loadScene as mockLoadScene } from '../../../data';
+import { SceneLoaderManager } from '../../../data/scene-loader-manager';
+import { attachSceneGraphIndex, sceneGraphIndexOf } from '../../../utils/scene-graph-index';
 import { materialManager } from '../../../rendering/material-manager';
+import { log } from '../../../utils/log';
 import { createWebGPURenderer as mockedCreateWebGPURenderer } from '../../../scene/scene-manager/render-pipeline/renderer-setup';
 import {
   sceneDimsManager,
@@ -516,6 +539,7 @@ describe('SceneManager', () => {
         capabilities: {
           apiSurface: 'webgpu',
           framebufferYDown: true,
+          readbackYDown: true,
           hdr: {
             p3Gamut: false,
             rec2020Gamut: false,
@@ -530,11 +554,6 @@ describe('SceneManager', () => {
           maxTextureSize: 2048,
           maxRenderbufferSize: 2048,
           pointSizeRange: [1, 1024],
-          readBackbufferPixels: async () => ({
-            pixels: new Uint8Array(0),
-            width: 0,
-            height: 0,
-          }),
         },
       });
 
@@ -616,6 +635,41 @@ describe('SceneManager', () => {
       expect(spy).toHaveBeenLastCalledWith(640, 480, expect.anything());
     });
 
+    it('wakes the loop (one scene change) when the drawing buffer actually changes size', async () => {
+      // An idle loop has nothing else to repaint the canvas the resize just
+      // cleared: the container ResizeObserver path lands here.
+      await sceneManager.init({ canvas: mockCanvas as any });
+      const sm = sceneManager as unknown as { resizer: { resizeNow: () => void } };
+      const canvas = sceneManager.renderer.domElement;
+      canvas.width = 800;
+      canvas.height = 600;
+      vi.spyOn(sm.resizer, 'resizeNow').mockImplementation(() => {
+        canvas.width = 1024;
+        canvas.height = 600;
+      });
+      const listener = vi.fn();
+      sceneManager.addEventListener('change', listener);
+
+      sceneManager.resizeToCanvas();
+
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it('stays quiet when a resize leaves the drawing buffer the same size', async () => {
+      await sceneManager.init({ canvas: mockCanvas as any });
+      const sm = sceneManager as unknown as { resizer: { resizeNow: () => void } };
+      const canvas = sceneManager.renderer.domElement;
+      canvas.width = 800;
+      canvas.height = 600;
+      vi.spyOn(sm.resizer, 'resizeNow').mockImplementation(() => {});
+      const listener = vi.fn();
+      sceneManager.addEventListener('change', listener);
+
+      sceneManager.resizeToCanvas();
+
+      expect(listener).not.toHaveBeenCalled();
+    });
+
     it('falls back to window dimensions when the canvas reports zero', async () => {
       await sceneManager.init({ canvas: mockCanvas as any });
       const sm = sceneManager as unknown as { resizer: { resizeNow: () => void } };
@@ -645,7 +699,13 @@ describe('SceneManager', () => {
       await sceneManager.loadSceneData(testUrl);
 
       expect(mockShowLoadingIndicator).toHaveBeenCalled();
-      expect(mockLoadScene).toHaveBeenCalledWith(testUrl, undefined);
+      // The loader config carries the pre-node-load framing hook, and the
+      // loader's commits report to THIS scene manager's depth-sort coordinator.
+      expect(mockLoadScene).toHaveBeenCalledWith(
+        SceneLoaderManager.getInstance(),
+        testUrl,
+        expect.objectContaining({ onSceneMetadata: expect.any(Function) })
+      );
       expect(mockHideLoadingIndicator).toHaveBeenCalled();
     });
 
@@ -655,6 +715,23 @@ describe('SceneManager', () => {
 
       expect(sceneManager.warmBlendModePrograms()).toBe(completion);
       expect(blendWarmupMocks.warmScene).toHaveBeenCalledExactlyOnceWith(sceneManager.scene);
+    });
+
+    it("detaches the outgoing scene's path index when the next load clears it", async () => {
+      // The loader indexes its root; a dataset switch must stop maintaining
+      // the old tree (listeners on every node) rather than leave it to GC.
+      const oldRoot = new THREE.Group();
+      oldRoot.name = 'LuxarScene';
+      oldRoot.add(new THREE.Mesh());
+      attachSceneGraphIndex(oldRoot);
+      sceneManager.scene.add(oldRoot);
+      expect(sceneGraphIndexOf(oldRoot)).toBeDefined();
+
+      await sceneManager.loadSceneData('http://example.com/next.zarr');
+
+      expect(oldRoot.parent).toBeNull();
+      expect(sceneGraphIndexOf(oldRoot)).toBeUndefined();
+      expect(sceneGraphIndexOf(oldRoot.children[0])).toBeUndefined();
     });
 
     it('should clear existing scene before loading new one', async () => {
@@ -877,6 +954,97 @@ describe('SceneManager', () => {
       for (let i = 1; i < order.length; i++) {
         expect(order[i]).toBeGreaterThan(order[i - 1]);
       }
+    });
+
+    /**
+     * Make `loadScene` behave like the real loader: attach the root metadata,
+     * call the config's `onSceneMetadata` hook, then "load the nodes" — and
+     * record the camera pose (and whether the root is in the scene) at that
+     * moment, which is when B4 ranks a partition's parts against the camera.
+     */
+    function loadSceneRecordingNodeLoad(userData: Record<string, unknown>): {
+      atNodeLoad: { position: number[] | null; rootInScene: boolean | null };
+    } {
+      const atNodeLoad = { position: null as number[] | null, rootInScene: null as boolean | null };
+      (mockLoadScene as any).mockImplementationOnce(
+        async (
+          _manager: unknown,
+          _src: string,
+          cfg?: { onSceneMetadata?: (root: THREE.Group) => void }
+        ) => {
+          const T = await import('three');
+          const group = new T.Group();
+          group.name = 'LuxarScene';
+          Object.assign(group.userData, userData);
+          cfg?.onSceneMetadata?.(group);
+          atNodeLoad.position = sceneManager.camera.position.toArray();
+          atNodeLoad.rootInScene = group.parent !== null;
+          return group;
+        }
+      );
+      return { atNodeLoad };
+    }
+
+    it("chains an embedder's onSceneMetadata after its own pre-node framing", async () => {
+      loadSceneRecordingNodeLoad({ positionBounds: { min: [0, 0, 0], max: [40, 40, 40] } });
+      const positionAtHook: number[][] = [];
+      const embedderHook = vi.fn((_root: THREE.Group) => {
+        positionAtHook.push(sceneManager.camera.position.toArray());
+      });
+
+      await sceneManager.loadSceneData('http://example.com/data.zarr', {
+        onSceneMetadata: embedderHook,
+      });
+
+      expect(embedderHook).toHaveBeenCalledTimes(1);
+      expect((embedderHook.mock.calls[0][0] as THREE.Group).name).toBe('LuxarScene');
+      // The embedder sees the opening pose, as load-time decisions do.
+      expect(positionAtHook[0]).toEqual(sceneManager.camera.position.toArray());
+    });
+
+    it('places the AUTHORED opening camera before the scene nodes load', async () => {
+      const { atNodeLoad } = loadSceneRecordingNodeLoad({
+        viewerConfig: { camera: { position: [3, 3, 8], target: [3, 3, 0], up: [0, 1, 0] } },
+        positionBounds: { min: [0, 0, 0], max: [40, 40, 40] },
+      });
+
+      await sceneManager.loadSceneData('http://example.com/data.zarr');
+
+      expect(atNodeLoad.position).toEqual([3, 3, 8]);
+      expect(sceneManager.camera.position.toArray()).toEqual([3, 3, 8]);
+      // Framing early must not put a half-loaded root on screen.
+      expect(atNodeLoad.rootInScene).toBe(false);
+    });
+
+    it('auto-frames the opening camera before the scene nodes load', async () => {
+      const { atNodeLoad } = loadSceneRecordingNodeLoad({
+        positionBounds: { min: [0, 0, 0], max: [40, 40, 40] },
+      });
+
+      await sceneManager.loadSceneData('http://example.com/data.zarr');
+
+      // The pose the nodes were loaded against is the one the scene opens on.
+      expect(atNodeLoad.position).toEqual(sceneManager.camera.position.toArray());
+    });
+
+    it('defers an authored target_node until its node is loaded', async () => {
+      const warning = vi.spyOn(log, 'warning').mockImplementation(() => {});
+      const { atNodeLoad } = loadSceneRecordingNodeLoad({
+        viewerConfig: { camera: { position: [3, 3, 8], target_node: 'focus' } },
+        positionBounds: { min: [0, 0, 0], max: [40, 40, 40] },
+      });
+
+      await sceneManager.loadSceneData('http://example.com/data.zarr');
+
+      expect(atNodeLoad.position).toEqual([0, 0, 8]);
+      expect(atNodeLoad.rootInScene).toBe(false);
+      // The test loader has no node to resolve, so only the post-load framing warns.
+      expect(
+        warning.mock.calls.filter(([, message]) =>
+          String(message).includes("target_node 'focus' not found in scene graph")
+        )
+      ).toHaveLength(1);
+      warning.mockRestore();
     });
 
     it('skips autoFrameCamera when applyZarrViewerConfig reports positionApplied=true', async () => {
@@ -1323,6 +1491,126 @@ describe('SceneManager', () => {
       expect(updateProjectionMatrix).toHaveBeenCalledOnce();
       expect(setZoomLimits).toHaveBeenCalledOnce();
       expect(updateMaterials).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('commitCameraChange', () => {
+    // Every consumer of a camera change (the scene-manager relay, the input
+    // handler, the embedder's camera-changed) listens on the CONTROLS
+    // manager's `change`. commitCameraChange guarantees exactly one reaches
+    // it per programmatic write, whether or not the write fired one itself.
+
+    let sceneChange: Mock<() => void>;
+
+    const controlsChanges = (): number =>
+      vi
+        .mocked(sceneManager.controls.dispatchEvent)
+        .mock.calls.filter(([event]) => (event as { type: string }).type === 'change').length;
+
+    beforeEach(async () => {
+      await sceneManager.init({ canvas: mockCanvas as any });
+      vi.mocked(sceneManager.controls.dispatchEvent).mockClear();
+      sceneChange = vi.fn();
+      sceneManager.addEventListener('change', sceneChange);
+    });
+
+    it('dispatches ONE controls change when the write fires none (fly-mode semantics)', () => {
+      sceneManager.commitCameraChange(() => {});
+
+      expect(controlsChanges()).toBe(1);
+      expect(sceneChange).toHaveBeenCalledTimes(1);
+    });
+
+    it('dispatches ONE controls change with no write at all', () => {
+      sceneManager.commitCameraChange();
+
+      expect(controlsChanges()).toBe(1);
+      expect(sceneChange).toHaveBeenCalledTimes(1);
+    });
+
+    it('adds nothing when the write already made the controls fire change', () => {
+      sceneManager.commitCameraChange(() => {
+        // What an orbit update() does when the pose moved.
+        sceneManager.controls.dispatchEvent({ type: 'change' } as any);
+      });
+
+      expect(controlsChanges()).toBe(1);
+      expect(sceneChange).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not leave its counting listener registered', () => {
+      sceneManager.commitCameraChange(() => {
+        sceneManager.controls.dispatchEvent({ type: 'change' } as any);
+      });
+      sceneManager.commitCameraChange();
+
+      const added = vi
+        .mocked(sceneManager.controls.addEventListener)
+        .mock.calls.filter(([type]) => type === 'change').length;
+      const removed = vi
+        .mocked(sceneManager.controls.removeEventListener)
+        .mock.calls.filter(([type]) => type === 'change').length;
+      // One permanent relay listener from init; every counter is removed.
+      expect(added - removed).toBe(1);
+      expect(controlsChanges()).toBe(2);
+    });
+
+    it('updates the camera world matrix after the write', () => {
+      const order: string[] = [];
+      const updateMatrixWorld = vi
+        .spyOn(sceneManager.camera, 'updateMatrixWorld')
+        .mockImplementation(() => {
+          order.push('updateMatrixWorld');
+        });
+
+      sceneManager.commitCameraChange(() => {
+        order.push('write');
+      });
+
+      expect(updateMatrixWorld).toHaveBeenCalled();
+      expect(order).toEqual(['write', 'updateMatrixWorld']);
+    });
+
+    it('setCameraZoom on an orthographic camera now publishes one controls change', () => {
+      sceneManager.setControlType('ortho');
+      vi.mocked(sceneManager.controls.dispatchEvent).mockClear();
+      sceneChange.mockClear();
+
+      sceneManager.setCameraZoom(2.5);
+
+      expect(controlsChanges()).toBe(1);
+      expect(sceneChange).toHaveBeenCalledTimes(1);
+    });
+
+    it('setFov in perspective publishes exactly one controls change (the embedder hook)', () => {
+      expect(sceneManager.setFov(63)).toBe(true);
+
+      expect(controlsChanges()).toBe(1);
+      expect(sceneChange).toHaveBeenCalledTimes(1);
+    });
+
+    it('centerOnOrigin publishes exactly one controls change when controls.update fires none', () => {
+      sceneManager.centerOnOrigin();
+
+      expect(controlsChanges()).toBe(1);
+      expect(sceneChange).toHaveBeenCalledTimes(1);
+    });
+
+    it('centerCameraOnScene publishes exactly one controls change when controls.update fires none', () => {
+      sceneManager.centerCameraOnScene();
+
+      expect(controlsChanges()).toBe(1);
+      expect(sceneChange).toHaveBeenCalledTimes(1);
+    });
+
+    it('fitCameraToObject publishes exactly one controls change when controls.update fires none', () => {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2));
+      sceneManager.scene.add(mesh);
+
+      sceneManager.fitCameraToObject(mesh);
+
+      expect(controlsChanges()).toBe(1);
+      expect(sceneChange).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1787,9 +2075,11 @@ describe('SceneManager', () => {
       // via the sphere formula — not arbitrary positive values. Compute the
       // expectation from the same [-5,5] bounds and the camera's actual pose.
       const cam = sceneManager.camera.position;
+      const direction = sceneManager.camera.getWorldDirection(new THREE.Vector3());
       const expected = calculateClippingPlanesFromSphere(
         boundingBoxToSphere({ min: { x: -5, y: -5, z: -5 }, max: { x: 5, y: 5, z: 5 } }),
-        { x: cam.x, y: cam.y, z: cam.z }
+        { x: cam.x, y: cam.y, z: cam.z },
+        direction
       );
       expect(result.near).toBeCloseTo(expected.near, 4);
       expect(result.far).toBeCloseTo(expected.far, 4);

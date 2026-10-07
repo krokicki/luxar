@@ -23,6 +23,7 @@ import {
 import { getPointTexture } from '../../../rendering/point-geometry';
 import { getLineTexture } from '../../../rendering/line-geometry';
 import { getSplatTexture } from '../../../rendering/gsplat-geometry';
+import { DepthSortCoordinator } from '../../../rendering/depth-sort-coordinator';
 
 type GeomType = 'points' | 'lines' | 'gsplats';
 
@@ -187,7 +188,7 @@ describe('GPUBufferPool self-invalidation on out-of-band dispose', () => {
         // The eviction sweep finds nothing left of the zombie: no second
         // dispose, no phantom eviction counted.
         const evictionsBefore = pool.getStats().evictions;
-        for (let i = 0; i < 305; i++) pool.beginFrame(); // past evictionFrames
+        for (let i = 0; i < 305; i++) pool.beginCommit(); // past evictionCommits
         pool.evictUnused();
         expect(zombieDisposeEvents).toBe(1);
         expect(pool.getStats().evictions).toBe(evictionsBefore);
@@ -239,7 +240,7 @@ describe('GPUBufferPool self-invalidation on out-of-band dispose', () => {
     }
     expect(pool.getStats().activeBuffers).toBe(3);
 
-    const removed = clearLoadedSceneContent(scene);
+    const removed = clearLoadedSceneContent(scene, new DepthSortCoordinator());
     expect(removed).toBe(3);
 
     expect(pool.getStats().activeBuffers).toBe(0);
@@ -275,7 +276,7 @@ describe('GPUBufferPool self-invalidation on out-of-band dispose', () => {
   });
 
   it('normal release → evict → dispose path is unchanged (listener does not double-count)', () => {
-    // evictionFrames=1 so the pooled buffer becomes evictable quickly.
+    // evictionCommits=1 so the pooled buffer becomes evictable quickly.
     const evictPool = new GPUBufferPool(20, 1, 5, () => 0);
     const geometry = evictPool.acquirePointsGeometry('n', 1000);
 
@@ -291,10 +292,10 @@ describe('GPUBufferPool self-invalidation on out-of-band dispose', () => {
 
     const evictionsBefore = evictPool.getStats().byType.points.evictions;
 
-    // Advance past evictionFrames and sweep — the normal LRU path disposes
+    // Advance past evictionCommits and sweep — the normal LRU path disposes
     // the pooled buffer (splices from the bucket BEFORE dispose, so the
     // self-invalidation listener finds nothing in activeBuffers → no-op).
-    for (let i = 0; i < 3; i++) evictPool.beginFrame();
+    for (let i = 0; i < 3; i++) evictPool.beginCommit();
     evictPool.evictUnused();
 
     // The geometry was disposed exactly once by the normal eviction path.

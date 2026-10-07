@@ -101,11 +101,11 @@ export async function renderOnce(page: Page): Promise<void> {
   await page.evaluate(() => {
     (window as any).__luxarDebug.renderOnce();
   });
-  // Intentional fixed sleep: renderOnce() schedules a frame, but the actual
-  // paint lands on the next browser frame, which is not directly observable
-  // from JS. 300 ms rather than the historical 100 ms so the wait also covers
-  // a frame-pacing cooldown (#1724): renderOnce() is `startAnimation()`, which
-  // does not shorten a cooldown already armed on a running loop, and the
+  // Intentional fixed sleep: renderOnce() ticks synchronously on a stopped
+  // loop, but a running loop paints at its next browser frame, which is not
+  // directly observable from JS. 300 ms rather than the historical 100 ms
+  // also covers a frame-pacing cooldown (#1724): renderOnce() does not
+  // shorten a cooldown already armed on a running loop, and the
   // cooldown is bounded by `config.animation.pacing.maxCooldownMs` — 250 ms,
   // hard-coded here rather than imported, since this helper must not pull
   // viewer config into the Node-side test process. So 300 ms is that 250 ms
@@ -1058,7 +1058,12 @@ export async function waitForRenderStable(
           const debug = (window as any).__luxarDebug;
           const info = debug?.renderer?.info;
           const frame = info?.render?.frame ?? info?.frame;
-          return typeof frame === 'number' && frame >= t;
+          const done = typeof frame === 'number' && frame >= t;
+          // Render-on-change: an unchanged frame is not re-rendered, so the
+          // counter only advances on a real change. Keep asking for frames
+          // until it has advanced far enough (each poll is one rAF).
+          if (!done) debug?.renderOnce?.();
+          return done;
         },
         target,
         { timeout: Math.min(timeout, 3000) }
@@ -1234,7 +1239,11 @@ export async function waitForNextRender(page: Page, frames = 2, timeout = 5000):
           const debug = (window as any).__luxarDebug;
           const info = debug?.renderer?.info;
           const frame = info?.render?.frame ?? info?.frame;
-          return typeof frame === 'number' && frame >= target;
+          const done = typeof frame === 'number' && frame >= target;
+          // Render-on-change: idle ticks no longer render, so one kick yields
+          // one frame. Re-kick on every poll until the counter has advanced.
+          if (!done) debug?.renderOnce?.();
+          return done;
         },
         targetFrame,
         { timeout: Math.min(timeout, 3000) }

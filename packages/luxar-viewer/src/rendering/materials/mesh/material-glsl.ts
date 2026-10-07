@@ -37,6 +37,7 @@ import {
   syncMeshShadingDefines,
   type MeshShadingMode,
 } from './appearance';
+import { copyRuntimeUniforms, MESH_RUNTIME_UNIFORMS } from '../_shared/runtime-uniforms';
 import type { CameraAwareMaterial } from '../_shared/camera-aware-material';
 import { getGlassDepthTexture } from '../_shared/glass-partition';
 import type { ColormapAwareMaterial } from '../_shared/colormap-aware-material';
@@ -197,7 +198,6 @@ export class MeshMaterial
         uAlphaCutoff: {
           value: clampAppearanceFraction(materialConfig.alphaCutoff, MESH_DEFAULTS.alphaCutoff),
         },
-        uIsOrtho: { value: 0 }, // 0 = perspective, 1 = orthographic
         uNearCull: { value: 0.1 }, // Default; overridden per-scene by updateCameraParams
         // Refraction split (glass-partition.ts): mode 0 outside the split; the ONE
         // shared depth texture the split renders the refracting glass into.
@@ -268,20 +268,14 @@ export class MeshMaterial
   /**
    * Update the camera-dependent uniforms.
    *
-   * `_fov` and `_resolution` are accepted and IGNORED: they exist so a material can
-   * size a screen-space sprite, and a mesh's size is its own geometry. Only the two
-   * near-fade inputs are consumed. Named with a leading underscore so the asymmetry
-   * is visible at the signature rather than buried in the body.
+   * `_resolution` is accepted and IGNORED: it exists so a material can size a
+   * screen-space sprite, and a mesh's size is its own geometry; the near fade's
+   * ortho test reads the projection matrix of the draw
+   * (`luxarIsOrthoProjection()`). Only `nearCull` is consumed. Named with a leading
+   * underscore so the asymmetry is visible at the signature rather than buried in
+   * the body.
    */
-  updateCameraParams(
-    _fov: number,
-    _resolution: THREE.Vector2,
-    isOrtho: boolean = false,
-    nearCull?: number,
-    _pixelRatio?: number
-  ): void {
-    this.uniforms.uIsOrtho.value = isOrtho ? 1 : 0;
-
+  updateCameraParams(_resolution: THREE.Vector2, nearCull?: number, _pixelRatio?: number): void {
     if (nearCull !== undefined) {
       this.uniforms.uNearCull.value = nearCull;
     }
@@ -506,13 +500,8 @@ export class MeshMaterial
     // display frame forced DoubleSide must keep drawing both faces until the next
     // commit re-applies it.
     cloned.side = this.side;
-    cloned.uniforms.uInvGamma.value = this.uniforms.uInvGamma.value;
-    // Camera state, carried live rather than left at the constructor defaults: a
-    // clone that reverted to perspective/0.1 would fade against the WRONG near
-    // plane until the next broadcast reached it — and under ortho, where the fade
-    // is the identity, it would fade at all.
-    cloned.uniforms.uIsOrtho.value = this.uniforms.uIsOrtho.value;
-    cloned.uniforms.uNearCull.value = this.uniforms.uNearCull.value;
+    // Runtime state a fresh clone would reset (MESH_RUNTIME_UNIFORMS, ../_shared/runtime-uniforms.ts).
+    copyRuntimeUniforms(this, cloned, MESH_RUNTIME_UNIFORMS);
     return cloned as this;
   }
 

@@ -16,12 +16,14 @@
  */
 
 import { describe, it, expect, expectTypeOf, vi, beforeEach } from 'vitest';
+import * as THREE from 'three';
 import {
   runInitPipeline,
   type InitPipelineResult,
   type InitPipelinePorts,
 } from '../../../../../core/app/init/pipeline';
 import { EventGroup } from '../../../../../utils/cross-layer/event-group';
+import { eventBus } from '../../../../../utils/cross-layer/event-bus';
 import type { DimensionSlidersConfig } from '../../../../../input/input-handler/panel-capabilities';
 import type { SliderConfig } from '../../../../../ui/dimension-sliders';
 
@@ -37,7 +39,7 @@ function makeSceneStub(opts: { initThrows?: boolean } = {}) {
       if (opts.initThrows) throw new Error('sceneManager.init failed');
     }),
     controls: { kind: 'controls' },
-    postProcessing: { kind: 'pp' },
+    postProcessing: { kind: 'pp', isCaptureInProgress: false, setCaptureReleasedCallback: vi.fn() },
     isWebGLContextLost: vi.fn().mockReturnValue(false),
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),
@@ -47,6 +49,16 @@ function makeSceneStub(opts: { initThrows?: boolean } = {}) {
     // runtime here; `environment` stays null so the per-frame tick is a no-op.
     attachEnvironmentRuntime: vi.fn(),
     environment: null,
+    // The app's depth-sort coordinator, owned by the scene manager; stubbed so
+    // the wiring and warm-up are observable (and no real SortWorker/WASM is
+    // spawned here).
+    depthSort: {
+      configure: vi.fn(),
+      setEnabled: vi.fn(),
+      warmUp: vi.fn(),
+      evaluatePerFrame: vi.fn(),
+      isAvailable: vi.fn(() => true),
+    },
   };
 }
 function makeAnimationStub() {
@@ -55,10 +67,15 @@ function makeAnimationStub() {
     setIdleRestorePredicate: vi.fn(),
     setRenderSkipPredicate: vi.fn(),
     setPacingSuspendPredicate: vi.fn(),
+    setRenderOnChange: vi.fn(),
+    setViewSignatureSource: vi.fn(),
+    setRenderAudit: vi.fn(),
     addPerFrameCallback: vi.fn(),
     setAdaptiveDPRManager: vi.fn(),
     setDensityGuardControl: vi.fn(),
     startAnimation: vi.fn(),
+    requestRender: vi.fn(),
+    requestTick: vi.fn(),
   };
 }
 function makeRenderingControlsStub() {
@@ -87,8 +104,9 @@ function makeRecordingPanelStub() {
   };
 }
 function makeLayersPanelStub() {
-  // `setAudioPort` is the sound layer's late-bound port for the sound rows.
-  return { kind: 'layers', setAudioPort: vi.fn() };
+  // `setAudioPort` is the sound layer's late-bound port for the sound rows;
+  // `layerState.onChange` is where the scene environment hears appearance edits.
+  return { kind: 'layers', setAudioPort: vi.fn(), layerState: { onChange: vi.fn(() => vi.fn()) } };
 }
 function makeInputHandlerStub() {
   return {
@@ -195,14 +213,6 @@ vi.mock('../../../../../data/scene-loader-manager', () => ({
 vi.mock('../../../../../utils/cross-layer/notifier', () => ({
   notifier: { error: vi.fn() },
 }));
-// The coordinator is module-scoped live authority; mocked so the warm-up
-// call is observable (and so no real SortWorker/WASM is spawned here).
-vi.mock('../../../../../rendering/depth-sort-coordinator', () => ({
-  configureDepthSort: vi.fn(),
-  setDepthSortEnabled: vi.fn(),
-  warmUpDepthSortWorker: vi.fn(),
-  evaluateDepthSortPerFrame: vi.fn(),
-}));
 vi.mock('../../../../../utils/input-capabilities', () => ({
   getInputProfile: () => inputProfile,
 }));
@@ -216,11 +226,7 @@ vi.mock('../../../../../rendering/gpu-byte-budget', async (importOriginal) => ({
 import { InputHandler, KeyAction } from '../../../../../input';
 import { ControlRail } from '../../../../../ui/control-rail';
 import { getSceneLoader, SceneLoaderManager } from '../../../../../data/scene-loader-manager';
-import {
-  configureDepthSort,
-  setDepthSortEnabled,
-  warmUpDepthSortWorker,
-} from '../../../../../rendering/depth-sort-coordinator';
+import { DataMonitorManager } from '../../../../../ui/data-monitor-manager';
 import {
   DEFAULT_MAX_PIXEL_RATIO,
   setMaxPixelRatioCap,
@@ -306,6 +312,91 @@ describe('runInitPipeline', () => {
     };
     const registry = factory({ currentViewVersion: 1 });
     expect(registry.deps.getLodBias()).toBe(4);
+  });
+
+  it('refreshes the shared view after a clipping callback throws', async () => {
+    const ports = makePorts();
+    const { factories, sceneStub } = makeFactoryOverrides();
+    ports.options.factories = factories as never;
+    let canvasWidth = 800;
+    Object.defineProperty(ports.options.canvas, 'clientWidth', { get: () => canvasWidth });
+    Object.defineProperty(ports.options.canvas, 'clientHeight', { get: () => 600 });
+    const camera = new THREE.PerspectiveCamera();
+    const clipping = vi.fn();
+    Object.assign(sceneStub, {
+      camera,
+      renderer: { domElement: ports.options.canvas },
+      updateDynamicClippingPlanes: clipping,
+    });
+
+    await runInitPipeline(ports, {});
+
+    const manager = SceneLoaderManager.getInstance() as unknown as {
+      setLODGroupRegistryFactory: ReturnType<typeof vi.fn>;
+    };
+    const factory = manager.setLODGroupRegistryFactory.mock.calls[0][0] as (owner: unknown) => {
+      deps: { getViewContext: () => { viewportCss: { width: number; height: number } | null } };
+    };
+    const registry = factory({ currentViewVersion: 1 });
+    const views = registry.deps.getViewContext;
+    const animation = factories.animationController.mock.results[0].value as ReturnType<
+      typeof makeAnimationStub
+    >;
+    const callback = animation.addPerFrameCallback.mock.calls.find(
+      ([id]) => id === 'dynamic-clipping'
+    )?.[1] as () => void;
+
+    callback();
+    expect(views().viewportCss?.width).toBe(800);
+    canvasWidth = 600;
+    clipping.mockImplementation(() => {
+      throw new Error('clipping failed');
+    });
+    expect(callback).toThrow('clipping failed');
+    expect(views().viewportCss?.width).toBe(600);
+  });
+
+  it('a read outside the frame loop sees the camera as it is now', async () => {
+    // A load-time consumer (no per-frame callback between the camera move and
+    // its read) must not get the last tick's pose.
+    const ports = makePorts();
+    const { factories, sceneStub } = makeFactoryOverrides();
+    ports.options.factories = factories as never;
+    const camera = new THREE.PerspectiveCamera();
+    Object.assign(sceneStub, {
+      camera,
+      renderer: { domElement: ports.options.canvas },
+      updateDynamicClippingPlanes: vi.fn(),
+    });
+
+    await runInitPipeline(ports, {});
+
+    const manager = SceneLoaderManager.getInstance() as unknown as {
+      setLODGroupRegistryFactory: ReturnType<typeof vi.fn>;
+    };
+    const factory = manager.setLODGroupRegistryFactory.mock.calls[0][0] as (owner: unknown) => {
+      deps: {
+        getViewContext: () => {
+          cameraWorldPosition: THREE.Vector3;
+          projectionMatrix: THREE.Matrix4;
+        };
+      };
+    };
+    const views = factory({ currentViewVersion: 1 }).deps.getViewContext;
+    const animation = factories.animationController.mock.results[0].value as ReturnType<
+      typeof makeAnimationStub
+    >;
+    const callback = animation.addPerFrameCallback.mock.calls.find(
+      ([id]) => id === 'dynamic-clipping'
+    )?.[1] as () => void;
+
+    callback();
+    expect(views().cameraWorldPosition.x).toBe(0);
+    camera.position.x = 5; // e.g. load-time framing, between ticks
+    camera.far = 42;
+    camera.updateProjectionMatrix();
+    expect(views().cameraWorldPosition.x).toBe(5);
+    expect(views().projectionMatrix.elements).toEqual(camera.projectionMatrix.elements);
   });
 
   describe('partial-accumulator contract (load-bearing)', () => {
@@ -431,7 +522,7 @@ describe('runInitPipeline', () => {
       };
 
       expect(audio.deps.getCamera()).toBeUndefined();
-      expect(audio.deps.getSceneGraph()).toBeNull();
+      expect(audio.deps.getSceneNodeIndex()).toBeNull();
       expect(audio.deps.getSceneScale()).toBe(1);
       expect(audio.deps.resolveNodeCenter('missing')).toBeNull();
       expect(audio.deps.container()).toBeInstanceOf(HTMLElement);
@@ -603,26 +694,49 @@ describe('runInitPipeline', () => {
       // for the main thread and misses its init deadline at a few million
       // elements, which used to disable sorting for the session.
       //
-      // Order is load-bearing, not cosmetic: `warmUpDepthSortWorker` early-outs
-      // on the `depthSortEnabled` flag, so warming up before
-      // `setDepthSortEnabled` would spawn a worker (and load WASM) for a
-      // `?depthSort=0` session, and before `configureDepthSort` a starved
-      // retry's self-wake would have no `requestRender` to call.
-      const { factories } = makeFactoryOverrides();
+      // Order is load-bearing, not cosmetic: `warmUp` early-outs on the
+      // coordinator's enabled flag, so warming up before `setEnabled` would
+      // spawn a worker (and load WASM) for a `?depthSort=0` session, and before
+      // `configure` a starved retry's self-wake would have no `requestRender`
+      // to call.
+      const { factories, sceneStub } = makeFactoryOverrides();
       const ports = makePorts();
       ports.options.factories = factories as never;
 
       await runInitPipeline(ports, {});
 
-      expect(warmUpDepthSortWorker).toHaveBeenCalledTimes(1);
-      const warmUpOrder = vi.mocked(warmUpDepthSortWorker).mock.invocationCallOrder[0];
-      expect(vi.mocked(setDepthSortEnabled).mock.invocationCallOrder[0]).toBeLessThan(warmUpOrder);
-      expect(vi.mocked(configureDepthSort).mock.invocationCallOrder[0]).toBeLessThan(warmUpOrder);
+      const depthSort = sceneStub.depthSort;
+      expect(depthSort.warmUp).toHaveBeenCalledTimes(1);
+      const warmUpOrder = depthSort.warmUp.mock.invocationCallOrder[0];
+      expect(depthSort.setEnabled.mock.invocationCallOrder[0]).toBeLessThan(warmUpOrder);
+      expect(depthSort.configure.mock.invocationCallOrder[0]).toBeLessThan(warmUpOrder);
+    });
+
+    it("wires the app coordinator's verdict into each monitor the factory creates", async () => {
+      // The degrade note reads THIS app's coordinator, not a module-wide one.
+      const { factories, sceneStub } = makeFactoryOverrides();
+      const ports = makePorts();
+      ports.options.factories = factories as never;
+      await runInitPipeline(ports, {});
+
+      const monitor = { setDensityProvider: vi.fn(), setDepthSortAvailabilityProvider: vi.fn() };
+      const manager = vi.mocked(DataMonitorManager.getInstance)();
+      vi.mocked(manager.hasMonitor).mockReturnValueOnce(false);
+      vi.mocked(manager.getMonitor).mockReturnValue(monitor as never);
+      const factory = vi.mocked(SceneLoaderManager.getInstance().setMonitorFactory).mock
+        .calls[0][0]!;
+      factory('default');
+
+      const provider = monitor.setDepthSortAvailabilityProvider.mock.calls[0][0] as () => boolean;
+      sceneStub.depthSort.isAvailable.mockReturnValueOnce(false);
+      expect(provider()).toBe(false);
+      expect(sceneStub.depthSort.isAvailable).toHaveBeenCalled();
+      vi.mocked(manager.getMonitor).mockReturnValue(null as never);
     });
   });
 
   describe('recording-panel predicate wiring', () => {
-    it('the render-skip predicate follows the loop-render-suppression flag, never real-time recording', async () => {
+    it('the render-skip predicate follows offline capture and pending readbacks', async () => {
       const { factories } = makeFactoryOverrides();
       const ports = makePorts();
       ports.options.factories = factories as never;
@@ -631,6 +745,7 @@ describe('runInitPipeline', () => {
 
       const animation = factories.animationController.mock.results[0].value as {
         setRenderSkipPredicate: ReturnType<typeof vi.fn>;
+        startAnimation: ReturnType<typeof vi.fn>;
       };
       const panel = factories.recordingPanel.mock.results[0].value as {
         isCurrentlyRecording: ReturnType<typeof vi.fn>;
@@ -654,6 +769,25 @@ describe('runInitPipeline', () => {
       // dropped before the capture's teardown awaits its driver abort.
       panel.isLoopRenderSuppressed.mockReturnValue(true);
       expect(predicate()).toBe(true);
+
+      panel.isLoopRenderSuppressed.mockReturnValue(false);
+      const sceneManager = factories.sceneManager.mock.results[0].value as {
+        postProcessing: { isCaptureInProgress: boolean };
+      };
+      sceneManager.postProcessing.isCaptureInProgress = true;
+      expect(predicate()).toBe(true);
+      sceneManager.postProcessing.isCaptureInProgress = false;
+      expect(predicate()).toBe(false);
+
+      const postProcessing = factories.sceneManager.mock.results[0].value.postProcessing as {
+        setCaptureReleasedCallback: ReturnType<typeof vi.fn>;
+      };
+      expect(postProcessing.setCaptureReleasedCallback).toHaveBeenCalledTimes(1);
+      const onCaptureReleased = postProcessing.setCaptureReleasedCallback.mock
+        .calls[0][0] as () => void;
+      animation.startAnimation.mockClear();
+      onCaptureReleased();
+      expect(animation.startAnimation).toHaveBeenCalledTimes(1);
     });
 
     it('the pacing-suspend predicate follows the BROAD recording flag, not loop-render suppression', async () => {
@@ -740,6 +874,150 @@ describe('runInitPipeline', () => {
         // The module mock is shared; restore the suite-wide default.
         vi.mocked(getSceneLoader).mockReturnValue(null as never);
       }
+    });
+  });
+
+  describe("'lod-group-selector' per-frame callback", () => {
+    async function wireSelector() {
+      const { factories } = makeFactoryOverrides();
+      const ports = makePorts();
+      ports.options.factories = factories as never;
+      const partial: Partial<InitPipelineResult> = {};
+      await runInitPipeline(ports, partial);
+      const anim = factories.animationController.mock.results[0].value as {
+        addPerFrameCallback: ReturnType<typeof vi.fn>;
+      };
+      const entry = anim.addPerFrameCallback.mock.calls.find(
+        (call) => call[0] === 'lod-group-selector'
+      );
+      if (!entry) throw new Error("'lod-group-selector' was never registered");
+      const tick = entry[1] as () => boolean;
+      const notify = (
+        partial.adaptiveDPRManager as unknown as { notifyContentChanged: ReturnType<typeof vi.fn> }
+      ).notifyContentChanged;
+      return { tick, notify };
+    }
+
+    it('runs before the projected-density guard (#2944 review B)', async () => {
+      // Same phase ⇒ registration order is run order. The density guard sets
+      // each drawn level's keep fraction, so it must see the level the
+      // selector reveals THIS frame, not draw it one frame on its stale keep.
+      const { factories } = makeFactoryOverrides();
+      const ports = makePorts();
+      ports.options.factories = factories as never;
+      await runInitPipeline(ports, {});
+      const anim = factories.animationController.mock.results[0].value as {
+        addPerFrameCallback: ReturnType<typeof vi.fn>;
+      };
+      const ids = anim.addPerFrameCallback.mock.calls.map((call) => call[0] as string);
+      expect(ids.indexOf('lod-group-selector')).toBeGreaterThanOrEqual(0);
+      expect(ids.indexOf('projected-density')).toBeGreaterThan(ids.indexOf('lod-group-selector'));
+    });
+
+    function stubRegistry(frame: { levelChanged: boolean; cullChanged: boolean }) {
+      const refreshVisibleCounts = vi.fn();
+      vi.mocked(getSceneLoader).mockReturnValue({
+        refreshVisibleCounts,
+        lodGroupRegistry: {
+          evaluatePerFrame: vi.fn(() => frame),
+          // False on purpose: the redraw must follow from the frame's own
+          // report, not from a drawn-state flag the stub happens to raise.
+          takeDrawnStateChanged: vi.fn(() => false),
+        },
+      } as never);
+      return { refreshVisibleCounts };
+    }
+
+    it('a partition cull flip redraws but does NOT reset adaptive-DPR learning', async () => {
+      // An orbit over a partitioned scene flips part visibility constantly; that
+      // is the same content seen from elsewhere, not new content. Treating it as
+      // a content change pulled learned floors forward and confounded every probe.
+      const { tick, notify } = await wireSelector();
+      try {
+        const { refreshVisibleCounts } = stubRegistry({ levelChanged: false, cullChanged: true });
+        const drew = tick();
+        expect(notify).not.toHaveBeenCalled();
+        expect(drew).toBe(true);
+        // The visible tally still tracks the parts actually drawn.
+        expect(refreshVisibleCounts).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.mocked(getSceneLoader).mockReturnValue(null as never);
+      }
+    });
+
+    it('a level swap redraws AND notifies adaptive DPR of a content change', async () => {
+      const { tick, notify } = await wireSelector();
+      try {
+        const { refreshVisibleCounts } = stubRegistry({ levelChanged: true, cullChanged: false });
+        const drew = tick();
+        expect(notify).toHaveBeenCalledTimes(1);
+        expect(drew).toBe(true);
+        expect(refreshVisibleCounts).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.mocked(getSceneLoader).mockReturnValue(null as never);
+      }
+    });
+
+    it('a no-op frame neither redraws nor notifies', async () => {
+      const { tick, notify } = await wireSelector();
+      try {
+        const { refreshVisibleCounts } = stubRegistry({ levelChanged: false, cullChanged: false });
+        const drew = tick();
+        expect(notify).not.toHaveBeenCalled();
+        expect(drew).toBe(false);
+        expect(refreshVisibleCounts).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(getSceneLoader).mockReturnValue(null as never);
+      }
+    });
+  });
+
+  describe('geometry-commit render requests', () => {
+    // A commit to a node the frame does not draw (the hidden eager level of an
+    // LOD group re-committed every playback tick) must keep the loop ticking,
+    // since the registry may now show that level, but must not force a render
+    // of an unchanged frame (#2944 C3: 2 renders per playback tick).
+    async function wireCommits() {
+      const { factories } = makeFactoryOverrides();
+      const ports = makePorts();
+      ports.options.factories = factories as never;
+      await runInitPipeline(ports, {});
+      const anim = factories.animationController.mock.results[0].value as {
+        requestRender: ReturnType<typeof vi.fn>;
+        requestTick: ReturnType<typeof vi.fn>;
+      };
+      const manager = SceneLoaderManager.getInstance() as unknown as {
+        setRequestRender: ReturnType<typeof vi.fn>;
+      };
+      const onCommit = manager.setRequestRender.mock.calls.at(-1)![0] as (drawn: boolean) => void;
+      anim.requestRender.mockClear();
+      anim.requestTick.mockClear();
+      return { anim, onCommit, ports };
+    }
+
+    it('a drawn loader commit requests a render', async () => {
+      const { anim, onCommit, ports } = await wireCommits();
+      onCommit(true);
+      expect(anim.requestRender).toHaveBeenCalledWith('geometry');
+      ports.events.dispose();
+    });
+
+    it('an undrawn loader commit only keeps the loop ticking', async () => {
+      const { anim, onCommit, ports } = await wireCommits();
+      onCommit(false);
+      expect(anim.requestRender).not.toHaveBeenCalled();
+      expect(anim.requestTick).toHaveBeenCalled();
+      ports.events.dispose();
+    });
+
+    it("an undrawn 'geometry-committed' only keeps the loop ticking", async () => {
+      const { anim, ports } = await wireCommits();
+      eventBus.emit('geometry-committed', { drawn: false });
+      expect(anim.requestRender).not.toHaveBeenCalled();
+      expect(anim.requestTick).toHaveBeenCalled();
+      eventBus.emit('geometry-committed', { drawn: true });
+      expect(anim.requestRender).toHaveBeenCalledWith('geometry');
+      ports.events.dispose();
     });
   });
 

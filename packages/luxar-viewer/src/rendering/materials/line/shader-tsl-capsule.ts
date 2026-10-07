@@ -13,9 +13,11 @@
  * - the whole vertex stage is ONE `Fn()` body of `.toVar()` statements;
  *   varyings are declared outside and `.assign()`ed inside; per-segment
  *   constants are `flat` (written identically on every vertex).
- * - build-time JS branches replace GLSL defines: `config.isOrtho`,
- *   `config.useColormap`, `config.gammaOne`, `config.noGOG`, and the
- *   blending mode select the graph variant.
+ * - build-time JS branches replace GLSL defines: `config.useColormap`,
+ *   `config.gammaOne`, `config.noGOG`, and the blending mode select the
+ *   graph variant. The projection is NOT one: the ortho branch is read per
+ *   draw from the projection matrix (`isOrthoProjectionTSL()`), exactly as
+ *   the GLSL twin's `luxarLineIsOrtho`.
  * - every GLSL discard is mirrored exactly (cut sides, zero support,
  *   zero-contribution colour).
  * - unlike the quad fragment, the capsule fragment reads NO
@@ -70,13 +72,16 @@ import {
   VOLUMETRIC_TAU_EPS,
 } from '../_shared/volumetric';
 import {
-  perspectiveNearFadeStaticTSL,
+  projectionSizeScaleTSL,
+  isOrthoProjectionTSL,
+  perspectiveNearFadeTSL,
   sanitizeAlpha,
   sanitizeNonNegative,
   tslLineJointCapSuppression,
   type TSLNode,
   sortedIndexNode,
   densityDroppedNode,
+  densityAlphaNode,
 } from '../_shared/tsl-helpers';
 import {
   applyBlendingStateToMaterial,
@@ -105,8 +110,10 @@ export function capsuleLineWebGPUFactory(
   const uPixelRatio = nodes.uPixelRatio;
   const uNearCull = nodes.uNearCull;
   const uMaxLinePixelWidth = nodes.uMaxLinePixelWidth;
-  const uPerspectiveLineScale = nodes.uPerspectiveLineScale;
-  const uOrthoLineScale = nodes.uOrthoLineScale;
+  // Pixels per view unit at unit depth: resY * |P11|, read from the
+  // projection this draw uses (GLSL twin: luxarProjectionSizeScale). It
+  // replaces the former CPU-pushed perspective / ortho line-scale uniforms.
+  const lineScale: TSLNode = uResolution.y.mul(projectionSizeScaleTSL());
   const uOpacity = nodes.uOpacity;
   const uInvGamma = nodes.uInvGamma;
   const uIntensity = nodes.uIntensity;
@@ -125,13 +132,16 @@ export function capsuleLineWebGPUFactory(
   const uScalarScale = config.useColormap ? nodes.uScalarScale! : null;
 
   const blendingMode = config.blendingMode ?? 'additive';
+  // Alpha-over density-guard compensation on the normal graph — identical to
+  // the quad's (GLSL luxarDensityAlpha twin); every other graph is untouched.
+  const alphaExp = blendingMode === 'normal' ? nodes.uDensityAlphaExp : undefined;
+  const normalAlpha = (a: TSLNode): TSLNode => (alphaExp ? densityAlphaNode(a, alphaExp) : a);
   const volumetric = isVolumetricMode(blendingMode);
   const opaque = blendingMode === 'opaque';
   const premultiplyRGB =
     config.useMaxRGBContribution !== undefined
       ? config.useMaxRGBContribution
       : blendingMode === 'max';
-  const isOrtho = config.isOrtho === true;
 
   // ---- Varyings (stencil-local geometry interpolated; cuts flat) ----
   // Geometry varyings are screen-space quantities pre-multiplied by the
@@ -165,10 +175,11 @@ export function capsuleLineWebGPUFactory(
     // === Line-texture fetch (6 texels/segment) ===
     const lineBase: TSLNode = int(aSortedIndex).mul(int(6)).toVar();
     const lineTexW: TSLNode = int(
-      resolveElementTextureWidth(
-        LINE_TEXTURE_LAYOUT,
-        (nodes.uLineTex as unknown as { value?: { image?: { width?: number } } }).value ?? null
-      )
+      config.elementTextureWidth ??
+        resolveElementTextureWidth(
+          LINE_TEXTURE_LAYOUT,
+          (nodes.uLineTex as unknown as { value?: { image?: { width?: number } } }).value ?? null
+        )
     ).toVar();
     const texelX: TSLNode = lineBase.mod(lineTexW).toVar();
     const texelY: TSLNode = lineBase.div(lineTexW).toVar();
@@ -184,11 +195,16 @@ export function capsuleLineWebGPUFactory(
 
     const startDepth: TSLNode = mvStart.z.negate().toVar();
     const endDepth: TSLNode = mvEnd.z.negate().toVar();
+    // The ortho branch of the projection THIS draw uses (GLSL twin:
+    // `luxarLineIsOrtho = luxarIsOrthoProjection()`) — no CPU-pushed flag, no
+    // graph rebuild on a camera-kind flip. Materialised ahead of every `If`.
+    const isOrtho: TSLNode = isOrthoProjectionTSL().equal(int(1)).toVar();
+    const isPersp: TSLNode = isOrtho.not().toVar();
     // Projected-density thinning rides the both-behind cull (GLSL twin does the
     // same), so a dropped segment takes the zero-varyings path.
-    const bothBehind: TSLNode = isOrtho
-      ? float(0.0).greaterThan(1.0)
-      : startDepth.lessThan(nearCull).and(endDepth.lessThan(nearCull));
+    const bothBehind: TSLNode = isPersp.and(
+      startDepth.lessThan(nearCull).and(endDepth.lessThan(nearCull))
+    );
     const culled: TSLNode = bothBehind.or(densityDropped).toVar();
 
     // Near-plane segment clip (perspective only) — stencil AND domain.
@@ -200,7 +216,7 @@ export function capsuleLineWebGPUFactory(
     const clippedB: TSLNode = float(0.0).toVar();
     const tA: TSLNode = float(0.0).toVar();
     const tB: TSLNode = float(1.0).toVar();
-    if (!isOrtho) {
+    If(isPersp, () => {
       If(startDepth.lessThan(nearCull).and(endDepth.greaterThanEqual(nearCull)), () => {
         tA.assign(nearCull.sub(startDepth).div(endDepth.sub(startDepth)));
         mvA.assign(mix(mvStart, mvEnd, tA));
@@ -210,7 +226,7 @@ export function capsuleLineWebGPUFactory(
         mvB.assign(mix(mvStart, mvEnd, tB));
         clippedB.assign(1.0);
       });
-    }
+    });
 
     const w0: TSLNode = sanitizeNonNegative(lineT0.w, 0.0);
     const w1: TSLNode = sanitizeNonNegative(lineT1.w, 0.0);
@@ -228,22 +244,24 @@ export function capsuleLineWebGPUFactory(
     const pB: TSLNode = clipB.xy.div(wB).mul(0.5).add(0.5).mul(uResolution).toVar();
 
     // Per-end pixel radius: 2σ-trimmed fraction of the quad half-width.
-    const rawA: TSLNode = (
-      isOrtho
-        ? wEffA.mul(uOrthoLineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
-        : wEffA
-            .mul(uPerspectiveLineScale)
-            .mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
-            .div(max(mvA.z.negate(), nearCull))
-    ).toVar();
-    const rawB: TSLNode = (
-      isOrtho
-        ? wEffB.mul(uOrthoLineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
-        : wEffB
-            .mul(uPerspectiveLineScale)
-            .mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
-            .div(max(mvB.z.negate(), nearCull))
-    ).toVar();
+    const rawA: TSLNode = isOrtho
+      .select(
+        wEffA.mul(lineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH),
+        wEffA
+          .mul(lineScale)
+          .mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
+          .div(max(mvA.z.negate(), nearCull))
+      )
+      .toVar();
+    const rawB: TSLNode = isOrtho
+      .select(
+        wEffB.mul(lineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH),
+        wEffB
+          .mul(lineScale)
+          .mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
+          .div(max(mvB.z.negate(), nearCull))
+      )
+      .toVar();
     const appearancePixelRatio: TSLNode = uPixelRatio.max(float(1.0));
     const minRadius: TSLNode = appearancePixelRatio.mul(CAPSULE_MIN_RADIUS_PX).toVar();
     const packetMinRadius: TSLNode = appearancePixelRatio
@@ -299,17 +317,15 @@ export function capsuleLineWebGPUFactory(
       const farObj: TSLNode = farTexel.xyz.toVar();
       pFarWidth.assign(sanitizeNonNegative(farTexel.w, 0.0));
       const mvFar: TSLNode = modelViewMatrix.mul(vec4(farObj, 1.0)).toVar();
-      if (!isOrtho) {
-        const farDepth: TSLNode = mvFar.z.negate().toVar();
-        If(farDepth.lessThan(nearCull), () => {
-          const tF: TSLNode = clamp(
-            jointDepth.sub(nearCull).div(max(jointDepth.sub(farDepth), float(1e-20))),
-            0.0,
-            1.0
-          ).toVar();
-          mvFar.assign(mix(mvJoint, mvFar, tF));
-        });
-      }
+      const farDepth: TSLNode = mvFar.z.negate().toVar();
+      If(isPersp.and(farDepth.lessThan(nearCull)), () => {
+        const tF: TSLNode = clamp(
+          jointDepth.sub(nearCull).div(max(jointDepth.sub(farDepth), float(1e-20))),
+          0.0,
+          1.0
+        ).toVar();
+        mvFar.assign(mix(mvJoint, mvFar, tF));
+      });
       pFarDepth.assign(max(mvFar.z.negate(), nearCull));
       const cl: TSLNode = cameraProjectionMatrix.mul(mvFar).toVar();
       const px: TSLNode = cl.xy
@@ -350,12 +366,10 @@ export function capsuleLineWebGPUFactory(
                   ),
                 () => {
                   const rpFarA: TSLNode = clamp(
-                    isOrtho
-                      ? pFarWidth.mul(uOrthoLineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
-                      : pFarWidth
-                          .mul(uPerspectiveLineScale)
-                          .mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
-                          .div(pFarDepth),
+                    isOrtho.select(
+                      pFarWidth.mul(lineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH),
+                      pFarWidth.mul(lineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH).div(pFarDepth)
+                    ),
                     minRadius,
                     uMaxLinePixelWidth
                   ).toVar();
@@ -410,12 +424,10 @@ export function capsuleLineWebGPUFactory(
                   .or(dot(qhat, u).lessThan(-0.5).and(min(rawA, rawB).greaterThanEqual(minRadius))),
                 () => {
                   const rpFarB: TSLNode = clamp(
-                    isOrtho
-                      ? pFarWidth.mul(uOrthoLineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
-                      : pFarWidth
-                          .mul(uPerspectiveLineScale)
-                          .mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH)
-                          .div(pFarDepth),
+                    isOrtho.select(
+                      pFarWidth.mul(lineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH),
+                      pFarWidth.mul(lineScale).mul(CAPSULE_RADIUS_PER_QUAD_HALFWIDTH).div(pFarDepth)
+                    ),
                     minRadius,
                     uMaxLinePixelWidth
                   ).toVar();
@@ -464,9 +476,11 @@ export function capsuleLineWebGPUFactory(
     const tOrig: TSLNode = mix(tA, tB, tc).toVar();
     const rawC: TSLNode = mix(rawA, rawB, tc).toVar();
     const widthScale: TSLNode = min(rawC.div(minRadius), 1.0).toVar();
-    const fade: TSLNode = isOrtho
-      ? float(1.0).toVar()
-      : perspectiveNearFadeStaticTSL(false, mix(mvA.z, mvB.z, tc), nearCull).toVar();
+    const fade: TSLNode = perspectiveNearFadeTSL(
+      isOrthoProjectionTSL(),
+      mix(mvA.z, mvB.z, tc),
+      nearCull
+    ).toVar();
 
     vCutN.assign(vec4(cutA.xy, cutB.xy));
     vPack.assign(
@@ -659,7 +673,7 @@ export function capsuleLineWebGPUFactory(
       const a: TSLNode = intensityScaled.mul(uOpacity).toVar();
       return vec4(gammaColor.mul(a), a);
     }
-    return vec4(gammaColor, intensityScaled.mul(uOpacity));
+    return vec4(gammaColor, normalAlpha(intensityScaled.mul(uOpacity)));
   });
 
   const material = outMaterial ?? new NodeMaterial();

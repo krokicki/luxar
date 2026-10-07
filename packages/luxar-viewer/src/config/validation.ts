@@ -10,7 +10,6 @@ import { log, Modules } from '../utils/log';
 import { validateCamera } from './sections/camera/validate';
 import { validateScene } from './sections/scene/validate';
 import { validateWebGL } from './sections/webgl/validate';
-import { validateInput } from './sections/input/validate';
 import { validateControls } from './sections/controls/validate';
 import {
   validateRendering,
@@ -21,6 +20,7 @@ import { validateCache } from './sections/cache/validate';
 import { validateAdaptiveDPR } from './sections/adaptive-dpr/validate';
 import { validateDensityGuard } from './sections/density-guard/validate';
 import { validateDepthSort } from './sections/depth-sort/validate';
+import { validateLod } from './sections/lod/validate';
 
 /**
  * Validation result interface
@@ -59,15 +59,13 @@ export function validateConfig(config: AppConfig): ValidationResult {
   // Validate scene configuration
   validateScene(config, errors, warnings);
 
-  // Validate input configuration
-  validateInput(config, errors, warnings);
-
   // Validate WebGL configuration
   validateWebGL(config, errors, warnings);
 
   // Validate adaptive DPR control-loop configuration
   validateAdaptiveDPR(config, errors, warnings);
   validateDensityGuard(config, errors);
+  validateLod(config, errors);
 
   // Validate depth-sort scheduling configuration
   validateDepthSort(config, errors, warnings);

@@ -2,26 +2,26 @@
  * Initial scene-load orchestrator.
  *
  * Sequence:
- *   1. Reset monitor + abort any in-flight worker tasks from a prior dataset.
- *   2. Dispose the previous loader (caching store, GPU pool, L0 cache,
- *      colormap LUTs, monitor closures) — awaited so stale writes drain.
- *   3. Fresh AbortController wired into the worker pool's signal.
- *   4. Reset the predictive-prefetch baseline (otherwise the first
- *      updateView extrapolates from the prior dataset's slicePosition).
- *   5. Set up L0 + L1/L2 caches; open the zarr root.
- *   6. Build the empty root THREE.Group + initialize scene dimensions
+ *   1. Reset the monitor's loader bindings.
+ *   2. (The loader is one-shot: `SceneLoader.loadScene` refuses a second
+ *      load, so there is never an earlier dataset of THIS loader to dispose.)
+ *   3. Create a fresh dataset AbortController for this loader's worker calls.
+ *   4. Set up L0 + L1/L2 caches; open the zarr root.
+ *   5. Build the empty root THREE.Group + initialize scene dimensions
  *      from `scene_dimensions` metadata.
- *   7. Surface a toast when ndim > 16 (WASM ceiling — TS fallback works
+ *   6. Surface a toast when ndim > 16 (WASM ceiling — TS fallback works
  *      but is slower).
- *   8. Persist `viewer_config` + `position_bounds` onto the root group's
+ *   7. Persist `viewer_config` + `position_bounds` onto the root group's
  *      userData for the UI to read.
- *   9. Build the scene graph (zarr group enumeration → SceneNode tree).
- *  10. Recursively load every leaf via `loadSceneNodes`.
- *  11. Load overlay configs (screen-space annotations).
- *  12. Wire post-load monitor providers (cache stats, loader maps, etc.).
- *  13. Schedule progressive GSplats LOD refinement when any multi-LOD
- *      loader still has higher LODs to fetch (the initial-load path
- *      only fetches LOD 0; without this kick, higher LODs would not
+ *   8. Build the scene graph (zarr group enumeration → SceneNode tree).
+ *   9. Hand the root to `config.onSceneMetadata` (the scene manager frames
+ *      the opening camera from the metadata), then recursively load every
+ *      leaf via `loadSceneNodes`.
+ *  10. Load overlay configs (screen-space annotations).
+ *  11. Wire post-load monitor providers (cache stats, loader maps, etc.).
+ *  12. Schedule progressive LOD refinement (all four geometry types) when
+ *      any multi-LOD loader still has higher LODs to fetch (the initial-load
+ *      path only fetches LOD 0; without this kick, higher LODs would not
  *      load until the user's first updateView).
  *
  * The orchestrator (`SceneLoader.loadScene`) is a thin wrapper that
@@ -33,12 +33,14 @@ import * as THREE from 'three';
 import * as zarr from '../../zarr';
 import { log, Modules, LogEmoji } from '../../../utils/log';
 import { notifier } from '../../../utils/cross-layer/notifier';
-import { getWorkerPool, warmUpDataWorkerPool } from '../../../workers/worker-pool';
+import { attachSceneGraphIndex } from '../../../utils/scene-graph-index';
+import { warmUpDataWorkerPool } from '../../../workers/worker-pool';
+import { retainCustomColormapTextures } from '../../../rendering/colormap-textures';
 import { markLoad, noteRefinementComplete } from '../../../profiling/load-timeline';
 import type { RefinementHoldReason } from '../../../types/data-monitor-types';
 import { ZarrSceneAttrs, SceneDimensionAttrs } from '../../../types/zarr';
 import { enforceFormatVersion } from '../../format-version';
-import type { LoaderConfig, SceneNode, ViewState } from '../../data-loader-types';
+import type { GeometryKind, LoaderConfig, SceneNode, ViewState } from '../../data-loader-types';
 import type { DataLoader } from '../../data-loader-types';
 import type { LinesDataLoader } from '../../../types/lines';
 import type { MeshDataLoader } from '../../../types/mesh';
@@ -56,6 +58,7 @@ import type {
 } from '../../scene-loader-monitor-port';
 import type { LODGroupRegistry } from '../../../scene/lod-group-registry';
 import { setupCaches } from '../cache/cache-setup';
+import { adoptChunkPacks } from '../cache/chunk-packs';
 import { wireMonitorAfterLoad } from '../monitor/monitor-wiring';
 import { createCommittedLODCountReader } from '../monitor/committed-lod-reader';
 import { createDrawOrderProvider } from '../monitor/draw-order-provider';
@@ -65,6 +68,7 @@ import { buildSceneGraph } from '../nodes/build-scene-graph';
 import { loadSceneNodes } from '../nodes/load-scene-nodes';
 import { reportLoadOutcome } from '../loaders/failure-report';
 import { SceneIdentityWatchdog, canonicalJson } from '../../scene-identity-watchdog';
+import type { RootDocumentFetch } from '../../../cache/root-document-prefetch';
 import type { NodeBuildCtx } from '../nodes/build-ctx';
 
 /**
@@ -107,10 +111,6 @@ export interface LoadSceneCtx {
 
   // Lifecycle callbacks the orchestrator owns:
   normalizeURL(url: string): string;
-  /** Await any previous loader's teardown before constructing the new one. */
-  dispose(): Promise<void>;
-  /** Reset the predictive-prefetch baseline. */
-  clearViewStatePrev(): void;
   /**
    * Validate `scene_dimensions` blob and update the loader's viewState.
    * Implementation in `initialize-scene-dimensions.ts`; the orchestrator
@@ -145,23 +145,14 @@ export interface LoadSceneCtx {
    * contexts need not supply it.
    */
   refinementHoldReason?(path: string): RefinementHoldReason | null;
-  /** Kick the GSplats LOD refinement loop after initial load. */
-  scheduleGSplatsRefinement(): Promise<void>;
+  /** Geometry kinds with a sweep-registered loader that has rungs left to stream. */
+  kindsWithMoreLODs(): GeometryKind[];
   /**
-   * Drain any view-state queued while the serialization lock was held,
-   * re-entering `updateView` with it. Only used by the post-load refinement
-   * kick's rejection handler — see the comment at that call site.
-   *
-   * @returns True when a state was drained (the re-entered pass then settles
-   *   the parked waiters itself); false when nothing was queued.
+   * Take the serialization lock and run the progressive refinement drain
+   * (`PassScheduler.startRefinement`), which releases it — and, should the
+   * orchestrator glue die, releases it and drains what queued meanwhile.
    */
-  drainPendingViewState(): boolean;
-  /**
-   * Settle callers parked in `updateView`'s supersede branch. Only used by the
-   * post-load refinement kick's rejection handler, for the case where nothing
-   * was queued and so no re-entered pass will resolve them.
-   */
-  resolvePassWaiters(): void;
+  startRefinement(): void;
 
   // Resource-write setters — orchestrator nulls/sets its own fields.
   /**
@@ -178,9 +169,6 @@ export interface LoadSceneCtx {
   setZarrStore(store: zarr.Readable): void;
   setRootGroup(group: THREE.Group): void;
   setSceneGraph(graph: SceneNode): void;
-  setUpdateInProgress(value: boolean): void;
-  /** Current abort controller — `loadScene` aborts it before disposing. */
-  getDatasetAbortController(): AbortController | null;
 }
 
 /**
@@ -237,6 +225,33 @@ function synthesizeSceneDimensionsFromNode(
 }
 
 /**
+ * Hand the load-time root fetch's `ETag` to the identity watchdog, so its first
+ * poll is conditional rather than a third full download of the root document.
+ *
+ * Asynchronous and non-blocking: by the time the root is open the shared fetch
+ * has settled (the open read it, or validation did), and a fetch that has not
+ * simply leaves the first poll unconditional, as before. The evidence passed is
+ * the cheapest available — the token validation already derived when there is
+ * one, else the bytes for the watchdog to check at its first probe.
+ */
+function seedWatchdogFromLoad(
+  watchdog: SceneIdentityWatchdog,
+  rootDocument: Promise<RootDocumentFetch> | null
+): void {
+  if (!rootDocument) return;
+  void rootDocument.then((result) => {
+    const served = result.served;
+    if (!served?.etag) return;
+    const token = result.peekToken();
+    watchdog.seedFromLoad(
+      token?.mode === 'content-hash'
+        ? { doc: served.doc, etag: served.etag, contentHash: token.hash }
+        : { doc: served.doc, etag: served.etag, body: served.bytes }
+    );
+  });
+}
+
+/**
  * Execute the full initial-load sequence and return the populated root
  * THREE.Group. Mutates the orchestrator's resource references via the
  * ctx setters.
@@ -244,53 +259,34 @@ function synthesizeSceneDimensionsFromNode(
 export async function loadScene(url: string, ctx: LoadSceneCtx): Promise<THREE.Group> {
   log.custom(LogEmoji.SCENE, Modules.SCENE_LOADER, `Loading scene from ${url}`);
   markLoad('loadStart', { url });
+  // The profiler is manager-wide: drop the previous dataset's rows, or they
+  // accumulate across switches and every merge's stale sweep walks them all.
+  // reset() bumps the profiler's generation, so a session still in flight from
+  // the outgoing dataset ends as a no-op instead of merging into the new tree.
+  ctx.profiler?.reset();
   setSceneLineLoad(0);
 
   // Clear any existing loaders from monitor before loading new scene
   ctx.monitor()?.disconnectAllLoaders();
 
-  // Abort any in-flight worker tasks queued by the previous dataset.
-  // Doing this BEFORE `dispose()` settles already-racing
-  // `runWithTimeout` callers immediately so they unwind without
-  // waiting for the worker tasks to complete — the worker keeps
-  // executing the WASM kernels to completion (no WASM cancellation),
-  // but the results are dropped.
-  const prevAbort = ctx.getDatasetAbortController();
-  if (prevAbort) {
-    prevAbort.abort();
-    ctx.setDatasetAbortController(null);
-  }
-  getWorkerPool().setAbortSignal(undefined);
-
-  // Spawn the data workers NOW, in parallel with the metadata fetch and the
-  // teardown below, rather than letting the first chunk decode pay for it.
+  // Spawn the data workers NOW, in parallel with the metadata fetch, rather
+  // than letting the first chunk decode pay for it.
   // Measured on a hosted demo: lazy creation started the pool 1.93 s after
   // this point, by which time LOD 0's bytes had already arrived and were
   // simply waiting. Fire-and-forget and idempotent across dataset switches.
   warmUpDataWorkerPool();
 
-  // Dispose of any existing loaders. Awaited so the previous caching
-  // store fully drains (prefetcher tear-down, OPFS metadata flush,
-  // validation cancellation) before we construct the next one — without
-  // this, rapid dataset switches let an old store's writes land after
-  // the new store starts initialising.
-  if (ctx.loaders.size > 0) {
-    await ctx.dispose();
-  }
-
-  // Fresh abort source for THIS dataset; wire into the worker pool so
-  // every subsequent `runWithTimeout` races against it.
+  // Fresh abort source for THIS dataset. The loader threads it into its own
+  // worker calls; the pool is shared by every host on the page, so it holds
+  // no dataset signal of its own.
   const datasetAbortController = new AbortController();
   ctx.setDatasetAbortController(datasetAbortController);
-  getWorkerPool().setAbortSignal(datasetAbortController.signal);
+  // ...which also names this dataset's hold on the page-wide custom-LUT cache
+  // (released by `dispose.ts`).
+  retainCustomColormapTextures(datasetAbortController);
 
-  // S6: reset per-loader prefetch predictor state. Without this,
-  // the first updateView on a new dataset would extrapolate from
-  // the prior dataset's slicePosition, producing wild prefetch
-  // targets.
-  ctx.clearViewStatePrev();
-
-  const cacheResult = await setupCaches(ctx.normalizeURL(url), {
+  const normalizedUrl = ctx.normalizeURL(url);
+  const cacheResult = await setupCaches(normalizedUrl, {
     noCache: ctx.config.noCache,
     noSliceCache: ctx.config.noSliceCache,
     noOpfs: ctx.config.noOpfs,
@@ -310,6 +306,11 @@ export async function loadScene(url: string, ctx: LoadSceneCtx): Promise<THREE.G
   // Create root THREE.js group
   const rootGroup = new THREE.Group();
   rootGroup.name = 'LuxarScene';
+  // Path lookups (commit / process / sweep / release hooks) resolve through this
+  // index instead of an O(scene) `getObjectByName` walk each (B9a). It maintains
+  // itself from the graph's own add/remove/rename events, so no builder below has
+  // to know about it; a dataset switch builds a fresh root and a fresh index.
+  attachSceneGraphIndex(rootGroup);
   ctx.setRootGroup(rootGroup);
 
   // Load scene metadata
@@ -319,6 +320,13 @@ export async function loadScene(url: string, ctx: LoadSceneCtx): Promise<THREE.G
   const rootZarrGroup = await zarr.openGroupPreferV3(rootLoc);
   markLoad('metadataReady');
   const sceneAttrs = rootZarrGroup.attrs as ZarrSceneAttrs;
+  await adoptChunkPacks(
+    cacheResult.chunkPacks,
+    rootLoc,
+    (sceneAttrs as Record<string, unknown>).content_hash,
+    cacheResult.rootIndexFromNetwork(),
+    () => zarr.root(cacheResult.sidecarSourceStore())
+  );
 
   // Watch the dataset's identity from here on: a demo/dev server dying and a
   // different one later binding the same port would otherwise leave this tab
@@ -326,7 +334,6 @@ export async function loadScene(url: string, ctx: LoadSceneCtx): Promise<THREE.G
   // read — not after the full load — so a swap during a LONG load (or a load
   // that subsequently fails because the server vanished) is caught too.
   // Identity is baselined on these attrs, so there is no window to race.
-  const normalizedUrl = ctx.normalizeURL(url);
   if (SceneIdentityWatchdog.isWatchable(normalizedUrl)) {
     const loadedHash = (sceneAttrs as Record<string, unknown>)?.content_hash;
     // Hash-less fallback baseline: the attrs we actually loaded, canonically
@@ -345,9 +352,13 @@ export async function loadScene(url: string, ctx: LoadSceneCtx): Promise<THREE.G
       expectedContentHash: typeof loadedHash === 'string' ? loadedHash : null,
       expectedAttrsJson: attrsJson,
     });
+    seedWatchdogFromLoad(watchdog, cacheResult.rootDocument);
     watchdog.start();
     ctx.setIdentityWatchdog(watchdog);
   }
+  // The root is open: validation and the store open are both past the shared
+  // load-time fetch, so let its bytes go (a later re-read reaches the server).
+  cacheResult.releaseRootDocument();
 
   // Format-version policy, shared with the Python reader (data/format-version.ts
   // mirrors typing_utils/format_version.py): a supported version loads
@@ -442,6 +453,9 @@ export async function loadScene(url: string, ctx: LoadSceneCtx): Promise<THREE.G
   ctx.setSceneGraph(sceneGraph);
   setSceneLineLoad(sceneEffectiveLineLoad(sceneGraph));
 
+  // The opening camera is framed from this metadata before any node reads the view.
+  ctx.config.onSceneMetadata?.(rootGroup);
+
   // Load points / lines / gsplats / nested groups recursively
   await loadSceneNodes(sceneGraph, rootGroup, rootLoc, ctx.makeNodeBuildCtx());
 
@@ -464,9 +478,13 @@ export async function loadScene(url: string, ctx: LoadSceneCtx): Promise<THREE.G
   // A baked environment map (`luxar env attach`), if the store carries one that
   // matches this scene's digest. Parked on the root; `load-dataset.ts` hands it to
   // the scene environment together with the authored `viewer_config.environment`.
+  // The index's silence is trusted only when it came from the network: `env
+  // attach` keeps content_hash, so a warm L2 may still hold the pre-attach index.
   const bakedEnvironment = await loadBakedEnvironment(
     rootLoc,
-    (sceneAttrs as Record<string, unknown> | undefined)?.content_hash as string | undefined
+    (sceneAttrs as Record<string, unknown> | undefined)?.content_hash as string | undefined,
+    normalizedUrl,
+    cacheResult.rootIndexFromNetwork()
   );
   if (bakedEnvironment) rootGroup.userData.bakedEnvironment = bakedEnvironment;
 
@@ -505,66 +523,22 @@ export async function loadScene(url: string, ctx: LoadSceneCtx): Promise<THREE.G
     ctx.getFailedLoaderReasons()
   );
 
-  // Schedule progressive LOD refinement after initial load.
-  // Each per-type loader maps may include progressive loaders that
-  // only emit LOD 0 on the initial load — the refinement loop drains
-  // their remaining LODs frame-by-frame. Symmetric across Points /
-  // Lines / GSplats / Mesh.
-  const hasMore = (loader: unknown) => (loader as { hasMoreLODs?: boolean }).hasMoreLODs === true;
-  const gsplatsNeed = [...ctx.gsplatLoaders.values()].some(hasMore);
-  const pointsNeed = [...ctx.loaders.values()].some(hasMore);
-  const linesNeed = [...ctx.linesLoaders.values()].some(hasMore);
-  const meshNeed = [...ctx.meshLoaders.values()].some(hasMore);
-
-  const needsRefinement = gsplatsNeed || pointsNeed || linesNeed || meshNeed;
-  // Nothing to stream: the load timeline's "refinement complete" milestone is
-  // reached trivially (perf probes gate `isSettled` on it).
-  if (!needsRefinement) noteRefinementComplete();
-
-  if (needsRefinement) {
+  // Schedule progressive LOD refinement after initial load: progressive
+  // loaders of every type emit only their first rung on the initial load, and
+  // the refinement drain streams the rest frame by frame. It holds the
+  // serialization lock, so the init pipeline's first `updateView`, landing
+  // while it runs, is queued — which cancels the drain into that pass.
+  const kinds = ctx.kindsWithMoreLODs();
+  if (kinds.length === 0) {
+    // Nothing to stream: the load timeline's "refinement complete" milestone
+    // is reached trivially (perf probes gate `isSettled` on it).
+    noteRefinementComplete();
+  } else {
     log.info(
       Modules.SCENE_LOADER,
-      'Scheduling post-load progressive LOD refinement ' +
-        `(points=${pointsNeed} lines=${linesNeed} gsplats=${gsplatsNeed} mesh=${meshNeed})`
+      `Scheduling post-load progressive LOD refinement (${kinds.join(', ')})`
     );
-    // Hold the serialization lock during refinement so any updateView()
-    // calls queue as _pendingViewState (which naturally cancels the
-    // refinement loops). Each scheduler is responsible for releasing
-    // the lock when its loop completes; the SceneLoader's
-    // `scheduleProgressiveRefinement` orchestrates the three.
-    ctx.setUpdateInProgress(true);
-    // Fire-and-forget: catch so an error escaping the refinement loop is
-    // logged rather than surfacing as an unhandled promise rejection.
-    ctx.scheduleGSplatsRefinement().catch((error) => {
-      log.error(
-        Modules.SCENE_LOADER,
-        `Post-load progressive refinement failed: ${(error as Error).message}`
-      );
-      // Belt-and-braces lock recovery (mirrors queue-next.ts and
-      // SceneLoader.kickRefinementIfIdle): each loop releases the lock in its
-      // own finally, so a rejection here means the orchestrator glue died
-      // outside them — a double fault, not an expected path. Without this
-      // release the lock taken above is held forever and every future
-      // updateView freezes.
-      //
-      // Draining matters as much as releasing, because the pending slot is
-      // routinely occupied in exactly this window: this kick fires from inside
-      // `loadScene` before it returns, so the init pipeline's first
-      // `updateAllNDNodes` → `updateView` lands while the kick holds the lock,
-      // takes updateView's supersede branch and parks its state via
-      // `setPending`. A filled slot that nothing drains strands the user's
-      // initial slice AND latches `isLoadPassInProgress()` true forever (every
-      // polling E2E helper then burns its full timeout). drain() is a no-op
-      // when nothing was queued.
-      ctx.setUpdateInProgress(false);
-      // When nothing was queued during the failed run, no re-entry will resolve
-      // parked waiters — settle them here. When a state WAS drained, the
-      // re-entered pass carries them to its own commit (queueNext settles them
-      // when no pending state is left), which is what a waiter means: resolving
-      // here as well would release the pacing gate before the view the caller
-      // asked for has landed. Same shape as `finalReleaseLock`.
-      if (!ctx.drainPendingViewState()) ctx.resolvePassWaiters();
-    });
+    ctx.startRefinement();
   }
 
   return rootGroup;

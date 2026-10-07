@@ -374,6 +374,13 @@ def test_overview_panel_carries_the_count_and_the_credit() -> None:
     assert "Twenty stories" in panel
 
 
+def test_a_private_showing_drops_the_permission_note_but_keeps_the_citation() -> None:
+    """`--no-permission-note` (the VIP kiosk) keeps the credit, not the licence line."""
+    panel = overview_panel_html(7_714_508, permission_note=False)
+    assert demo.DEMO_META["citation"]["ref"] in panel
+    assert demo.DEMO_META["citation"]["license"] not in panel
+
+
 # --------------------------------------------------------------------------- #
 # The shipped stories
 # --------------------------------------------------------------------------- #
@@ -420,7 +427,8 @@ def test_carried_stories_keep_their_vetted_facts() -> None:
     assert len(carried) == 7
     for s in carried:
         b = base[s.key]
-        assert s.mystery == b.mystery, s.key
+        # The viral question is re-aimed: this map is built from metagenomes.
+        assert s.mystery == b.mystery or s.key == "Viral surface proteins", s.key
         assert s.pdb_id == b.pdb_id or s.key == "Viral surface proteins", s.key
         assert len(s.facts) == len(b.facts), s.key
         unchanged = sum(f in b.facts for f in s.facts)
@@ -463,13 +471,34 @@ def test_shipped_stories_author_valid_waypoints() -> None:
 
 
 def test_default_viewer_config_is_the_laptop_build() -> None:
-    """The hosted default avoids kiosk-only render and dolly costs."""
+    """The hosted default avoids kiosk-only supersampling and the 95% swing."""
     from luxar.demos import demo_esm_protein_universe as demo
 
     vc = demo._viewer_config([], (0.0, 0.0, 100.0), auto_rotate=True, audio=False)
     assert vc.ssaa_enabled is False
-    assert vc.allow_high_dpr is False
-    assert vc.auto_dolly_amplitude_percent == 20.0
+    assert vc.auto_dolly_amplitude_percent == 60.0
+    # Pinned on every platform: the viewer's own default is Mac-only.
+    assert vc.natural_drag is True
+
+
+def test_resolution_is_full_and_fixed_in_every_build() -> None:
+    """The map renders at the display's own pixel ratio, never adapted down.
+
+    A resolution that drops while the camera travels and recovers on arrival
+    reads as the map going soft in flight, so both builds pin it.
+    """
+    from luxar.demos import demo_esm_protein_universe as demo
+
+    for high_quality in (False, True):
+        vc = demo._viewer_config(
+            [],
+            (0.0, 0.0, 100.0),
+            auto_rotate=True,
+            audio=False,
+            high_quality=high_quality,
+        )
+        assert vc.allow_high_dpr is True
+        assert vc.adaptive_dpr_enabled is False
 
 
 def test_auto_dolly_rides_with_the_turntable() -> None:
@@ -482,8 +511,8 @@ def test_auto_dolly_rides_with_the_turntable() -> None:
 
     spinning = demo._viewer_config([], (0.0, 0.0, 100.0), auto_rotate=True, audio=False)
     assert spinning.auto_dolly is True
-    assert spinning.auto_dolly_amplitude_percent == 20.0
-    assert spinning.auto_dolly_period == 58.5
+    assert spinning.auto_dolly_amplitude_percent == 60.0
+    assert spinning.auto_dolly_period == 50.5
 
     still = demo._viewer_config([], (0.0, 0.0, 100.0), auto_rotate=False, audio=False)
     assert still.auto_dolly is False
@@ -628,7 +657,11 @@ def test_the_scatter_story_is_the_one_family_that_is_not_a_family() -> None:
     assert story.pattern and story.pfam  # name match UNION the dedicated Pfam
     assert story.region is None  # not a map-wide predicate: a family selector
     assert story.frame_fraction >= 1.0  # pulled back to hold the whole scatter
-    assert any("never make a family of their own" in f for f in story.facts)
+    # The panel must say so in words, once: in the subtitle or a fact.
+    assert any(
+        "never a family of its own" in t or "never form a family of their own" in t
+        for t in (story.subtitle, *story.facts)
+    )
     assert not story.constellation
 
 
@@ -751,7 +784,9 @@ def test_only_one_story_claims_the_tour_is_tightest_knot() -> None:
     assert unscoped == ["Reverse gyrase"], unscoped
     assert scoped == ["Worm chemoreceptors"], scoped
     # And the one that claims it is the smallest knot is the same story.
-    smallest = [s.key for s in STORIES if "smallest" in " ".join(s.facts).lower()]
+    smallest = [
+        s.key for s in STORIES if "smallest" in " ".join((s.subtitle, *s.facts)).lower()
+    ]
     assert smallest == ["Reverse gyrase"], smallest
 
 

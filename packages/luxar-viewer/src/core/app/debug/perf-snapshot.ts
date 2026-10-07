@@ -8,13 +8,15 @@
  * for it under-observes the load; and `getState().isLoading` has a narrow,
  * E2E-relied-upon meaning (a load PASS is outstanding) that must not be
  * widened. `isSettled` here is the wide predicate — no update pass, no
- * refinement drain, no lazy LOD promotion in flight, no visible partition
- * resync waiting for the loader, and the post-load refinement ran to completion.
+ * refinement drain, no lazy LOD promotion in flight, no LOD level dissolve
+ * still drawing two levels, no visible partition resync waiting for the loader,
+ * and the post-load refinement ran to completion.
  *
  * @module core/app/debug/perf-snapshot
  */
 
 import { getLoadTimeline, type LoadTimelineSnapshot } from '../../../profiling/load-timeline';
+import { perfCounters } from '../../../profiling/perf-counters';
 import type { AdaptiveDPRDiagnostics } from '../../../rendering/adaptive-dpr-manager';
 import type { RendererInfoSnapshot } from './renderer-info-sampler';
 
@@ -29,6 +31,8 @@ export interface PerfSnapshotContext {
   isAnyLoadPassInProgress?: () => boolean;
   /** Any lazy substitutive-LOD / deferred-partition level fetch in flight. */
   isAnyLodLevelLoading?: () => boolean;
+  /** A time-driven LOD level dissolve is still in flight (`LODGroupRegistry.isAnimating`). */
+  isAnyLodFadeInFlight?: () => boolean;
   /** A visible partition rising edge is waiting to be handed to the loader. */
   hasVisiblePendingPartitionResync?: () => boolean;
   /** Per-node projected density (`scene/projected-density.ts` snapshot). */
@@ -45,6 +49,11 @@ export interface PerfSnapshot {
   /** True once the runtime hooks (renderer, loaders, DPR) are wired. */
   runtimeReady: boolean;
   timeline: LoadTimelineSnapshot;
+  /**
+   * Always-on perf counters (`profiling/perf-counters.ts`), a flat
+   * `name -> number` map. Available from bootstrap on.
+   */
+  counters: Record<string, number>;
   rendererInfo: RendererInfoSnapshot | null;
   adaptiveDpr: AdaptiveDPRDiagnostics | null;
   workers: unknown;
@@ -64,6 +73,7 @@ export interface PerfSnapshot {
     updateInProgress: boolean | null;
     loadPassInProgress: boolean | null;
     lodLevelLoading: boolean | null;
+    lodFadeInFlight: boolean | null;
     visiblePartitionResyncPending: boolean | null;
     refinementComplete: boolean;
   };
@@ -93,6 +103,7 @@ export function computePerfSnapshot(ctx: PerfSnapshotContext = {}): PerfSnapshot
   const updateInProgress = read(ctx.isUpdateInProgress);
   const loadPassInProgress = read(ctx.isAnyLoadPassInProgress);
   const lodLevelLoading = read(ctx.isAnyLodLevelLoading);
+  const lodFadeInFlight = read(ctx.isAnyLodFadeInFlight);
   const visiblePartitionResyncPending = read(ctx.hasVisiblePendingPartitionResync);
   const runtimeReady = ctx.isUpdateInProgress !== undefined;
   const refinementComplete = timeline.refinement.complete;
@@ -100,6 +111,7 @@ export function computePerfSnapshot(ctx: PerfSnapshotContext = {}): PerfSnapshot
     ? updateInProgress === false &&
       loadPassInProgress !== true &&
       lodLevelLoading !== true &&
+      lodFadeInFlight !== true &&
       visiblePartitionResyncPending !== true &&
       refinementComplete
     : null;
@@ -107,6 +119,7 @@ export function computePerfSnapshot(ctx: PerfSnapshotContext = {}): PerfSnapshot
     perfReady: true,
     runtimeReady,
     timeline,
+    counters: perfCounters.snapshot(),
     rendererInfo: readOrNull(ctx.rendererInfo),
     adaptiveDpr: readOrNull(ctx.adaptiveDpr),
     workers: readOrNull(ctx.workers),
@@ -118,6 +131,7 @@ export function computePerfSnapshot(ctx: PerfSnapshotContext = {}): PerfSnapshot
       updateInProgress,
       loadPassInProgress,
       lodLevelLoading,
+      lodFadeInFlight,
       visiblePartitionResyncPending,
       refinementComplete,
     },

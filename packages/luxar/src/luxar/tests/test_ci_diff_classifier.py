@@ -188,6 +188,11 @@ GATE_INPUTS: list[tuple[str, str, str]] = [
         "the classifier scans it for repo-rooted readFileSync inputs",
     ),
     (
+        "packages/luxar-viewer/src/tests/unit/scene/fixtures/lod-metric-parity.json",
+        "py",
+        "test_lod_metric_parity.py checks it against the Python metric generator",
+    ),
+    (
         "scripts/generate_builtin_colormaps.py",
         "ts",
         "the viewer's third-party notices test scrapes its colormap tables",
@@ -213,6 +218,11 @@ GATE_INPUTS: list[tuple[str, str, str]] = [
         "gallery-selection.test.ts validates README media keys against it",
     ),
     (
+        "packages/luxar-viewer/scripts/render-gate/gate-scenes.json",
+        "ts",
+        "gate-scenes.test.mjs validates every referenced store and case id",
+    ),
+    (
         "scripts/benchmarks/benchmark_bisect.sh",
         "py",
         "test_benchmark_bisect.py executes the committed launcher directly",
@@ -229,6 +239,11 @@ GATE_INPUTS: list[tuple[str, str, str]] = [
         "test_set_version.py asserts its `make set-version` remedy string, and a "
         "shell file matches no other domain, so a release.sh-only diff would "
         "otherwise run zero tests",
+    ),
+    (
+        "scripts/ci_hatch_env_cache.sh",
+        "py",
+        "test_ci_hatch_env_cache.py executes the cache setup script",
     ),
     (
         "scripts/zenodo_record_text/records.json",
@@ -617,6 +632,9 @@ _NON_SCANNED_PYTHON_VIEWER_INPUTS = {
     "packages/luxar-viewer/src/tests/unit/config/generated-fixture-freshness.test.ts": (
         "scanned for repo-rooted readFileSync inputs by this module"
     ),
+    "packages/luxar-viewer/src/tests/unit/scene/fixtures/lod-metric-parity.json": (
+        "read by test_lod_metric_parity.py through a repo-rooted fixture path"
+    ),
     "packages/luxar-viewer/src/tests/README.md": (
         "matched by test_fixture_environment.py through git grep"
     ),
@@ -667,6 +685,9 @@ _NON_GATE_PYTHON_TEST_PATH_LITERAL_EXCLUSIONS = {
 
 _NON_GATE_PYTHON_TEST_PATH_READ_EXCLUSIONS = {
     ".github/workflows/ci.yml": "owned by the explicit all-domains workflow block",
+    "packages/luxar-viewer/scripts/render-gate/gate-scenes.json": (
+        "the viewer gate validates the manifest directly in gate-scenes.test.mjs"
+    ),
 }
 
 #: The rule that puts the workflow itself in every domain. Extracted as text so a

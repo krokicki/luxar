@@ -252,18 +252,54 @@ export function collectAncestorNodes(root: SceneNode, targetPath: string): Scene
 }
 
 /**
- * Walk the scene graph from `root` toward `targetPath`, collecting the
- * composable attrs of every node on the path.
+ * Coerce a node's raw `layer` attr into "exposed in the Layers panel".
+ *
+ * The Python writer (`validate_layer`) always normalises to a JSON boolean,
+ * but hand-edited or third-party zarr may carry a number (`1`/`0`). Accept
+ * strict `true` and truthy finite numbers so such values don't silently drop
+ * the node from the panel; everything else (incl. `undefined`, strings) is
+ * not-a-layer. Pure — callers log a warning for malformed (non-boolean) values.
  */
-export function collectAncestorAttrs(root: SceneNode, targetPath: string): ComposableAttrs[] {
-  return collectAncestorNodes(root, targetPath).map((n) => toComposable(n.attrs));
+export function isLayerEnabled(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === 'number') return Number.isFinite(value) && value !== 0;
+  return false;
 }
 
 /**
- * Convenience: compose effective attrs for a target path in the scene graph.
+ * The RAW authored gain (`intensity`/`offset`, uncomposed) of the node that owns
+ * the chain target's display window in the Layers panel: the nearest
+ * `layer=true` node on its root→target chain (the shape
+ * {@link collectAncestorNodes} returns, or `SceneNodeIndex.ancestorChain`), the
+ * target itself included. `undefined` when no node on the chain is a layer.
+ *
+ * The panel reads a non-identity gain on a LAYER as that layer's absolute window
+ * (`layer-state.ts` `computeDisplayRange`), whereas on a non-layer ancestor the
+ * same gain is a multiplier on the data range. `resolveColormapWindow` needs to
+ * know which of the two a composed gain came from to build the window the panel
+ * will push.
  */
-export function getEffectiveAttrs(root: SceneNode, targetPath: string): EffectiveAttrs {
-  return composeAttrs(collectAncestorAttrs(root, targetPath));
+export function windowOwnerGainOfChain(
+  chain: readonly SceneNode[]
+): { intensity: number; offset: number } | undefined {
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const attrs = chain[i].attrs;
+    if (!isLayerEnabled(attrs.layer)) continue;
+    return {
+      intensity: (attrs.intensity as number | undefined) ?? 1,
+      offset: (attrs.offset as number | undefined) ?? 0,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Compose the effective attrs of a chain's target over its already-resolved
+ * root→target chain (the shape {@link collectAncestorNodes} returns, or
+ * `SceneNodeIndex.ancestorChain`).
+ */
+export function getEffectiveAttrsOfChain(chain: readonly SceneNode[]): EffectiveAttrs {
+  return composeAttrs(chain.map((n) => toComposable(n.attrs)));
 }
 
 /**

@@ -19,6 +19,10 @@ import { extractEnvironmentConfig } from '../../../config/zarr-bridge/viewer-con
  * Each per-overlay / per-system init step is supplied as a callback so
  * the helper composes the orchestrator's other delegate methods without
  * the helper needing to know how they're implemented internally.
+ *
+ * `isStale` is checked after every await: a load whose app was disposed (or
+ * disposed and re-initialized) meanwhile stops there instead of running its
+ * tail against a torn-down — or a newer — lifetime.
  */
 export interface LoadDatasetPorts {
   inputHandler: InputHandler;
@@ -36,6 +40,7 @@ export interface LoadDatasetPorts {
   initPicking: () => Promise<void>;
   applyViewerConfigState: (config: ZarrViewerConfig | undefined) => void;
   openCacheStatsView: () => void;
+  isStale: () => boolean;
 }
 
 export async function loadDataset(src: string, ports: LoadDatasetPorts): Promise<void> {
@@ -69,6 +74,7 @@ export async function loadDataset(src: string, ports: LoadDatasetPorts): Promise
   await ports.sceneManager.loadSceneData(src, ports.loaderConfig, {
     applyViewerConfigFov: applyViewerConfigDefaults,
   });
+  if (ports.isStale()) return;
 
   // Pass zarr viewer_config to rendering controls (available after scene loads).
   // If no localStorage settings exist for this scene, apply zarr defaults. An
@@ -101,10 +107,22 @@ export async function loadDataset(src: string, ports: LoadDatasetPorts): Promise
   ports.initScaleBar();
 
   const sceneLoader = getSceneLoader('default');
-  if (sceneLoader?.sceneGraph && ports.layersPanel) {
+  const layersPanel = ports.layersPanel;
+  if (sceneLoader?.sceneGraph && layersPanel) {
     const root = ports.sceneManager.scene.children.find((c) => c.name === 'LuxarScene');
     if (root) {
-      ports.layersPanel.initFromScene(root as THREE.Group, sceneLoader.sceneGraph);
+      layersPanel.initFromScene(
+        root as THREE.Group,
+        sceneLoader.sceneGraph,
+        sceneLoader.sceneNodeIndex
+      );
+      // Leaves built from now on (partition parts the LOD registry activates,
+      // lazily built levels) must start from the panel's LIVE layer state, not
+      // their authored attrs — before they are first drawn. After initFromScene,
+      // which styled everything that already exists.
+      sceneLoader.setLeafMaterializedListener((graph, path, object) =>
+        layersPanel.applyLayerStateToNewLeaf(graph, path, object)
+      );
       // Hand the layers panel an equivalent failed-loads provider over the same
       // live failure set the data monitor reads (each getFailedLoadsProvider()
       // call returns a new object, but all close over the loader's one
@@ -112,10 +130,10 @@ export async function loadDataset(src: string, ports: LoadDatasetPorts): Promise
       // badge in the always-open panel instead of only in the console /
       // collapsed monitor. After initFromScene: its clear() resets any prior
       // provider first.
-      ports.layersPanel.setFailedLoadsProvider(sceneLoader.getFailedLoadsProvider());
+      layersPanel.setFailedLoadsProvider(sceneLoader.getFailedLoadsProvider());
       // Per-layer "Frame camera" context-menu action (same late-binding
       // pattern as the provider above).
-      ports.layersPanel.setCameraFramer((obj) => ports.sceneManager.fitCameraToObject(obj));
+      layersPanel.setCameraFramer((obj) => ports.sceneManager.fitCameraToObject(obj));
     }
   }
   // Notify on-screen affordances (the control rail's Layers button gates its
@@ -132,9 +150,11 @@ export async function loadDataset(src: string, ports: LoadDatasetPorts): Promise
 
   // Initialize overlays (screen-space annotations from zarr)
   await ports.initOverlays();
+  if (ports.isStale()) return;
 
   // Initialize GPU picking system (if any node has labels)
   await ports.initPicking();
+  if (ports.isStale()) return;
 
   // Apply zarr viewer_config: UI visibility, theme, dimension state, animation
   ports.applyViewerConfigState(viewerConfig);

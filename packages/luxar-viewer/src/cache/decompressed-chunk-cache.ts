@@ -33,6 +33,43 @@ export interface DecompressedChunk {
 }
 
 /**
+ * A decoded chunk as returned by zarrita's `getChunk` (the value an in-flight
+ * decode settles with). Typed loosely here because the cache is not generic
+ * over the zarr dtype; the proxy narrows it back.
+ */
+export interface DecodedChunkResult {
+  data: unknown;
+  shape: number[];
+  stride: number[];
+}
+
+/**
+ * One fetch + decode in flight for an L0 key, shared by EVERY proxy wrapping an
+ * array over this cache (see `cached-zarr-array.ts`).
+ *
+ * The decode runs under its own {@link controller}, never under any single
+ * caller's signal: it is aborted only once every waiter has abandoned it, so a
+ * superseded caller cannot cancel work a live caller still awaits.
+ */
+export interface InflightDecode {
+  /** Settles with the decoded chunk (or the underlying error). */
+  readonly promise: Promise<DecodedChunkResult>;
+  /** Owns the underlying fetch/decode; aborted when {@link waiters} hits 0. */
+  readonly controller: AbortController;
+  /** Callers still waiting on {@link promise} (not yet aborted). */
+  waiters: number;
+  /**
+   * Every waiter left and {@link controller} was aborted. The entry STAYS
+   * registered until it settles: an abort that lands after the chunk's bytes
+   * arrived cannot stop the decode, which then completes and commits, and a
+   * caller arriving meanwhile waits for that outcome instead of starting a
+   * second fetch + decode of the same chunk (it retries only if the abandoned
+   * decode really was cancelled).
+   */
+  abandoned?: boolean;
+}
+
+/**
  * Configuration options for the decompressed chunk cache.
  */
 export interface DecompressedChunkCacheOptions {
@@ -84,19 +121,35 @@ export interface DecompressedChunkCacheStats {
  * ```
  */
 export class DecompressedChunkCache {
-  /** Default cache size derived from config.cache.l0MaxSizeMB */
-  private static readonly DEFAULT_MAX_SIZE = config.cache.l0MaxSizeMB * 1024 * 1024;
+  /**
+   * Default cache size derived from config.cache.l0MaxSizeMB. A method, not a
+   * static initializer, like `SliceCache.defaultMaxSize`: reading config at
+   * module-load time couples every transitive importer to a fully-populated
+   * config mock in tests.
+   */
+  private static defaultMaxSize(): number {
+    return config.cache.l0MaxSizeMB * 1024 * 1024;
+  }
 
   /** Metadata overhead estimate per chunk (shape array, stride array, object wrapper) */
   private static readonly METADATA_OVERHEAD = 64;
 
   private cache: LRUCache<DecompressedChunk>;
+  /**
+   * In-flight decodes keyed by the full L0 key (`makeKey(arrayPath, coords)`,
+   * so the array identity is part of the key). Lives on the CACHE — not on a
+   * proxy — so the foreground loaders and the SlicePrefetcher's shadow loaders,
+   * which wrap the same arrays through different proxies, share one decode.
+   */
+  private readonly inflight = new Map<string, InflightDecode>();
+  /** Bumped by every `clear()`; see {@link generation}. */
+  private _generation = 0;
   private debug: boolean;
   /** Resolved byte budget — surfaced in getStats() for runtime introspection. */
   private readonly maxSize: number;
 
   constructor(options?: DecompressedChunkCacheOptions) {
-    const maxSize = options?.maxSize ?? DecompressedChunkCache.DEFAULT_MAX_SIZE;
+    const maxSize = options?.maxSize ?? DecompressedChunkCache.defaultMaxSize();
     this.maxSize = maxSize;
     this.debug = options?.debug ?? false;
 
@@ -118,10 +171,12 @@ export class DecompressedChunkCache {
    * Get a cached decompressed chunk.
    *
    * @param key - Cache key (use `makeKey()` to generate)
+   * @param options.countStats - `false` for a warm-up: the lookup promotes
+   *   the chunk but moves no hit/miss statistic (see {@link getStats}).
    * @returns Cached chunk or undefined if not found
    */
-  get(key: string): DecompressedChunk | undefined {
-    const chunk = this.cache.get(key);
+  get(key: string, options?: { countStats?: boolean }): DecompressedChunk | undefined {
+    const chunk = this.cache.get(key, options);
 
     if (this.debug) {
       if (chunk) {
@@ -167,11 +222,49 @@ export class DecompressedChunkCache {
     return this.cache.has(key);
   }
 
+  /** The decode in flight for `key`, if any. */
+  getInflight(key: string): InflightDecode | undefined {
+    return this.inflight.get(key);
+  }
+
+  /** Register `entry` as THE in-flight decode for `key`. */
+  setInflight(key: string, entry: InflightDecode): void {
+    this.inflight.set(key, entry);
+  }
+
   /**
-   * Clear all cached chunks.
+   * Forget the in-flight decode for `key` — only if it is still `entry` (a
+   * later decode for the same key may already have replaced an abandoned one).
+   */
+  deleteInflight(key: string, entry: InflightDecode): void {
+    if (this.inflight.get(key) === entry) this.inflight.delete(key);
+  }
+
+  /**
+   * Incremented by every {@link clear} (the invalidation / dispose path).
+   * Holders of state derived from this cache's contents — e.g. the range
+   * loader's memoised, L0-wrapped array_ref targets — compare it to know when
+   * to re-derive.
+   */
+  get generation(): number {
+    return this._generation;
+  }
+
+  /** Number of decodes currently in flight (diagnostics / tests). */
+  get inflightCount(): number {
+    return this.inflight.size;
+  }
+
+  /**
+   * Clear all cached chunks. Also forgets the in-flight decodes: a decode
+   * started before the clear still settles for its waiters, but no longer
+   * commits its result (only a still-registered entry may `set`), and a new
+   * request starts afresh rather than joining pre-clear work.
    */
   clear(): void {
     this.cache.clear();
+    this.inflight.clear();
+    this._generation++;
 
     if (this.debug) {
       log.custom(LogEmoji.CACHE, Modules.CACHE, 'L0 cleared');
@@ -221,24 +314,5 @@ export class DecompressedChunkCache {
    */
   static makeKey(arrayPath: string, chunkCoords: number[]): string {
     return `${arrayPath}:${chunkCoords.join(',')}`;
-  }
-
-  /**
-   * Parse a cache key back into array path and chunk coordinates.
-   *
-   * @param key - Cache key to parse
-   * @returns Parsed components or null if invalid key format
-   */
-  static parseKey(key: string): { arrayPath: string; chunkCoords: number[] } | null {
-    const colonIndex = key.lastIndexOf(':');
-    if (colonIndex === -1) return null;
-
-    const arrayPath = key.substring(0, colonIndex);
-    const coordsStr = key.substring(colonIndex + 1);
-    const chunkCoords = coordsStr.split(',').map(Number);
-
-    if (chunkCoords.some(isNaN)) return null;
-
-    return { arrayPath, chunkCoords };
   }
 }

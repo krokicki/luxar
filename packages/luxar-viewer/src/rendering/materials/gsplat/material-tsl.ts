@@ -36,13 +36,23 @@
 import * as THREE from 'three';
 import { texture, uniform } from 'three/tsl';
 import { NodeMaterial } from 'three/webgpu';
-import { gsplatWebGPUFactory, type GSplatTSLNodes } from './shader-tsl';
+import {
+  applyGSplatMaterialState,
+  gsplatWebGPUFactory,
+  type GSplatTSLConfig,
+  type GSplatTSLNodes,
+} from './shader-tsl';
+import { copyRuntimeUniforms, GSPLAT_RUNTIME_UNIFORMS } from '../_shared/runtime-uniforms';
+import { applySharedTSLGraph } from '../_shared/shared-graph-tsl';
 import type { GSplatMaterialConfig } from './material-glsl';
 import type { CameraAwareMaterial } from '../_shared/camera-aware-material';
 import type { ColormapAwareMaterial } from '../_shared/colormap-aware-material';
 import { clampGamma, isGammaOne, isNoGOG } from '../_shared/uniform-helpers';
-import { getPlaceholderElementTexture } from '../../element-texture-layout';
-import { computeFocalLength } from '../_shared/camera-uniforms';
+import {
+  getPlaceholderElementTexture,
+  resolveElementTextureWidth,
+  SPLAT_TEXTURE_LAYOUT,
+} from '../../element-texture-layout';
 import {
   computeRayIntegralFactor,
   clampTruncationRadius,
@@ -87,8 +97,6 @@ export class GSplatTSLMaterial
     uSplatTex: TSLNode;
     uResolution: TSLNode;
     uPixelRatio: TSLNode;
-    uFx: TSLNode;
-    uFy: TSLNode;
     uTruncate: TSLNode;
     uTruncateSq: TSLNode;
     uShiftC: TSLNode;
@@ -101,9 +109,9 @@ export class GSplatTSLMaterial
     uInvGamma: TSLNode;
     uIntensity: TSLNode;
     uOffset: TSLNode;
-    uIsOrtho: TSLNode;
     uSortedIndexSlot: TSLNode;
     uDensityDrop: TSLNode;
+    uDensityAlphaExp: TSLNode;
     uGlassPartition: TSLNode;
     uGlassDepth: TSLNode;
     uNearCull: TSLNode;
@@ -152,8 +160,6 @@ export class GSplatTSLMaterial
       uSplatTex: texture(getPlaceholderElementTexture()),
       uResolution: uniform(new THREE.Vector2(1, 1)),
       uPixelRatio: uniform(1),
-      uFx: uniform(500),
-      uFy: uniform(500),
       uTruncate: uniform(truncate),
       uTruncateSq: uniform(truncate * truncate),
       uShiftC: uniform(shiftC),
@@ -170,9 +176,9 @@ export class GSplatTSLMaterial
       uInvGamma: uniform(1.0 / gammaValue),
       uIntensity: uniform(materialConfig.intensity ?? 1.0),
       uOffset: uniform(materialConfig.offset ?? 0.0),
-      uIsOrtho: uniform(0),
       uSortedIndexSlot: uniform(0),
       uDensityDrop: uniform(0),
+      uDensityAlphaExp: uniform(1),
       // Refraction split: mode 0 outside the split; the shared glass depth texture.
       ...glassPartitionNodes(),
       uNearCull: uniform(0.1),
@@ -264,8 +270,6 @@ export class GSplatTSLMaterial
       uSplatTex: proxyIUniform(this.tslNodes.uSplatTex),
       uResolution: proxyIUniform(this.tslNodes.uResolution),
       uPixelRatio: proxyIUniform(this.tslNodes.uPixelRatio),
-      uFx: proxyIUniform(this.tslNodes.uFx),
-      uFy: proxyIUniform(this.tslNodes.uFy),
       uTruncate: proxyIUniform(this.tslNodes.uTruncate),
       uTruncateSq: proxyIUniform(this.tslNodes.uTruncateSq),
       uShiftC: proxyIUniform(this.tslNodes.uShiftC),
@@ -278,9 +282,9 @@ export class GSplatTSLMaterial
       uInvGamma: proxyIUniform(this.tslNodes.uInvGamma),
       uIntensity: proxyIUniform(this.tslNodes.uIntensity),
       uOffset: proxyIUniform(this.tslNodes.uOffset),
-      uIsOrtho: proxyIUniform(this.tslNodes.uIsOrtho),
       uSortedIndexSlot: proxyIUniform(this.tslNodes.uSortedIndexSlot),
       uDensityDrop: proxyIUniform(this.tslNodes.uDensityDrop),
+      uDensityAlphaExp: proxyIUniform(this.tslNodes.uDensityAlphaExp),
       uGlassPartition: proxyIUniform(this.tslNodes.uGlassPartition),
       uGlassDepth: proxyIUniform(this.tslNodes.uGlassDepth),
       uNearCull: proxyIUniform(this.tslNodes.uNearCull),
@@ -325,15 +329,26 @@ export class GSplatTSLMaterial
    * needs for max projection.)
    */
   private rebuildGraph(): void {
-    gsplatWebGPUFactory(
-      this.tslNodes as GSplatTSLNodes,
-      {
-        useColormap: !!this.defines && 'USE_COLORMAP' in this.defines,
-        gammaOne: !!this.defines && 'LUXAR_GAMMA_ONE' in this.defines,
-        noGOG: !!this.defines && 'LUXAR_NO_GOG' in this.defines,
-        blendingMode: (this.userData.blendingMode as BlendingMode | undefined) ?? 'additive',
-      },
-      this
+    const config: GSplatTSLConfig = {
+      useColormap: !!this.defines && 'USE_COLORMAP' in this.defines,
+      gammaOne: !!this.defines && 'LUXAR_GAMMA_ONE' in this.defines,
+      noGOG: !!this.defines && 'LUXAR_NO_GOG' in this.defines,
+      blendingMode: (this.userData.blendingMode as BlendingMode | undefined) ?? 'additive',
+      elementTextureWidth: resolveElementTextureWidth(
+        SPLAT_TEXTURE_LAYOUT,
+        this.tslNodes.uSplatTex.value as { image?: { width?: number } } | null
+      ),
+    };
+    // ONE graph per configuration, shared by every gsplat material of it
+    // (see shared-graph-tsl.ts): the build cache keys on node ids, so a
+    // private graph per material cost a full NodeBuilder build per part.
+    applySharedTSLGraph(this, 'gsplat', config, this.tslNodes, (inputs, scratch) => {
+      gsplatWebGPUFactory(inputs as GSplatTSLNodes, config, scratch);
+    });
+    applyGSplatMaterialState(
+      this,
+      config.blendingMode ?? 'additive',
+      (this.tslNodes.uOpacity.value as number | undefined) ?? 1.0
     );
     // Re-apply the explicit constructor overrides over the factory
     // tail's mode-derived blending state — on EVERY rebuild, not just
@@ -349,20 +364,9 @@ export class GSplatTSLMaterial
     this.needsUpdate = true;
   }
 
-  updateCameraParams(
-    fov: number,
-    resolution: THREE.Vector2,
-    isOrtho: boolean = false,
-    nearCull?: number,
-    pixelRatio: number = 1
-  ): void {
+  updateCameraParams(resolution: THREE.Vector2, nearCull?: number, pixelRatio: number = 1): void {
     (this.uniforms.uResolution.value as THREE.Vector2).copy(resolution);
     this.uniforms.uPixelRatio.value = pixelRatio;
-    this.uniforms.uIsOrtho.value = isOrtho ? 1 : 0;
-
-    const fy = computeFocalLength(fov, resolution.y, isOrtho);
-    this.uniforms.uFx.value = fy;
-    this.uniforms.uFy.value = fy;
 
     if (nearCull !== undefined) {
       this.uniforms.uNearCull.value = nearCull;
@@ -622,28 +626,12 @@ export class GSplatTSLMaterial
 
     const splatTex = this.uniforms.uSplatTex?.value as THREE.DataTexture | null | undefined;
     if (splatTex) cloned.updateSplatTexture(splatTex);
-    cloned.uniforms.uFx.value = this.uniforms.uFx.value;
-    cloned.uniforms.uFy.value = this.uniforms.uFy.value;
-    (cloned.uniforms.uResolution.value as THREE.Vector2).copy(
-      this.uniforms.uResolution.value as THREE.Vector2
-    );
-    cloned.uniforms.uPixelRatio.value = this.uniforms.uPixelRatio.value;
-    // Camera-state uniforms ride along with the derived focal scales
-    // (mirrors LineTSLMaterial.clone / the points clone fix): uIsOrtho
-    // is a runtime uniform in the gsplat TSL graph, so a plain value
-    // copy suffices — no rebuild needed.
-    cloned.uniforms.uIsOrtho.value = this.uniforms.uIsOrtho.value;
-    cloned.uniforms.uNearCull.value = this.uniforms.uNearCull.value;
-    cloned.uniforms.uProjectionMode.value = this.uniforms.uProjectionMode.value;
-    cloned.uniforms.uInvGamma.value = this.uniforms.uInvGamma.value;
+    // Runtime state a fresh clone would reset (GSPLAT_RUNTIME_UNIFORMS, ../_shared/runtime-uniforms.ts).
+    copyRuntimeUniforms(this, cloned, GSPLAT_RUNTIME_UNIFORMS);
     cloned.updateLabelStyle(
       this.uniforms.uLabelColorMode.value === 1,
       this.uniforms.uLabelFilterIndex.value
     );
-    // The active ordering slot must ride along: a clone taken while the
-    // geometry draws from slot 1 would otherwise read the stale buffer
-    // until the coordinator's next per-frame re-assert.
-    cloned.uniforms.uSortedIndexSlot.value = this.uniforms.uSortedIndexSlot.value;
 
     return cloned as this;
   }

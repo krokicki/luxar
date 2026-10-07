@@ -4,10 +4,13 @@
  * Mirrors the visual gsplat shader with picking-specific adjustments:
  *   - `uNodeId` uniform + `vNodeId` / `vElementId` varyings, written
  *     into the RGBA32F pick buffer as `(nodeId, elementId-low16, brightness, elementId-high16)`.
- *   - Tighter truncation: 1.5σ (vs 3σ for visual) so the pick footprint
- *     is the bright core only.
- *   - Always max-projection (no ray-integral) — picking only needs the
- *     brightest fragment, not the integrated path.
+ *   - Tighter truncation: 1.5σ (vs the node's own T, default 2.75σ, for
+ *     the visual) so the pick footprint is the bright core only; the
+ *     coverage fade still culls with the node's T (`uCoverageTruncate`).
+ *   - The VISUAL amplitude and weight: the node's projection (the
+ *     sum-projection ray-integral boost included), per-splat alpha, node
+ *     opacity and gain (`../_shared/visibility-glsl.ts`), so a splat is
+ *     pickable exactly when it is visible.
  *   - Brightness-as-depth so the brightest overlapping fragment wins —
  *     except in surface ('normal') mode (`uSurfaceDepth == 1`), where the
  *     real projected depth is written so the FRONT-MOST splat wins,
@@ -23,9 +26,16 @@ import type { ShaderSource } from '../../materials/_shared/shader-source';
 import {
   GLSL_SANITIZE_FUNCTIONS,
   GLSL_NEAR_FADE_FUNCTIONS,
+  GLSL_PROJECTION_FUNCTIONS,
   GLSL_SORTED_INDEX,
 } from '../../materials/_shared/glsl-lib';
 import { requireTslMaterials } from '../../tsl/slot';
+import {
+  GLSL_GSPLAT_VISIBLE_FOOTPRINT,
+  GSPLAT_VISIBILITY_FLOOR,
+} from '../../materials/gsplat/math';
+import { GLSL_PICK_VISIBILITY } from '../_shared/visibility-glsl';
+import { GLSL_GSPLAT_PROJECTION } from '../../materials/gsplat/projection-glsl';
 
 /**
  * Picking vertex shader for gsplats.
@@ -37,6 +47,9 @@ export const GSPLAT_PICK_VERTEX_SHADER = /* glsl */ `
 
     ${GLSL_SANITIZE_FUNCTIONS}
     ${GLSL_NEAR_FADE_FUNCTIONS}
+    ${GLSL_PROJECTION_FUNCTIONS}
+    ${GLSL_GSPLAT_VISIBLE_FOOTPRINT}
+    ${GLSL_PICK_VISIBILITY}
 
     in vec2 aQuadCorner;
 
@@ -53,38 +66,46 @@ export const GSPLAT_PICK_VERTEX_SHADER = /* glsl */ `
     uniform highp sampler2D uSplatTex;
 
     uniform vec2 uResolution;
-    uniform float uFx, uFy;
     uniform float uTruncate;
-    uniform int uIsOrtho;
+    // The DRAW pass's truncation radius (the node's T), synced from the
+    // visual material per pick render: the coverage fade below is a cull
+    // rule, not a footprint, and must cull exactly what the draw culls.
+    uniform float uCoverageTruncate;
     uniform float uNearCull;
     uniform float uMaxExtentFactor;
     uniform float uCov2DDilation;     // 2D-covariance low-pass dilation in CSS px² (visual-shader parity)
     uniform float uPixelRatio;
     uniform float uNodeId;
     uniform int uLabelFilterIndex;
+    // The visual node's projection (synced per pick render): 0 = sum
+    // (ray-integral: additive/luminous/volumetric), 1 = peak (surface modes).
+    // The amplitude the draw emits — and so whether a splat is visible —
+    // differs between the two by the ray-integral boost.
+    uniform int uProjectionMode;
+    uniform float uRayIntegralFactor; // the visual node's (its own T), not the pick's
+    // Fragment-discard inputs, read here to size the quad to the visible
+    // footprint (visual-shader parity). Same precision as the fragment
+    // declarations (GLSL ES link rule).
+    uniform highp float uShiftC;
+    uniform highp float uInvOneMinusC;
+    uniform highp float uTruncateSq;
 
     flat out mediump float vAmplitude2D;
+    // Visual-pass weight: alpha factor x opacity x max(gain, 1) — the factor
+    // the fragment's visibility test multiplies its falloff by.
+    flat out mediump float vPickWeight;
     flat out highp vec3 vL2D;
     flat out highp vec2 vCenterScreen;
     flat out highp float vNodeId;
     flat out highp vec2 vElementId;
 
-    mat3 unpackCholesky3D(vec2 c01, vec2 c23, vec2 c45) {
-        return mat3(
-            c01.x, c01.y, c23.y,
-            0.0,   c23.x, c45.x,
-            0.0,   0.0,   c45.y
-        );
-    }
+    // Covariance projection shared with the visual stage (unpackCholesky3D,
+    // gsplatSigmaCam, invalidCov2D, coverage fade, Jacobian, ray sigma, eigen
+    // axes, clamped extents): materials/gsplat/projection-glsl.ts.
+    ${GLSL_GSPLAT_PROJECTION}
 
-    // Parity with visual shader-glsl.ts invalidCov2D — reject Σ_2D
-    // entries that are NaN/Inf so a degenerate splat can't poison the
-    // eigendecomposition and produce undefined pick geometry.
-    bool invalidCov2D(mat2 S) {
-        return isInvalidFloat(S[0][0]) || isInvalidFloat(S[0][1])
-            || isInvalidFloat(S[1][0]) || isInvalidFloat(S[1][1]);
-    }
-
+    // The pick stage's own 2D Cholesky (historical 1e-8 floors, no
+    // sanitization — see projection-glsl.ts for why it is not shared).
     vec3 cholesky2x2(mat2 S) {
         float L00 = sqrt(max(S[0][0], 1e-8));
         float invL00 = 1.0 / L00;
@@ -115,6 +136,7 @@ export const GSPLAT_PICK_VERTEX_SHADER = /* glsl */ `
         vec2 aCholesky01 = splatT1.xy;
         vec2 aCholesky23 = splatT1.zw;
         vec2 aCholesky45 = splatT2.xy;
+        float aAlpha = splatT3.y;          // per-splat opacity (1.0 for RGB data)
         float aLabelIndex = splatT3.z;
         if (uLabelFilterIndex > 0 && int(aLabelIndex + 0.5) != uLabelFilterIndex) {
             gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
@@ -124,82 +146,57 @@ export const GSPLAT_PICK_VERTEX_SHADER = /* glsl */ `
         vec4 centerCam4 = modelViewMatrix * vec4(aCenter, 1.0);
         vec3 centerCam = centerCam4.xyz;
 
+        // Clip-space centre through the projection THIS draw uses. The screen
+        // centre, the covariance Jacobian, the coverage extent and the ortho
+        // branch all come from it and from P, so a splat is placed and sized
+        // for whatever camera three draws with: a cube-capture face (fov -90
+        // flips P), a zoomed or asymmetric frustum, an embedder's camera.
+        // CPU mirror + tests: projection-math.ts.
+        vec4 centerClip = projectionMatrix * centerCam4;
+        int isOrtho = luxarIsOrthoProjection();
+        float invW = 1.0 / centerClip.w;
+
         // Unified near handling — see the visual gsplat shader: the
         // shared perspectiveNearFade subsumes the old standalone
         // behind-camera reject; ortho falls through to NDC clipping.
         // 1e-20 floor = degenerate-smoothstep guard only; uNearCull is
         // scene-bounds-scaled (an absolute 1e-4 faded out tiny-unit
         // scenes entirely).
-        float depthFade = perspectiveNearFade(uIsOrtho, centerCam.z, max(uNearCull, 1e-20));
+        float depthFade = perspectiveNearFade(isOrtho, centerCam.z, max(uNearCull, 1e-20));
         if (depthFade < 0.01) {
             gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
             return;
         }
 
-        mat3 R = mat3(modelViewMatrix);
-        mat3 L3D = unpackCholesky3D(aCholesky01, aCholesky23, aCholesky45);
-        mat3 L_cam = R * L3D;
-        mat3 Sigma_cam = L_cam * transpose(L_cam);
+        mat3 Sigma_cam = gsplatSigmaCam(aCholesky01, aCholesky23, aCholesky45);
 
         float zDepth = -centerCam.z;
 
-        // Coverage fade applies in BOTH projections (matches the visual
-        // shader — ortho projected size is depth-independent, divisor 1)
-        // so pickability tracks what is actually visible. Computed
-        // UNCONDITIONALLY (visual twin updated in lockstep): below
-        // maxExtent*0.5 the smoothstep is 0 and the fade is a no-op, so
-        // no size gate is needed — the former maxLateralVar > 0.01 gate
-        // skipped the fade for sigma < 0.1 world-unit splats.
-        float coverageFade;
-        {
-            // 1e-20 floors = pure div-by-zero/sqrt guards, matching the
-            // visual shader: maxLateralVar is world-unit² (an absolute
-            // 1e-8 floor coverage-culled every splat of a tiny-unit
-            // scene); zDepth is bounded by the scene-relative near fade.
-            float maxLateralVar = max(Sigma_cam[0][0], max(Sigma_cam[1][1], Sigma_cam[2][2]));
-            float extentDivisor = (uIsOrtho == 1) ? 1.0 : max(zDepth, 1e-20);
-            float projectedExtent = uFx * sqrt(max(maxLateralVar, 1e-20)) * uTruncate / extentDivisor;
-            float maxExtent = max(uResolution.x, uResolution.y) * uMaxExtentFactor;
-            coverageFade = 1.0 - smoothstep(maxExtent * 0.5, maxExtent, projectedExtent);
-            if (coverageFade < 0.01) {
-                gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
-                return;
-            }
+        // Coverage fade — the visual stage's cull rule, evaluated with the
+        // node's own T (uCoverageTruncate), so pickability tracks what is
+        // actually visible (projection-glsl.ts).
+        float coverageFade = gsplatCoverageFade(Sigma_cam, zDepth, isOrtho, uCoverageTruncate);
+        if (coverageFade < 0.01) {
+            gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
+            return;
         }
 
         float nearFade = min(depthFade, coverageFade);
 
-        float invZ = 1.0 / zDepth;
-        float invZ2 = invZ * invZ;
-
-        mat3x2 J;
-        if (uIsOrtho == 1) {
-            J[0] = vec2(uFx, 0.0);
-            J[1] = vec2(0.0, uFy);
-            J[2] = vec2(0.0, 0.0);
-        } else {
-            J[0] = vec2(uFx * invZ, 0.0);
-            J[1] = vec2(0.0, uFy * invZ);
-            J[2] = vec2(uFx * centerCam.x * invZ2, uFy * centerCam.y * invZ2);
-        }
-
-        vec2 JS0 = J[0] * Sigma_cam[0][0] + J[1] * Sigma_cam[0][1] + J[2] * Sigma_cam[0][2];
-        vec2 JS1 = J[0] * Sigma_cam[1][0] + J[1] * Sigma_cam[1][1] + J[2] * Sigma_cam[1][2];
-        vec2 JS2 = J[0] * Sigma_cam[2][0] + J[1] * Sigma_cam[2][1] + J[2] * Sigma_cam[2][2];
-
-        mat2 Sigma2D;
-        Sigma2D[0][0] = JS0.x * J[0].x + JS1.x * J[1].x + JS2.x * J[2].x;
-        Sigma2D[1][0] = JS0.x * J[0].y + JS1.x * J[1].y + JS2.x * J[2].y;
-        Sigma2D[0][1] = Sigma2D[1][0];
-        Sigma2D[1][1] = JS0.y * J[0].y + JS1.y * J[1].y + JS2.y * J[2].y;
+        // Σ_2D = J · Σ_cam · Jᵀ, the visual stage's projection (projection-glsl.ts).
+        mat2 Sigma2D = gsplatProjectedCovariance(Sigma_cam, centerClip, invW);
 
         // 2D low-pass dilation — visual-shader parity (shader-glsl.ts). Widens
         // the pickable footprint to match the dilated visual splat, so what you
-        // click matches what you see.
+        // click matches what you see. The energy compensation is the visual
+        // one too: the sum projection below reads it.
+        float detRaw2D = Sigma2D[0][0] * Sigma2D[1][1] - Sigma2D[0][1] * Sigma2D[1][0];
         float dilationPixelRatio = max(uPixelRatio, 1.0);
         float cov2DDilation = uCov2DDilation * dilationPixelRatio * dilationPixelRatio;
         Sigma2D[0][0] += cov2DDilation;
         Sigma2D[1][1] += cov2DDilation;
+        float detDilated2D = Sigma2D[0][0] * Sigma2D[1][1] - Sigma2D[0][1] * Sigma2D[1][0];
+        float dilationCompensation = sqrt(max(detRaw2D, 0.0) / max(detDilated2D, 1e-12));
 
         // Visual-shader parity (shader-glsl.ts) + TSL-side parity
         // (gsplat-pick.tsl.ts): reject splats with NaN/Inf Σ_2D or
@@ -210,56 +207,64 @@ export const GSPLAT_PICK_VERTEX_SHADER = /* glsl */ `
             return;
         }
 
-        // For picking, always use max projection (no ray integration needed)
-        vAmplitude2D = aAmplitude * nearFade;
+        // The amplitude the VISUAL pass emits, so pickability tracks visibility:
+        // the sum projection's ray-integral boost (sigmaRay is in world units, so
+        // it can make a splat far brighter or far dimmer than its peak) and the
+        // dilation energy compensation; the peak projection's plain amplitude.
+        // Same scale-free Σ_cam inversion as the visual shader (shader-glsl.ts
+        // carries the derivation).
+        if (uProjectionMode == 0) {
+            vec3 rayDir = (isOrtho == 1) ? vec3(0.0, 0.0, -1.0) : normalize(centerCam);
+            float sigmaRay = gsplatRaySigma(Sigma_cam, rayDir);
+            float rayIntegrationBoost = sigmaRay * uRayIntegralFactor;
+            vAmplitude2D = aAmplitude * rayIntegrationBoost * nearFade * dilationCompensation;
+        } else {
+            vAmplitude2D = aAmplitude * nearFade;
+        }
 
         vL2D = cholesky2x2(Sigma2D);
 
-        float trace = Sigma2D[0][0] + Sigma2D[1][1];
-        float det = Sigma2D[0][0] * Sigma2D[1][1] - Sigma2D[0][1] * Sigma2D[1][0];
-        float disc = max(trace * trace - 4.0 * det, 0.0);
-        float sqrtDisc = sqrt(disc);
-        float lambda1 = max(0.5 * (trace + sqrtDisc), 1e-6);
-        float lambda2 = max(0.5 * (trace - sqrtDisc), 1e-6);
-
-        vec2 majorAxis;
-        if (abs(Sigma2D[0][1]) > 1e-6) {
-            majorAxis = normalize(vec2(lambda1 - Sigma2D[1][1], Sigma2D[0][1]));
-        } else {
-            // Near-diagonal covariance: pick axis with larger variance
-            majorAxis = (Sigma2D[0][0] >= Sigma2D[1][1]) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
-        }
+        // Eigen-axes of Σ_2D and the max-extent-clamped quad half extents
+        // (projection-glsl.ts — shared with the visual stage).
+        vec2 lambdas = gsplatEigenvalues(Sigma2D);
+        float lambda1 = lambdas.x;
+        float lambda2 = lambdas.y;
+        vec2 majorAxis = gsplatMajorAxis(Sigma2D, lambda1);
         vec2 minorAxis = vec2(-majorAxis.y, majorAxis.x);
+        vec2 extents = gsplatClampedExtents(uTruncate, lambdas);
+        float extent1 = extents.x;
+        float extent2 = extents.y;
 
-        float extent1 = uTruncate * sqrt(lambda1);
-        float extent2 = uTruncate * sqrt(lambda2);
-
-        float maxExtentPx = max(uResolution.x, uResolution.y) * uMaxExtentFactor;
-        float largestExtent = max(extent1, extent2);
-        if (largestExtent > maxExtentPx) {
-            float clampScale = maxExtentPx / largestExtent;
-            extent1 *= clampScale;
-            extent2 *= clampScale;
+        // Visible-footprint tightening — visual-shader parity (shader-glsl.ts;
+        // derivation in materials/gsplat/math.ts). The pick fragment's
+        // visibility test multiplies its falloff by the visual weight
+        // (vPickWeight = this alpha factor x max(gain, 1)), so the quad is
+        // sized by the SAME peak-scale function with the same factors; the
+        // alpha factor additionally carries the node opacity (a transparent
+        // node is invisible, so it must not be pickable either).
+        float splatAlpha = sanitizeAlpha(aAlpha);
+        float pickAlphaFactor = luxarPickAlphaFactor(splatAlpha) * uOpacity;
+        vPickWeight = pickAlphaFactor * max(uIntensity, 1.0);
+        float visibleMahalSq = gsplatVisibleMahalSq(
+            gsplatFootprintPeakScale(vAmplitude2D, uInvOneMinusC, pickAlphaFactor, uIntensity),
+            uShiftC, uTruncateSq);
+        if (visibleMahalSq < 0.0) {
+            gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
+            return;
         }
+        extent1 = gsplatFootprintExtent(extent1, lambda1, visibleMahalSq);
+        extent2 = gsplatFootprintExtent(extent2, lambda2, visibleMahalSq);
 
-        if (uIsOrtho == 1) {
-            vCenterScreen = vec2(
-                uFx * centerCam.x + uResolution.x * 0.5,
-                uFy * centerCam.y + uResolution.y * 0.5
-            );
-        } else {
-            vCenterScreen = vec2(
-                uFx * centerCam.x * invZ + uResolution.x * 0.5,
-                uFy * centerCam.y * invZ + uResolution.y * 0.5
-            );
-        }
+        // Screen centre in pixels from the clip-space centre (gl_FragCoord
+        // convention: origin at the viewport's bottom-left corner).
+        vCenterScreen = (centerClip.xy * invW * 0.5 + 0.5) * uResolution;
 
         vec2 quadOffset = aQuadCorner.x * majorAxis * extent1
                         + aQuadCorner.y * minorAxis * extent2;
         vec2 screenPos = vCenterScreen + quadOffset;
         vec2 ndcXY = (screenPos / uResolution) * 2.0 - 1.0;
 
-        vec4 centerClip = projectionMatrix * centerCam4;
+        // Depth through the same projection (the clip-space centre above).
         float ndcZ = centerClip.z / centerClip.w;
 
         gl_Position = vec4(ndcXY, ndcZ, 1.0);
@@ -282,6 +287,7 @@ export const GSPLAT_PICK_FRAGMENT_SHADER = /* glsl */ `
     precision highp float;
 
     flat in mediump float vAmplitude2D;
+    flat in mediump float vPickWeight;
     flat in highp vec3 vL2D;
     flat in highp vec2 vCenterScreen;
     flat in highp float vNodeId;
@@ -306,9 +312,14 @@ export const GSPLAT_PICK_FRAGMENT_SHADER = /* glsl */ `
         if (mahalSq > uTruncateSq) discard;
 
         float intensity = vAmplitude2D * uInvOneMinusC * max(exp(-0.5 * mahalSq) - uShiftC, 0.0);
-        if (intensity < 1e-4) discard;
+        // Visual salience: the falloff times what the draw scales it by
+        // (alpha factor, opacity) and the gain its discard honours. The vertex
+        // stage sizes the quad from this exact test (gsplatVisibleMahalSq) —
+        // change both together.
+        float salience = intensity * vPickWeight;
+        if (salience < ${GSPLAT_VISIBILITY_FLOOR.toExponential()}) discard;
 
-        float brightness = clamp(intensity, 0.0, 1.0);
+        float brightness = clamp(salience, 0.0, 1.0);
 
         fragColor = vec4(vNodeId, vElementId.x, brightness, vElementId.y);
         // Pick depth convention (synced from the MAIN material's blending
@@ -319,7 +330,7 @@ export const GSPLAT_PICK_FRAGMENT_SHADER = /* glsl */ `
         //     gl_FragCoord.z is the true depth) — FRONT-MOST wins.
         //   - commutative modes (additive/max/luminous):
         //     brightness-as-depth — BRIGHTEST wins.
-        gl_FragDepth = (uSurfaceDepth == 1) ? gl_FragCoord.z : 1.0 - brightness;
+        gl_FragDepth = (uSurfaceDepth == 1) ? gl_FragCoord.z : 1.0 / (1.0 + salience);
     }
 `;
 

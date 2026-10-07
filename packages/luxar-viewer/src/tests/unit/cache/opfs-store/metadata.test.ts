@@ -4,6 +4,7 @@ import {
   type MetadataSnapshot,
 } from '../../../../cache/multi-level-caching-store/opfs-store/metadata';
 import { OPFS_ENCODING_VERSION } from '../../../../cache/types';
+import { perfCounters } from '../../../../profiling/perf-counters';
 
 /**
  * Minimal mock OPFS root.
@@ -166,6 +167,19 @@ describe('OPFSMetadataManager', () => {
       expect(mgr.parseFailures).toBe(1);
     });
 
+    it('a zero-byte index (a first save interrupted before close) is a cold start, not corruption', async () => {
+      const { root, rootFiles } = mockRoot();
+      // What an interrupted FIRST save leaves on disk: the file exists from
+      // getFileHandle({ create: true }), but its bytes only land at close().
+      // Measured on Chromium: a reload inside the save debounce leaves exactly
+      // this, and the next session read it as a corrupt index.
+      await root.getFileHandle('_cache_meta.json', { create: true });
+      expect(rootFiles.get('_cache_meta.json')).toBe('');
+
+      expect(await mgr.load(root)).toBeNull();
+      expect(mgr.parseFailures).toBe(0);
+    });
+
     it('clamps NaN/Infinity/negative totalSize to entries-derived sum or 0', async () => {
       const { root, rootFiles } = mockRoot();
       seedMetadata(rootFiles, {
@@ -229,6 +243,25 @@ describe('OPFSMetadataManager', () => {
         ...overrides,
       };
     }
+
+    it('perf counters: every schedule is a save attempt, only fired writes are index saves', async () => {
+      perfCounters.reset();
+      const { root } = mockRoot();
+      const onError = vi.fn();
+      mgr.scheduleSave({ root, getSnapshot: () => snap(), delayMs: 1000, onError });
+      mgr.scheduleSave({ root, getSnapshot: () => snap(), delayMs: 1000, onError });
+      mgr.scheduleSave({ root, getSnapshot: () => snap(), delayMs: 1000, onError });
+      expect(perfCounters.get('opfs.saveAttempts')).toBe(3);
+      expect(perfCounters.get('opfs.indexSaves')).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await mgr.awaitInFlight();
+      expect(perfCounters.get('opfs.indexSaves')).toBe(1);
+
+      await mgr.save(root, snap()); // the direct (dispose) flush is a write too
+      expect(perfCounters.get('opfs.indexSaves')).toBe(2);
+      expect(perfCounters.get('opfs.saveAttempts')).toBe(3);
+    });
 
     it('debounces: rapid schedule calls produce one save with the latest snapshot', async () => {
       const { root, rootFiles } = mockRoot();
@@ -320,6 +353,132 @@ describe('OPFSMetadataManager', () => {
       // awaitInFlight should resolve once the write completes.
       await mgr.awaitInFlight();
       expect(rootFiles.has('_cache_meta.json')).toBe(true);
+    });
+
+    // A pure trailing debounce re-armed on every call never fires while the
+    // calls keep coming: measured in real playback, 65k save attempts and ZERO
+    // index writes in 53 s, so a killed/navigated-away session left ~40 index
+    // entries for ~5,000 files on disk. `maxWaitMs` bounds that starvation.
+    it('maxWait: schedule calls every 30 ms for 5 s still write the index every maxWait', async () => {
+      perfCounters.reset();
+      const { root } = mockRoot();
+      const onError = vi.fn();
+      for (let t = 0; t < 5000; t += 30) {
+        mgr.scheduleSave({ root, getSnapshot: snap, delayMs: 1000, maxWaitMs: 2000, onError });
+        await vi.advanceTimersByTimeAsync(30);
+      }
+      await mgr.awaitInFlight();
+      // 5 s of continuous activity with a 2 s ceiling -> writes at ~2 s and ~4 s.
+      expect(perfCounters.get('opfs.indexSaves')).toBeGreaterThanOrEqual(2);
+      expect(onError).not.toHaveBeenCalled();
+    });
+
+    // A reload that lands inside the trailing debounce loses the session's whole
+    // index: a save started at unload never completes across a navigation
+    // (measured on Chromium). The leading edge puts the first index on disk
+    // shortly after a burst begins, while a sustained burst keeps the debounce.
+    it('leading edge: the first save after a quiet period starts within leadingDelayMs', async () => {
+      perfCounters.reset();
+      const { root } = mockRoot();
+      const onError = vi.fn();
+      const params = {
+        root,
+        getSnapshot: () => snap(),
+        delayMs: 1000,
+        maxWaitMs: 2000,
+        leadingDelayMs: 150,
+        onError,
+      };
+      mgr.scheduleSave(params);
+      // A burst behind the first write must not push the leading save back.
+      for (let t = 0; t < 100; t += 50) {
+        await vi.advanceTimersByTimeAsync(50);
+        mgr.scheduleSave(params);
+      }
+      await vi.advanceTimersByTimeAsync(50);
+      await mgr.awaitInFlight();
+      expect(perfCounters.get('opfs.indexSaves')).toBe(1);
+
+      // Writes arriving right after that save are NOT a quiet period: they wait
+      // out the ordinary trailing debounce.
+      mgr.scheduleSave(params);
+      await vi.advanceTimersByTimeAsync(900);
+      expect(perfCounters.get('opfs.indexSaves')).toBe(1);
+      await vi.advanceTimersByTimeAsync(100);
+      await mgr.awaitInFlight();
+      expect(perfCounters.get('opfs.indexSaves')).toBe(2);
+
+      // After a full quiet period, the next first write takes the leading edge again.
+      await vi.advanceTimersByTimeAsync(1000);
+      mgr.scheduleSave(params);
+      await vi.advanceTimersByTimeAsync(150);
+      await mgr.awaitInFlight();
+      expect(perfCounters.get('opfs.indexSaves')).toBe(3);
+      expect(onError).not.toHaveBeenCalled();
+    });
+
+    it('maxWait: a save that is still in flight is never overlapped by the next one', async () => {
+      // Two createWritable() streams on the same file are not safe. When the
+      // ceiling fires while the previous index write is still running, the
+      // next write must wait for it and coalesce, never run alongside it.
+      let active = 0;
+      let maxActive = 0;
+      let writes = 0;
+      const slowRoot = {
+        async getFileHandle() {
+          return {
+            async createWritable() {
+              active++;
+              maxActive = Math.max(maxActive, active);
+              return {
+                async write() {
+                  await new Promise((r) => setTimeout(r, 3000));
+                },
+                async close() {
+                  active--;
+                  writes++;
+                },
+              };
+            },
+          };
+        },
+      } as unknown as FileSystemDirectoryHandle;
+      const onError = vi.fn();
+      for (let t = 0; t < 10_000; t += 30) {
+        mgr.scheduleSave({
+          root: slowRoot,
+          getSnapshot: snap,
+          delayMs: 1000,
+          maxWaitMs: 2000,
+          onError,
+        });
+        await vi.advanceTimersByTimeAsync(30);
+      }
+      await vi.advanceTimersByTimeAsync(10_000);
+      await mgr.awaitInFlight();
+      expect(maxActive).toBe(1);
+      expect(writes).toBeGreaterThanOrEqual(2);
+      expect(onError).not.toHaveBeenCalled();
+    });
+
+    it('flushPending() writes a scheduled save immediately (pagehide path)', async () => {
+      const { root, rootFiles } = mockRoot();
+      const onError = vi.fn();
+      mgr.scheduleSave({ root, getSnapshot: snap, delayMs: 1000, onError });
+      expect(rootFiles.has('_cache_meta.json')).toBe(false);
+
+      mgr.flushPending();
+      expect(mgr.hasPendingSave()).toBe(false);
+      // No timer advance: the write was started synchronously by the flush.
+      await mgr.awaitInFlight();
+      expect(rootFiles.has('_cache_meta.json')).toBe(true);
+    });
+
+    it('flushPending() is a no-op when nothing is scheduled', async () => {
+      const { rootFiles } = mockRoot();
+      mgr.flushPending();
+      await mgr.awaitInFlight();
+      expect(rootFiles.has('_cache_meta.json')).toBe(false);
     });
 
     it('direct save() swallows errors silently (used by dispose)', async () => {

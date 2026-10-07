@@ -14,6 +14,8 @@ import { loadDataset, type LoadDatasetPorts } from '../../../../../core/app/data
 import { captureViewerState } from '../../../../../config/zarr-bridge/viewer-state-capture';
 import { config } from '../../../../../config';
 import { syncCameraFovState } from '../../../../../ui/rendering-controls/sync-current-state';
+import { deferred, type Deferred } from '../../../../helpers/deferred';
+import { defineLifecycleContract } from '../../../_shared/lifecycle-contract';
 
 vi.mock('../../../../../data/scene-loader-manager', () => ({
   getSceneLoader: vi.fn(),
@@ -80,6 +82,7 @@ function makePorts(trace: Trace, overrides: Partial<LoadDatasetPorts> = {}): Loa
       trace.recordedViewerConfig = config;
     }),
     openCacheStatsView: vi.fn(() => trace.order.push('openCacheStatsView')),
+    isStale: vi.fn(() => false),
     ...overrides,
   };
 }
@@ -256,6 +259,7 @@ describe('loadDataset', () => {
     (getSceneLoader as unknown as ReturnType<typeof vi.fn>).mockReturnValue({
       sceneGraph: { kind: 'graph' },
       getFailedLoadsProvider: vi.fn(() => ({ getFailedPaths: () => [], retryAll: vi.fn() })),
+      setLeafMaterializedListener: vi.fn(),
     });
 
     await loadDataset('scene.zarr', ports);
@@ -281,6 +285,7 @@ describe('loadDataset', () => {
     (getSceneLoader as unknown as ReturnType<typeof vi.fn>).mockReturnValue({
       sceneGraph: { kind: 'graph' },
       getFailedLoadsProvider,
+      setLeafMaterializedListener: vi.fn(),
     });
 
     await loadDataset('scene.zarr', ports);
@@ -291,6 +296,48 @@ describe('loadDataset', () => {
     expect(setFailedLoadsProvider.mock.invocationCallOrder[0]).toBeGreaterThan(
       initFromScene.mock.invocationCallOrder[0]
     );
+  });
+
+  it('routes leaves the loader materialises LATER to the layers panel, AFTER initFromScene', async () => {
+    // A partition part activated by the LOD registry (or any leaf built after
+    // load) must pick up the panel's live layer state before it is drawn. The
+    // loader reports it through this listener; the panel checks the graph.
+    const trace: Trace = { order: [], recordedViewerConfig: undefined };
+    const initFromScene = vi.fn();
+    const applyLayerStateToNewLeaf = vi.fn();
+    const ports = makePorts(trace, {
+      layersPanel: {
+        initFromScene,
+        setFailedLoadsProvider: vi.fn(),
+        setCameraFramer: vi.fn(),
+        applyLayerStateToNewLeaf,
+      } as never,
+    });
+    const root = new THREE.Group();
+    root.name = 'LuxarScene';
+    ports.sceneManager.scene.children = [root];
+    const setLeafMaterializedListener = vi.fn();
+    (getSceneLoader as unknown as ReturnType<typeof vi.fn>).mockReturnValue({
+      sceneGraph: { kind: 'graph' },
+      getFailedLoadsProvider: vi.fn(() => ({ getFailedPaths: () => [], retryAll: vi.fn() })),
+      setLeafMaterializedListener,
+    });
+
+    await loadDataset('scene.zarr', ports);
+
+    expect(setLeafMaterializedListener).toHaveBeenCalledOnce();
+    expect(setLeafMaterializedListener.mock.invocationCallOrder[0]).toBeGreaterThan(
+      initFromScene.mock.invocationCallOrder[0]
+    );
+    const listener = setLeafMaterializedListener.mock.calls[0][0] as (
+      graph: unknown,
+      path: string,
+      object: THREE.Object3D
+    ) => void;
+    const graph = { kind: 'graph' };
+    const leaf = new THREE.Mesh();
+    listener(graph, '/nuclei/part_0', leaf);
+    expect(applyLayerStateToNewLeaf).toHaveBeenCalledExactlyOnceWith(graph, '/nuclei/part_0', leaf);
   });
 
   it('layers panel hydration is skipped when layersPanel is undefined', async () => {
@@ -402,6 +449,24 @@ describe('loadDataset', () => {
     expect(resolved).toBe(true);
   });
 
+  it.each([
+    ['loadSceneData', 'initDimensionSliders'],
+    ['initOverlays', 'initPicking'],
+    ['initPicking', 'applyViewerConfigState'],
+  ])('a load gone stale during %s stops before %s', async (staleAfter, firstSkipped) => {
+    const trace: Trace = { order: [], recordedViewerConfig: undefined };
+    const ports = makePorts(trace, {
+      isStale: () => trace.order.includes(staleAfter),
+    });
+
+    await loadDataset('scene.zarr', ports);
+
+    expect(trace.order).toContain(staleAfter);
+    expect(trace.order).not.toContain(firstSkipped);
+    expect(trace.order).not.toContain('startAnimation');
+    expect(trace.order).not.toContain('warmBlendModePrograms');
+  });
+
   it('loaderConfig is forwarded to sceneManager.loadSceneData', async () => {
     const trace: Trace = { order: [], recordedViewerConfig: undefined };
     const loaderConfig = { prefetch: true } as never;
@@ -413,5 +478,70 @@ describe('loadDataset', () => {
       loaderConfig,
       { applyViewerConfigFov: true }
     );
+  });
+});
+
+describe('loadDataset — lifecycle', () => {
+  beforeEach(() => {
+    (getSceneLoader as unknown as ReturnType<typeof vi.fn>).mockReturnValue(null);
+  });
+
+  defineLifecycleContract('loadDataset', {
+    create: () => {
+      // LuxarApp.loadDataset's session discipline: starting a load disposes the
+      // outgoing session, and disposing the app disposes the current one.
+      const staleSessions = new Set<number>();
+      let sessions = 0;
+      let disposed = false;
+      const steps: Array<Deferred<void>> = [];
+      const step = (): Promise<void> => {
+        const d = deferred();
+        steps.push(d);
+        return d.promise;
+      };
+      /** The tail a load commits once its data has loaded. */
+      const committed: string[] = [];
+      return {
+        start: (n) => {
+          for (let s = 0; s < sessions; s++) staleSessions.add(s);
+          const session = sessions++;
+          const trace: Trace = { order: [], recordedViewerConfig: undefined };
+          const ports = makePorts(trace, {
+            initOverlays: step,
+            initPicking: step,
+            applyViewerConfigState: () => committed.push(`viewerConfigState:${n}`),
+            isStale: () => disposed || staleSessions.has(session),
+          });
+          Object.assign(ports.sceneManager, { loadSceneData: step });
+          Object.assign(ports.renderingControls, {
+            setZarrViewerConfig: () => committed.push(`zarrViewerConfig:${n}`),
+          });
+          Object.assign(ports.animationController, {
+            startAnimation: () => committed.push(`startAnimation:${n}`),
+          });
+          return loadDataset(`scene-${n}.zarr`, ports);
+        },
+        pending: () => steps.length,
+        settle: (index, outcome) =>
+          outcome === 'ok' ? steps[index].resolve() : steps[index].reject(new Error('404')),
+        observe: () => [...committed],
+        dispose: () => {
+          disposed = true;
+        },
+      };
+    },
+    cases: {
+      abort: {
+        na: 'loadDataset takes no signal: a newer load or an app dispose makes its session stale, and it stops at its next await (the isStale port)',
+      },
+      dispose: true,
+      failure: true,
+      retry: true,
+      supersede: true,
+      doubleDispose: true,
+    },
+    usableAfterDispose: {
+      na: 'disposing the app ends its sessions; the next load belongs to a re-initialised app and opens a new session (LuxarApp.loadDataset)',
+    },
   });
 });

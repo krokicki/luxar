@@ -11,8 +11,9 @@
  * visual mesh material rather than the pick convention:
  *
  * 1. **A `CameraAwareMaterial` for only half the usual reason.** A mesh has no
- *    screen-space footprint to size, so `fov` and `resolution` are ignored; what it
- *    does consume is `uIsOrtho` + `uNearCull`, because the pick pass has to
+ *    screen-space footprint to size, so `resolution` is ignored (the
+ *    near fade's ortho test reads the projection matrix); what it does consume
+ *    is `uNearCull`, because the pick pass has to
  *    reproduce the visual near fade or a fading surface would stay fully pickable
  *    (#1431). Registering it therefore routes it into the camera broadcast, exactly
  *    as the visual mesh material.
@@ -77,8 +78,10 @@ export class MeshPickingMaterial
         // the first one.
         uAlphaCutout: { value: 1 },
         uSurfaceDepth: { value: 1 },
-        uIsOrtho: { value: 0 }, // 0 = perspective, 1 = orthographic
         uNearCull: { value: 0.1 }, // Default; overridden per-scene by updateCameraParams
+        // 1 = mirror the house shader's near fade; 0 for a physical visual (no
+        // fade there). Synced per pick render (picking-system/visibility-sync.ts).
+        uNearFade: { value: 1 },
         ...(config.baseColorTexture ? { uBaseColorTex: { value: config.baseColorTexture } } : {}),
       },
       vertexShader: MESH_PICK_GLSL.vertex,
@@ -102,19 +105,12 @@ export class MeshPickingMaterial
   /**
    * Update the camera-dependent uniforms.
    *
-   * `_fov` / `_resolution` are accepted and IGNORED — a mesh has no screen-space
-   * footprint to size. Only the near fade's two inputs are consumed, and they must
-   * be kept identical to the visual material's or pick coverage would stop matching
+   * `_resolution` is accepted and IGNORED — a mesh has no
+   * screen-space footprint to size, and the near fade's ortho test reads the
+   * projection matrix. Only `nearCull` is consumed, and it must be kept identical to the visual material's or pick coverage would stop matching
    * visible coverage near the camera. Mirrors `MeshMaterial.updateCameraParams`.
    */
-  updateCameraParams(
-    _fov: number,
-    _resolution: THREE.Vector2,
-    isOrtho: boolean = false,
-    nearCull?: number,
-    _pixelRatio?: number
-  ): void {
-    this.uniforms.uIsOrtho.value = isOrtho ? 1 : 0;
+  updateCameraParams(_resolution: THREE.Vector2, nearCull?: number, _pixelRatio?: number): void {
     if (nearCull !== undefined) {
       this.uniforms.uNearCull.value = nearCull;
     }
@@ -200,8 +196,8 @@ export class MeshPickingMaterial
     // Camera state too: a clone left at the perspective/0.1 defaults would fade its
     // pick coverage against the wrong near plane — and under ortho, where the fade
     // is the identity, would fade at all.
-    cloned.uniforms.uIsOrtho.value = this.uniforms.uIsOrtho.value;
     cloned.uniforms.uNearCull.value = this.uniforms.uNearCull.value;
+    cloned.uniforms.uNearFade.value = this.uniforms.uNearFade.value;
     // The epoch's culling must ride along: a clone taken on an undecidable frame
     // would otherwise revert to FrontSide and drop half the pickable surface until
     // the next commit re-applied it.

@@ -24,7 +24,7 @@
  */
 
 import * as THREE from 'three';
-import { createMeshGeometry } from '../mesh-geometry';
+import { createEmptyMeshGeometry } from '../mesh-geometry';
 import { applyTransform } from './transforms';
 import {
   materialManager,
@@ -42,7 +42,7 @@ import { isMeshPickAwareMaterial } from '../picking/mesh/pick-mode';
 import type { PickingSystem } from '../picking/picking-system';
 import { getColormapTexture } from '../colormap-textures';
 import { supportsScalarColormap } from '../material-colormap-helpers';
-import { resolveColormapWindow } from '../display-range';
+import { resolveColormapWindow, type DisplayUniforms } from '../display-range';
 import { scheduleBlendModeProgramWarmupForObject } from '../webgl-blend-warmup';
 import { log, Modules } from '../../utils/log';
 import type { MeshSide } from '../../data/mesh/projection';
@@ -324,7 +324,8 @@ export function createMeshMaterial(
         const scalarRange = resolveColormapWindow(
           attrs.scalar_data_range ?? [0, 1],
           { intensity: leaf.intensity ?? 1.0, offset: leaf.offset ?? 0.0 },
-          { intensity: composedIntensity, offset: composedOffset }
+          { intensity: composedIntensity, offset: composedOffset },
+          (attrs as { windowOwnerGain?: DisplayUniforms }).windowOwnerGain
         );
         material.updateScalarRange(scalarRange[0], scalarRange[1]);
         // The window now drives the LUT lookup; clear the post-LUT gain the material
@@ -435,34 +436,7 @@ export function createEmptyMeshNode(
   pickingSystem: PickingSystem | null,
   leafAttrs?: Partial<MeshMetadata>
 ): THREE.Mesh {
-  const geometry = createMeshGeometry({
-    // One vertex and no indices: a valid, drawable-but-empty geometry.
-    //
-    // The choice is conservative rather than forced, and it is worth saying so
-    // precisely because an earlier version of this comment claimed a zero-vertex buffer
-    // makes `computeBoundingSphere` produce NaN bounds. MEASURED against three r184,
-    // that is false in every direction: a 0-count `position` gives `radius = 0`, and an
-    // ABSENT `position` gives three's `radius = -1` "no geometry" sentinel. Neither is
-    // NaN. What one vertex does buy is that every attribute — including the
-    // always-bound default `color` — has `count >= 1`, so the geometry is
-    // non-degenerate for anything that divides by or iterates over the count, and its
-    // bounding sphere is a real sphere rather than the -1 sentinel.
-    position: new Float32Array(3),
-    // The placeholder's buffer is brand new, so it is trivially "changed".
-    positionChanged: true,
-    indices: new Uint32Array(0),
-    colors: null,
-    // One-vertex STUBS for the optional attributes the node declares, so the
-    // attribute SET is complete from birth and the first commit only replaces
-    // contents. Adding an attribute to a live geometry instead would grow the
-    // vertex layout the WebGPU backend caches at first draw. Keyed off the
-    // metadata, which is what the real arrays' presence will agree with.
-    normals: attrs.has_normals ? new Float32Array(3) : null,
-    scalars: attrs.has_scalars ? new Float32Array(1) : null,
-    uvs: attrs.has_uvs ? new Float32Array(2) : null,
-    vertexCount: 1,
-    faceCount: 0,
-  });
+  const geometry = createEmptyMeshGeometry(attrs);
 
   // The stored-normal half of the shading rule needs the active `displayDims`, which
   // no one knows yet — the first projection decides it. Start from the
@@ -517,9 +491,10 @@ export function createEmptyMeshNode(
     const pickId = pickingSystem.allocatePickId();
     mesh.userData.pickId = pickId;
     // The pick material reads the same coverage the visual one does, so it starts
-    // from the same node opacity and cutoff. Both are re-pushed by the layers panel
-    // through `syncMeshPickAppearance`; seeding them here keeps the FIRST pick
-    // (which can precede any panel interaction) consistent with the screen.
+    // from the same node opacity and cutoff. The cutoff is re-pushed by the layers
+    // panel through `syncMeshPickAppearance`, and the live opacity is copied from
+    // the visual material on every pick render (picking-system/visibility-sync.ts);
+    // seeding both here keeps the pick material consistent from the start.
     const pickPlaceholder = attrs.has_texture ? new THREE.Texture() : null;
     const pickMaterial = materialManager.createMeshPickingMaterial({
       nodeId: pickId,
@@ -568,9 +543,11 @@ export function createEmptyMeshNode(
  *
  * `opacity` and `alpha_cutoff` are the two visual values the pick pass reads (they
  * are the whole coverage term and the cutout threshold — §6.5), and the layers panel
- * can change either at runtime. Without this the pick pass would keep the
- * load-time values: dragging opacity below the cutoff would dissolve the mesh on
- * screen while leaving every triangle pickable.
+ * can change either at runtime. The opacity is ALSO reconciled from the visual
+ * material's live uniform on every pick render (picking-system/visibility-sync.ts —
+ * that is what covers the LOD cross-fade and the embedder exposure path), so for
+ * opacity this push matters for the invalidation its return value drives; the
+ * cutoff has no other route.
  *
  * A no-op for a node with no pick material (picking disabled, or a test-built node).
  *

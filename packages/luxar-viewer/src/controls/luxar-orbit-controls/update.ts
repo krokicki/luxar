@@ -30,6 +30,40 @@ import { applyToCamera } from './camera-application';
 import type { AutoRotateAxis } from '../types';
 
 const _IDENTITY_QUAT = new THREE.Quaternion();
+
+/**
+ * Sine of the half-angle below which a rotation delta is dropped (≈ 2e-8 rad).
+ * The damped tail applies, in total, exactly the remaining delta, so dropping
+ * it moves no drawn position by more than 2e-8 of its distance from the
+ * target, below its own float32 resolution (~6e-8 relative) — the same bound
+ * as the zoom gate's 1e-8. Below it a step only flips float32 roundings of
+ * the camera matrices: on a 4 px drag the old 1e-12 gate rendered ~59 frames
+ * identical to their predecessor, after a few whose only change was 1/255 in
+ * a few dozen pixels.
+ */
+const NEGLIGIBLE_ROTATION_SIN_HALF = 1e-8;
+
+/**
+ * Remaining pan, as a fraction of the view's length scale, below which it is
+ * dropped (same bound). The scale is the camera distance in perspective and
+ * the VISIBLE field width `(right - left) / zoom` in orthographic, where the
+ * distance does not set what one pixel spans: a distance-scaled gate froze a
+ * pan at extreme zoom-in and kept a sub-pixel one alive zoomed out.
+ */
+const NEGLIGIBLE_PAN_FRACTION = 1e-8;
+
+/** The length scale {@link NEGLIGIBLE_PAN_FRACTION} is a fraction of. */
+function panScale(ctx: OrbitUpdateCtx): number {
+  const camera = ctx.camera;
+  return camera instanceof THREE.OrthographicCamera
+    ? (camera.right - camera.left) / camera.zoom
+    : ctx.getDistance();
+}
+
+/** Whether `q` (a unit rotation) is within {@link NEGLIGIBLE_ROTATION_SIN_HALF} of the identity. */
+function isNegligibleRotation(q: THREE.Quaternion): boolean {
+  return q.x * q.x + q.y * q.y + q.z * q.z < NEGLIGIBLE_ROTATION_SIN_HALF ** 2;
+}
 const _v2 = new THREE.Vector3();
 const _q1 = new THREE.Quaternion();
 
@@ -141,8 +175,16 @@ export function runUpdateStep(ctx: OrbitUpdateCtx, deltaTime?: number): boolean 
     ctx.setDollyPhase(nextPhase);
   }
 
-  // 3. Apply trackball rotation with damping (local frame)
-  if (ctx.enableDamping) {
+  // 3. Apply trackball rotation with damping (local frame). A negligible
+  // residue is snapped to the identity and NOT applied, like the roll/zoom
+  // gates below: the damped delta decays geometrically and takes thousands of
+  // frames to reach the exact identity, and multiplying it in + re-normalizing
+  // every frame can flip the orientation between two ULP-apart quaternions
+  // forever — step 10's exact test then reports a change on every frame and
+  // the render loop never idles after the drag.
+  if (isNegligibleRotation(ctx.rotationDelta)) {
+    ctx.rotationDelta.identity();
+  } else if (ctx.enableDamping) {
     _q1.slerpQuaternions(_IDENTITY_QUAT, ctx.rotationDelta, ctx.dampingFactor);
     ctx.orientation.multiply(_q1);
     ctx.orientation.normalize();
@@ -171,8 +213,10 @@ export function runUpdateStep(ctx: OrbitUpdateCtx, deltaTime?: number): boolean 
     }
   }
 
-  // 5. Apply pan with damping
-  if (ctx.enableDamping) {
+  // 5. Apply pan with damping. A negligible residue is dropped, as above.
+  if (ctx.panDelta.lengthSq() < (NEGLIGIBLE_PAN_FRACTION * panScale(ctx)) ** 2) {
+    ctx.panDelta.set(0, 0, 0);
+  } else if (ctx.enableDamping) {
     ctx.target.addScaledVector(ctx.panDelta, ctx.dampingFactor);
     ctx.panDelta.multiplyScalar(1 - ctx.dampingFactor);
   } else {

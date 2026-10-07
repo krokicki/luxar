@@ -9,11 +9,6 @@
       "count": 1
     }
   },
-  "src/cache/decompressed-chunk-cache/cached-zarr-array.ts": {
-    "complexity": {
-      "count": 2
-    }
-  },
   "src/cache/heap-budget.ts": {
     "complexity": {
       "count": 1
@@ -160,7 +155,7 @@
   },
   "src/core/app/picking/init-picking.ts": {
     "complexity": {
-      "count": 2
+      "count": 1
     },
     "max-lines-per-function": {
       "count": 1
@@ -224,9 +219,6 @@
   },
   "src/data/gsplats/gsplats-progressive-loader.ts": {
     "complexity": {
-      "count": 3
-    },
-    "max-lines-per-function": {
       "count": 1
     }
   },
@@ -238,11 +230,6 @@
       "count": 1
     },
     "max-params": {
-      "count": 1
-    }
-  },
-  "src/data/gsplats/handler.ts": {
-    "complexity": {
       "count": 1
     }
   },
@@ -261,9 +248,9 @@
   },
   "src/data/lines/lines-progressive-loader.ts": {
     "complexity": {
-      "count": 3
+      "count": 1
     },
-    "max-lines-per-function": {
+    "max-params": {
       "count": 1
     }
   },
@@ -413,10 +400,7 @@
   },
   "src/data/points/points-progressive-loader.ts": {
     "complexity": {
-      "count": 4
-    },
-    "max-lines-per-function": {
-      "count": 1
+      "count": 2
     },
     "max-params": {
       "count": 2
@@ -459,9 +443,6 @@
     "complexity": {
       "count": 4
     },
-    "max-lines-per-function": {
-      "count": 1
-    },
     "max-params": {
       "count": 1
     }
@@ -491,9 +472,6 @@
       "count": 1
     },
     "max-depth": {
-      "count": 1
-    },
-    "max-params": {
       "count": 1
     }
   },
@@ -600,9 +578,6 @@
   "src/data/scene-loader/progressive/refinement.ts": {
     "complexity": {
       "count": 1
-    },
-    "max-depth": {
-      "count": 1
     }
   },
   "src/data/scene-loader/update-view/atomic-commit.ts": {
@@ -693,7 +668,17 @@
   },
   "src/rendering/depth-sort-coordinator.ts": {
     "complexity": {
-      "count": 7
+      "count": 1
+    }
+  },
+  "src/rendering/depth-sort-coordinator/capture.ts": {
+    "complexity": {
+      "count": 1
+    }
+  },
+  "src/rendering/depth-sort-coordinator/ordering-apply.ts": {
+    "complexity": {
+      "count": 1
     }
   },
   "src/rendering/depth-sort-coordinator/render-order.ts": {
@@ -704,6 +689,11 @@
       "count": 1
     }
   },
+  "src/rendering/depth-sort-coordinator/scheduler.ts": {
+    "complexity": {
+      "count": 4
+    }
+  },
   "src/rendering/depth-sort-coordinator/triangle-ordering.ts": {
     "complexity": {
       "count": 1
@@ -711,7 +701,7 @@
   },
   "src/rendering/element-storage.ts": {
     "complexity": {
-      "count": 4
+      "count": 3
     }
   },
   "src/rendering/gpu-buffer-pool.ts": {
@@ -725,11 +715,6 @@
     }
   },
   "src/rendering/gpu-buffer-pool/geometry-bytes.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/rendering/gpu-buffer-pool/gsplats-adapter.ts": {
     "complexity": {
       "count": 1
     }
@@ -769,11 +754,6 @@
       "count": 1
     }
   },
-  "src/rendering/materials/_shared/tsl-helpers.ts": {
-    "max-params": {
-      "count": 1
-    }
-  },
   "src/rendering/materials/gsplat/material-glsl.ts": {
     "complexity": {
       "count": 2
@@ -799,7 +779,7 @@
   },
   "src/rendering/materials/line/material-tsl.ts": {
     "complexity": {
-      "count": 3
+      "count": 2
     }
   },
   "src/rendering/materials/line/shader-tsl-capsule.ts": {
@@ -812,7 +792,7 @@
   },
   "src/rendering/materials/line/shader-tsl.ts": {
     "complexity": {
-      "count": 4
+      "count": 3
     },
     "max-lines-per-function": {
       "count": 2
@@ -924,7 +904,7 @@
   },
   "src/rendering/picking/line/pick.tsl.ts": {
     "complexity": {
-      "count": 2
+      "count": 1
     },
     "max-lines-per-function": {
       "count": 2
@@ -937,7 +917,7 @@
   },
   "src/rendering/picking/picking-system.ts": {
     "complexity": {
-      "count": 2
+      "count": 1
     }
   },
   "src/rendering/picking/point/pick.tsl.ts": {
@@ -1002,11 +982,6 @@
       "count": 1
     }
   },
-  "src/scene/animation/animation-controller.ts": {
-    "complexity": {
-      "count": 2
-    }
-  },
   "src/scene/animation/dimension-animation-manager.ts": {
     "complexity": {
       "count": 4
@@ -1043,31 +1018,12 @@
       "count": 1
     }
   },
-  "src/scene/lod-group-registry.ts": {
-    "complexity": {
-      "count": 5
-    },
-    "max-depth": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 1
-    },
-    "max-params": {
-      "count": 1
-    }
-  },
   "src/scene/lod-selector-math.ts": {
     "complexity": {
       "count": 2
     }
   },
   "src/scene/scene-dims-manager.ts": {
-    "complexity": {
-      "count": 1
-    }
-  },
-  "src/scene/scene-manager.ts": {
     "complexity": {
       "count": 1
     }
@@ -1212,11 +1168,6 @@
       "count": 3
     }
   },
-  "src/tests/unit/workers/worker-pool/selection/load-balancing.test.ts": {
-    "@typescript-eslint/no-misused-promises": {
-      "count": 1
-    }
-  },
   "src/themes/glass-filters.ts": {
     "max-lines-per-function": {
       "count": 1
@@ -1353,12 +1304,12 @@
   },
   "src/ui/layers/layer-apply.ts": {
     "complexity": {
-      "count": 4
+      "count": 2
     }
   },
   "src/ui/layers/layer-controls.ts": {
     "complexity": {
-      "count": 3
+      "count": 2
     },
     "max-lines-per-function": {
       "count": 1
@@ -1550,6 +1501,11 @@
       "count": 1
     }
   },
+  "src/wasm/typescript/points-membership.ts": {
+    "max-params": {
+      "count": 1
+    }
+  },
   "src/workers/data-worker/decode/lut.ts": {
     "complexity": {
       "count": 1
@@ -1582,11 +1538,6 @@
     },
     "max-params": {
       "count": 3
-    }
-  },
-  "src/workers/worker-pool.ts": {
-    "complexity": {
-      "count": 1
     }
   },
   "src/workers/worker-pool/lifecycle/init-with-guard.ts": {

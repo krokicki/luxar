@@ -10,6 +10,7 @@ import {
   releasePrefetchResources,
   updateSceneForDimensions,
 } from '../data';
+import { SceneLoaderManager } from '../data/scene-loader-manager';
 import { sceneDimsManager } from './scene-dims-manager';
 import type { AnimationController } from './animation/animation-controller';
 import type { DimensionAnimationManager } from './animation/dimension-animation-manager';
@@ -76,8 +77,8 @@ function scheduleScrubSettle(ctx: DimensionLoadingContext): void {
     // case) so the same-value write does not fan out to a displayed-axis UI. If
     // every dimension is displayed, fall back to dimension 0: the notification
     // is still required to release the pinned loader into normal refinement.
-    // setDimensionValue notifies listeners synchronously and unconditionally, so
-    // the flag below is read before it is cleared.
+    // The forced refresh notifies listeners synchronously, so the flag below
+    // is read before it is cleared.
     const displayed = new Set(dims.displayed ?? []);
     let dim = 0;
     for (let d = 0; d < dims.ndim; d++) {
@@ -88,7 +89,7 @@ function scheduleScrubSettle(ctx: DimensionLoadingContext): void {
     }
     scrubSettlePassPending = true;
     try {
-      sceneDimsManager.setDimensionValue(dim, dims.currentStep[dim]);
+      sceneDimsManager.setDimensionValue(dim, dims.currentStep[dim], { force: true });
     } finally {
       // The listener ran synchronously up to its first await and has already
       // read the (empty) directives; clear for the next scrub.
@@ -122,7 +123,10 @@ export async function updateAllNDNodes(ctx: DimensionLoadingContext): Promise<vo
   const pinnedScrub = frameBudgetMs === undefined && ladderDepth !== undefined;
 
   // Use the new loader architecture's update mechanism
+  // The LuxarApp's loaders (this module drives the app's slice; a LuxarLayer
+  // runs its own `updateSceneForDimensions` against its own manager).
   await updateSceneForDimensions(
+    SceneLoaderManager.getInstance(),
     dims,
     ctx.sceneManager.scene as unknown as THREE.Group,
     undefined,
@@ -154,6 +158,7 @@ export async function updateAllNDNodes(ctx: DimensionLoadingContext): Promise<vo
     const budgetMs = anim.getFrameBudgetMs();
     if (predictedAny && budgetMs !== null) {
       prefetchSceneForDimensions(
+        SceneLoaderManager.getInstance(),
         { ...dims, currentStep: nextStep },
         ctx.sceneManager.scene as unknown as THREE.Group,
         undefined,
@@ -163,10 +168,13 @@ export async function updateAllNDNodes(ctx: DimensionLoadingContext): Promise<vo
   } else {
     // Playback ended (this branch includes the pause refine re-trigger
     // pass): free the shadow loaders' accumulators until the next play.
-    releasePrefetchResources();
+    releasePrefetchResources(SceneLoaderManager.getInstance());
     if (pinnedScrub) scheduleScrubSettle(ctx);
   }
 
-  // Trigger re-render after update
-  ctx.animationController.startAnimation();
+  // Keep the loop ticking after the update. Its commits already requested
+  // their own render (geometry-committed), so waking with a render here drew
+  // a second, identical frame on the next tick: about two renders per data
+  // step during playback.
+  ctx.animationController.requestTick();
 }

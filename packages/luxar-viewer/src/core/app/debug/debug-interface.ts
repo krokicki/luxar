@@ -5,8 +5,7 @@ import { VIEWER_VERSION } from '../../../version';
 import { sceneDimsManager } from '../../../scene/scene-dims-manager';
 import { SceneLoaderManager } from '../../../data/scene-loader-manager';
 import { getWorkerPool } from '../../../workers/worker-pool';
-import { showError } from '../../../ui/error-overlay';
-import { KeyAction } from '../../../input';
+import { showViewerError } from '../error-dialog';
 import { createInstancedLinesMesh } from '../../../rendering/line-geometry';
 import { createInstancedGSplatsMesh } from '../../../rendering/gsplat-geometry';
 import { createPointsGeometry } from '../../../rendering/node-factory/create-points-node';
@@ -22,22 +21,14 @@ import {
 import { getBlendModeProgramWarmupStats } from '../../../rendering/webgl-blend-warmup';
 import { materialManager, type BlendingMode } from '../../../rendering/material-manager';
 import { normalizeBlendingMode } from '../../../rendering/blending-state';
-import {
-  getDepthSortWorkerStatus,
-  noteDepthSortCommit,
-  resortForCapture,
-} from '../../../rendering/depth-sort-coordinator';
+import { getDepthSortWorkerStatus } from '../../../rendering/depth-sort-coordinator';
 import { setCommittedData } from '../../../types/committed-data';
 import { resolveLinePrimitiveForNode } from '../../../types/line-primitive';
 import type { LoadedPointsData } from '../../../types/points';
 import type { SyntheticInjectionResult, SyntheticSceneSpec } from '../../../scene/synthetic-scene';
 import { computeDebugState, computeDrawOrder } from './debug-state';
 import { buildDebugCacheHelpers } from './debug-cache-helpers';
-import {
-  setLodLoadStatsEnabled,
-  snapshotLodLoadStats,
-  resetLodLoadStats,
-} from '../../../data/scene-loader/lod-load-stats';
+import { snapshotLodLoadStats, resetLodLoadStats } from '../../../data/scene-loader/lod-load-stats';
 import type { SceneManager } from '../../../scene/scene-manager';
 import type { AnimationController } from '../../../scene/animation/animation-controller';
 import type { InputHandler } from '../../../input';
@@ -49,7 +40,9 @@ import type { OverlayManager } from '../../../ui/overlay-manager';
 import type { LuxarApp } from '../../app';
 import { GSPLAT_DEFAULT_TRUNCATION_RADIUS } from '../../../config/constants';
 import { computePerfSnapshot } from './perf-snapshot';
-import { getRendererInfoSnapshot, installRendererInfoSampler } from './renderer-info-sampler';
+import { perfCounters } from '../../../profiling/perf-counters';
+import { getRendererInfoSnapshot } from './renderer-info-sampler';
+import { installDebugPerfInstruments } from './perf-instruments';
 import { snapshotProjectedDensity } from '../../../scene/projected-density';
 import type { LODGroupRegistry } from '../../../scene/lod-group-registry';
 
@@ -84,17 +77,11 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
 
   log.info(Modules.LUXAR, 'Extending debug interface with runtime components');
 
-  // Enable lazy-LOD-load per-stage timing plus additive per-level ladder
-  // timing under ?debug only. The lazy ensureLoaded loads run outside any
-  // updateView cycle, so the UpdateProfiler never captures them — this fills
-  // that gap for navigation-cost diagnosis. Snapshot via
-  // __luxarDebug.getLodLoadStats().
-  setLodLoadStatsEnabled(true);
-
-  // Sample renderer.info at every frame-end for getPerf().rendererInfo —
-  // between frames Three's autoReset leaves only the last post-processing
-  // pass in it. Debug sessions only; re-install replaces a prior subscription.
-  installRendererInfoSampler(() => ports.sceneManager.renderer);
+  // The debug perf instruments (lazy-LOD stage timing, the getObjectByName
+  // counter, the renderer.info sampler). The standalone bootstrap installed
+  // them before init(); this covers embedders that enable `debug` directly,
+  // and re-points the sampler at the now-built renderer. Idempotent.
+  installDebugPerfInstruments(() => ports.sceneManager.renderer);
 
   // Extend whatever bootstrap seeded (app/consoleInterceptor/version). When
   // LuxarApp is instantiated outside the standalone-app entry point
@@ -197,7 +184,7 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
 
     // Helper to trigger a single frame render (for stable screenshots)
     renderOnce: () => {
-      ports.animationController.startAnimation();
+      ports.animationController.renderOnce();
     },
 
     // Effective cross-node draw order of every data mesh: opaque bucket
@@ -216,7 +203,8 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
     // depth-sort scheduler dead — without this each frame renders the
     // permutation frozen at the pre-orbit pose. Resolves when ordering is
     // settled (or after an internal safety timeout).
-    resortDepthOrderingForCapture: (maxWaitMs?: number) => resortForCapture(maxWaitMs),
+    resortDepthOrderingForCapture: (maxWaitMs?: number) =>
+      ports.sceneManager.depthSort.resortForCapture(maxWaitMs),
 
     // Why the scene may be drawn UNSORTED (issue #1694). `idle` = the sort
     // worker was never spawned or its init is still in flight; `ready` =
@@ -254,10 +242,7 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
     // through URL-routing failure paths (whose semantics evolve
     // independently of the dialog's appearance).
     showError: (message) =>
-      showError(message, (actionId) => ports.app.shortcutForAction(actionId), {
-        datasetBrowser: KeyAction.toggleDatasetBrowser,
-        help: KeyAction.toggleHelp,
-      }),
+      showViewerError(message, (actionId) => ports.app.shortcutForAction(actionId)),
 
     // Debug-only synthetic-scene injector for the perf bench. Builds
     // a large lines / points / gsplats payload purely in JS, wires it
@@ -274,7 +259,7 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
     // ('additive') while points/gsplats default to 'normal' so the
     // depth-sort subsystem engages; `spec.blending` overrides either.
     // Points/gsplats also stamp `committedData` and call
-    // `noteDepthSortCommit` — the same signals the production commit
+    // `depthSort.noteCommit` — the same signals the production commit
     // path emits — so the SortWorker registers the node and orderings
     // actually apply (the coordinator drops orderings for meshes
     // without the stamp).
@@ -355,8 +340,8 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
           // which runs for this debug injection).
           syncLineMaterialWithGeometry(mesh);
           scene.add(mesh);
-          // Kick the renderer so the new mesh is uploaded before the
-          // bench's first measurement frame.
+          // Wake the renderer: the mesh uploads at the next animation frame,
+          // before the bench's first measured frame (the benches wait one).
           ports.animationController.startAnimation();
           return { type: 'lines', segmentCount: cfg.segmentCount, elementCount: clamped, mesh };
         }
@@ -397,7 +382,11 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
           // live mode is order-dependent. The thunk hands the worker a
           // FRESH buffer (it is transferred) and only pays the copy on
           // the sorted path.
-          noteDepthSortCommit(mesh, () => cfg.centers.slice(0, clamped * 3), clamped);
+          ports.sceneManager.depthSort.noteCommit(
+            mesh,
+            () => cfg.centers.slice(0, clamped * 3),
+            clamped
+          );
           ports.animationController.startAnimation();
           return { type: 'gsplats', splatCount: cfg.splatCount, elementCount: clamped, mesh };
         }
@@ -453,7 +442,11 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
           syncPointMaterialWithGeometry(mesh);
           setCommittedData(mesh, data);
           scene.add(mesh);
-          noteDepthSortCommit(mesh, () => cfg.positions.slice(0, clamped * 3), clamped);
+          ports.sceneManager.depthSort.noteCommit(
+            mesh,
+            () => cfg.positions.slice(0, clamped * 3),
+            clamped
+          );
           ports.animationController.startAnimation();
           return { type: 'points', pointCount: cfg.pointCount, elementCount: clamped, mesh };
         }
@@ -462,13 +455,8 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         log.error(Modules.LUXAR, `__luxarDebug.injectSyntheticScene failed: ${message}`, error);
-        showError(
-          `Synthetic-scene injection failed: ${message}`,
-          (actionId) => ports.app.shortcutForAction(actionId),
-          {
-            datasetBrowser: KeyAction.toggleDatasetBrowser,
-            help: KeyAction.toggleHelp,
-          }
+        showViewerError(`Synthetic-scene injection failed: ${message}`, (actionId) =>
+          ports.app.shortcutForAction(actionId)
         );
         throw error;
       }
@@ -486,6 +474,8 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
     // Every hook is read INSIDE the getter, per snapshot, for the same
     // reason `isLoading` is: capturing once here would freeze it.
     perfReady: true,
+    getPerfRecords: (kind: string) => perfCounters.records(kind),
+    resetPerfCounters: () => perfCounters.reset(),
     getPerf: () =>
       computePerfSnapshot({
         rendererInfo: getRendererInfoSnapshot,
@@ -507,6 +497,9 @@ export function installDebugInterface(ports: InstallDebugInterfacePorts): void {
           } | null;
           return loader?.lodGroupRegistry?.isAnyLevelLoading() ?? false;
         },
+        isAnyLodFadeInFlight: () =>
+          SceneLoaderManager.getInstance().getDefaultLoader()?.lodGroupRegistry?.isAnimating() ??
+          false,
         hasVisiblePendingPartitionResync: () =>
           SceneLoaderManager.getInstance()
             .getDefaultLoader()

@@ -309,13 +309,13 @@ exports group into the categories below.
 
 ### nD / dimension navigation
 
-| Helper                                                           | Use when                                                                                                                                                                                                                                                                                                                                                                                   |
-| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `waitForDimensionSystemReady`                                    | Wait for the scene dimensions manager to expose its API.                                                                                                                                                                                                                                                                                                                                   |
-| `waitForDimensionSelected(page, index)`                          | Wait until a specific dimension is the active one.                                                                                                                                                                                                                                                                                                                                         |
-| `waitForDimensionNavigation`                                     | Wait for a dimension-change to commit (debounce-aware).                                                                                                                                                                                                                                                                                                                                    |
-| `waitForNavigationComplete` / `waitForNavigationCompleteOrThrow` | Wait for queued navigation events to drain; the `OrThrow` variant fails the test on timeout. The plain variant tolerates a condition that never settles — it returns after one warning, naming how many probes went out, how many yielded no usable state, and whether the `isLoading` flag was readable — but THROWS if every state probe FAILED, since it confirmed nothing (see #1726). |
-| `waitForSpatialQuery` / `waitForSpatialQueryOrThrow`             | Wait for the spatial-index query that drives nD slicing. The `OrThrow` variant is a bare `page.waitForFunction` and fails the test on timeout, with no probe of its own to warn about. The plain variant has the same two-way give-up as `waitForNavigationComplete`.                                                                                                                      |
+| Helper                                                           | Use when                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `waitForDimensionSystemReady`                                    | Wait for the scene dimensions manager to expose its API.                                                                                                                                                                                                                                                                                                                                  |
+| `waitForDimensionSelected(page, index)`                          | Wait until a specific dimension is the active one.                                                                                                                                                                                                                                                                                                                                        |
+| `waitForDimensionNavigation`                                     | Wait for a dimension-change to commit (debounce-aware).                                                                                                                                                                                                                                                                                                                                   |
+| `waitForNavigationComplete` / `waitForNavigationCompleteOrThrow` | Wait for queued navigation events to drain; the throwing variant fails the test on timeout. The plain variant tolerates a condition that never settles — it returns after one warning, naming how many probes went out, how many yielded no usable state, and whether the `isLoading` flag was readable — but THROWS if every state probe FAILED, since it confirmed nothing (see #1726). |
+| `waitForSpatialQuery` / `waitForSpatialQueryOrThrow`             | Wait for the spatial-index query that drives nD slicing. The throwing variant is a bare `page.waitForFunction` and fails the test on timeout, with no probe of its own to warn about. The plain variant has the same two-way give-up as `waitForNavigationComplete`.                                                                                                                      |
 
 ### Console and error assertions
 
@@ -432,25 +432,28 @@ least diagnosable way for a diagnostic test to fail.
 
 `pnpm check:e2e-timeout-budgets` enforces that rule for deadlines above half the
 default project's test timeout (30 s with today's 60 s budget). It reads
-explicit `timeout` options, numeric arguments passed to wait helpers, local
-wait-helper defaults, imported parameter defaults from `./helpers` and
-`./helpers/*`, and module-level timeout/deadline constants used by each test —
-except where such a constant IS the budget, since the argument to
-`test.setTimeout`, `test.slow` or `describe.configure` is what the deadline has
-to beat rather than a deadline of its own.
-Deadlines inside helper bodies, local or imported, remain out of scope (see
-#2901). `beforeAll` and `afterAll` are checked once at their declaration lines.
-Each has a separate timeout equal to the project timeout; suite-level
+explicit `timeout` options, numeric arguments passed to wait helpers, local and
+imported helper bodies, local wait-helper defaults, imported parameter defaults
+from `./helpers` and `./helpers/*`, and module-level timeout/deadline constants
+used by each test — except where such a constant IS the budget, since the
+argument to `test.setTimeout`, `test.slow` or `describe.configure` is what the
+deadline has to beat rather than a deadline of its own.
+Helper-body traversal follows at most ten nested calls and fails closed past that
+limit; it stops when a helper is already active, so recursive helpers cannot make
+the check recurse forever. Budget declarations inside helpers are not modelled;
+declare the budget in the test or enclosing suite.
+`beforeAll` and `afterAll` are checked once at their declaration lines. Each has
+a separate timeout equal to the project timeout; suite-level
 `describe.configure`, `test.setTimeout`, and `test.slow` do not extend it.
 Declare `test.setTimeout`, `testInfo.setTimeout`, `test.slow()`, or
 `testInfo.slow()` inside the hook to give it more time. An unconditional
-hook-local `slow()` triples that hook's current timeout once. The sum also
-remains out of scope — deadlines are modelled as
-the largest single wait, not their total,
-so three sequential 40 s waits under a 45 s budget pass the check even though
-the rule above asks for headroom over their sum. Summing across branches and
-loops is not something a static pass can honestly claim to do, so the budget
-still has to be sized by hand.
+hook-local `slow()` triples that hook's current timeout once.
+Sequential waits are also out of scope: deadlines are modelled as the largest
+single wait, not their total, so three sequential 40 s
+waits under a 45 s budget pass the check even though the rule above asks for
+headroom over their sum. Each nested helper and repeated helper call can compound
+that understatement. Summing across branches and loops is not something a
+static pass can honestly claim to do, so the budget still has to be sized by hand.
 `test.slow()`, `test.setTimeout()`, or an enclosing
 `test.describe.configure({ timeout })` supplies the budget. `test.slow()` is
 modelled as Playwright implements it, which differs by scope. In a describe

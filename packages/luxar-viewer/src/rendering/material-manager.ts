@@ -1,9 +1,11 @@
 /**
  * Material Manager for Luxar
  *
- * This module manages all materials in the scene, providing caching,
- * global uniform updates, and support for multiple material types.
- * Supports point, line, and GSplat materials.
+ * This module creates every node material — per node, never cached: the
+ * visual and picking materials of points, lines, gsplats and mesh, and the
+ * opt-in `physical` mesh material — and keeps them in one registry for the
+ * global uniform updates and disposal. It also creates the post-processing
+ * mega-shader material, which `PostProcessingManager` owns.
  */
 
 import * as THREE from 'three';
@@ -38,7 +40,7 @@ import {
   type CameraAwareMaterial,
 } from './materials/_shared/camera-aware-material';
 import type { RendererCapabilities } from './renderer-capabilities';
-import { log, Modules } from '../utils/log';
+import { log, LogEmoji, Modules } from '../utils/log';
 import {
   VISUAL_FACTORIES,
   PICKING_FACTORIES,
@@ -91,10 +93,11 @@ export type LuxarLineMaterial = LineMaterial | LineTSLMaterial;
 export type LuxarGSplatMaterial = GSplatMaterial | GSplatTSLMaterial;
 /**
  * Same union shape as its three siblings, including `updateCameraParams` — though a
- * mesh consumes only half of it. There is no screen-space size to recompute from
- * fov/resolution, but the projection mode and near-cull distance drive the shared
- * near fade, which applies to a surface exactly as it does to a sprite. So mesh
- * joins the camera broadcast like everything else.
+ * mesh consumes only part of it. There is no screen-space size to recompute from
+ * the resolution, and the near fade reads its ortho test from the camera itself,
+ * but the near-cull distance drives that shared fade, which applies to a surface
+ * exactly as it does to a sprite. So mesh joins the camera broadcast like
+ * everything else.
  */
 export type LuxarMeshMaterial = MeshMaterial | MeshTSLMaterial;
 /**
@@ -116,7 +119,7 @@ export type LuxarGSplatPickingMaterial = GSplatPickingMaterial | GSplatPickingTS
 /**
  * Like its three siblings, including `updateCameraParams` — the mesh pick pass has
  * no screen-space footprint to size, but it does have to reproduce the visual near
- * fade, so it takes the same two camera inputs and joins the same broadcast,
+ * fade, so it takes the same near-cull input and joins the same broadcast,
  * exactly as the visual mesh material does.
  */
 export type LuxarMeshPickingMaterial = MeshPickingMaterial | MeshPickingTSLMaterial;
@@ -208,9 +211,7 @@ export class MaterialManager {
    * See {@link LifecycleCtx.staticMaterials}.
    */
   private staticMaterials = new Set<THREE.Material>();
-  private currentFov = (60 * Math.PI) / 180; // Current FOV in radians (or frustumHeight for ortho)
   private currentResolution = new THREE.Vector2(1920, 1080); // Use reasonable default
-  private currentIsOrtho = false;
   private currentNearCull: number | undefined = undefined;
   private currentPixelRatio = 1;
 
@@ -296,14 +297,12 @@ export class MaterialManager {
     this.registeredMaterials.add(material);
     subscribeToDispose(material, this.lifecycleCtx);
     material.updateCameraParams(
-      this.currentFov,
       this.currentResolution,
-      this.currentIsOrtho,
       this.currentNearCull,
       this.currentPixelRatio
     );
 
-    log.info(Modules.RENDERER, `Created per-node point material (${backend})`);
+    log.verbose(LogEmoji.INFO, Modules.RENDERER, `Created per-node point material (${backend})`);
     return material;
   }
 
@@ -345,14 +344,12 @@ export class MaterialManager {
     this.registeredMaterials.add(material);
     subscribeToDispose(material, this.lifecycleCtx);
     material.updateCameraParams(
-      this.currentFov,
       this.currentResolution,
-      this.currentIsOrtho,
       this.currentNearCull,
       this.currentPixelRatio
     );
 
-    log.info(Modules.RENDERER, `Created per-node line material (${backend})`);
+    log.verbose(LogEmoji.INFO, Modules.RENDERER, `Created per-node line material (${backend})`);
     return material;
   }
 
@@ -391,14 +388,12 @@ export class MaterialManager {
     this.registeredMaterials.add(material);
     subscribeToDispose(material, this.lifecycleCtx);
     material.updateCameraParams(
-      this.currentFov,
       this.currentResolution,
-      this.currentIsOrtho,
       this.currentNearCull,
       this.currentPixelRatio
     );
 
-    log.info(Modules.RENDERER, `Created per-node gsplat material (${backend})`);
+    log.verbose(LogEmoji.INFO, Modules.RENDERER, `Created per-node gsplat material (${backend})`);
     return material;
   }
 
@@ -415,9 +410,9 @@ export class MaterialManager {
    * follow another's.
    *
    * Enters `registeredMaterials` and takes the camera broadcast like its three
-   * siblings. It consumes only half of it — there is no screen-space size to
-   * recompute from fov/resolution — but the projection mode and near-cull distance
-   * drive the shared near fade (#1431), and a mesh left out of the broadcast would
+   * siblings. It consumes only part of it — there is no screen-space size to
+   * recompute from the resolution — but the near-cull distance drives the shared
+   * near fade (#1431), and a mesh left out of the broadcast would
    * fade against the constructor's 0.1 default instead of the scene's. There is no
    * `meshMaterialCache`: no type has a material cache — every material is per-node,
    * so `getCacheStats()` reports only registry size and create-time, never a cache
@@ -451,14 +446,12 @@ export class MaterialManager {
     this.registeredMaterials.add(material);
     subscribeToDispose(material, this.lifecycleCtx);
     material.updateCameraParams(
-      this.currentFov,
       this.currentResolution,
-      this.currentIsOrtho,
       this.currentNearCull,
       this.currentPixelRatio
     );
 
-    log.info(Modules.RENDERER, `Created per-node mesh material (${backend})`);
+    log.verbose(LogEmoji.INFO, Modules.RENDERER, `Created per-node mesh material (${backend})`);
     return material;
   }
 
@@ -483,7 +476,11 @@ export class MaterialManager {
     this.createCount++;
     this.register(material);
     for (const listener of this.physicalMaterialListeners) listener();
-    log.info(Modules.RENDERER, `Created per-node physical mesh material (${backend})`);
+    log.verbose(
+      LogEmoji.INFO,
+      Modules.RENDERER,
+      `Created per-node physical mesh material (${backend})`
+    );
     return material;
   }
 
@@ -537,22 +534,23 @@ export class MaterialManager {
     return new (MEGA_SHADER_FACTORIES[resolveMaterialBackend(this.caps)]())(cfg);
   }
 
-  /** Update camera parameters for all registered materials. */
+  /**
+   * Update camera parameters for all registered materials: viewport size,
+   * near cull and pixel ratio. The projection itself (FOV, ortho zoom,
+   * off-axis frustum and the ortho/perspective kind) is read in shader from
+   * the projection matrix of the draw, so it needs no push.
+   */
   updateCameraParams(
-    fov: number,
     resolution: THREE.Vector2,
-    isOrtho: boolean,
     nearCull: number | undefined,
     pixelRatio: number
   ): void {
-    this.currentFov = fov;
     this.currentResolution.copy(resolution);
-    this.currentIsOrtho = isOrtho;
     this.currentNearCull = nearCull;
     this.currentPixelRatio = pixelRatio;
 
     for (const material of this.registeredMaterials) {
-      material.updateCameraParams(fov, resolution, isOrtho, nearCull, pixelRatio);
+      material.updateCameraParams(resolution, nearCull, pixelRatio);
     }
   }
 
@@ -587,9 +585,7 @@ export class MaterialManager {
     this.registeredMaterials.add(material);
     this.ownedMaterials.add(material);
     material.updateCameraParams(
-      this.currentFov,
       this.currentResolution,
-      this.currentIsOrtho,
       this.currentNearCull,
       this.currentPixelRatio
     );
@@ -672,27 +668,69 @@ export class MaterialManager {
 }
 
 /**
- * Page-level singleton instance of the material manager.
+ * The LuxarApp's material manager (one LuxarApp per page), built lazily. Every
+ * `LuxarLayer` constructs its own `MaterialManager`, so its materials take its
+ * own capabilities and camera parameters and are disposed by its own teardown.
+ */
+let _materialManagerInstance: MaterialManager | undefined;
+
+/**
+ * The manager installed by {@link runWithMaterialManager} for the synchronous
+ * call in progress, or undefined outside one.
+ */
+let _scopedMaterialManager: MaterialManager | undefined;
+
+/** The LuxarApp's manager instance (never the scoped one). */
+export function getPageMaterialManager(): MaterialManager {
+  _materialManagerInstance ??= new MaterialManager();
+  return _materialManagerInstance;
+}
+
+/**
+ * Run `fn` with {@link materialManager} resolving to `manager`.
+ *
+ * The node-factory and commit paths are shared by every host but reach the
+ * materials through the module export, so the host that owns a loader brackets
+ * its synchronous node-creation and commit calls with its own manager: a
+ * LuxarLayer's nodes then get the layer's capabilities, camera broadcast and
+ * disposal, never the app's. Synchronous by contract — node creation and the
+ * commit stage never await — and re-entrant (the previous scope is restored).
+ */
+export function runWithMaterialManager<T>(manager: MaterialManager, fn: () => T): T {
+  const previous = _scopedMaterialManager;
+  _scopedMaterialManager = manager;
+  try {
+    return fn();
+  } finally {
+    _scopedMaterialManager = previous;
+  }
+}
+
+/** The manager a `materialManager` access resolves to right now. */
+function activeMaterialManager(): MaterialManager {
+  return _scopedMaterialManager ?? getPageMaterialManager();
+}
+
+/**
+ * The material manager for the code running now: the host manager a
+ * {@link runWithMaterialManager} bracket installed, else the LuxarApp's.
  *
  * Construction is **deferred until first access** via a Proxy. Tests can
  * call {@link __resetMaterialManagerForTests} to start fresh between
  * cases. Call-site syntax is unchanged from a directly-exported instance.
  */
-let _materialManagerInstance: MaterialManager | undefined;
-
 export const materialManager: MaterialManager = new Proxy({} as MaterialManager, {
   get(_target, prop, _receiver) {
-    _materialManagerInstance ??= new MaterialManager();
-    const value = Reflect.get(_materialManagerInstance, prop, _materialManagerInstance);
-    return typeof value === 'function' ? value.bind(_materialManagerInstance) : value;
+    const active = activeMaterialManager();
+    const value = Reflect.get(active, prop, active);
+    return typeof value === 'function' ? value.bind(active) : value;
   },
   set(_target, prop, value, _receiver) {
-    _materialManagerInstance ??= new MaterialManager();
-    return Reflect.set(_materialManagerInstance, prop, value, _materialManagerInstance);
+    const active = activeMaterialManager();
+    return Reflect.set(active, prop, value, active);
   },
   has(_target, prop) {
-    _materialManagerInstance ??= new MaterialManager();
-    return prop in _materialManagerInstance;
+    return prop in activeMaterialManager();
   },
 });
 

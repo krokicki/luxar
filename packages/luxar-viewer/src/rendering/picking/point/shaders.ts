@@ -7,8 +7,14 @@
  *     into the RGBA32F pick buffer as `(nodeId, elementId-low16, brightness, elementId-high16)`.
  *   - 80%-radius truncation so the pick footprint tracks the visible disc
  *     while staying slightly biased toward the bright core.
+ *   - Brightness weighted by the visual factors (per-point alpha, node
+ *     opacity, gain — `../_shared/visibility-glsl.ts`), so an invisible
+ *     point is not pickable.
  *   - Brightness-as-depth so the brightest overlapping fragment wins
- *     the depth test (matters for hover-through-translucent point stacks).
+ *     the depth test (matters for hover-through-translucent point stacks) —
+ *     except in the depth-ordered `opaque` / `normal` modes
+ *     (`uSurfaceDepth == 1`, `../_shared/surface-pick.ts`), where the real
+ *     projected depth is written so the FRONT-MOST point wins.
  *
  * Source-of-truth for GLSL3; the WebGPU counterpart lives in `./pick.tsl`
  * and is referenced through the `ShaderSource.webgpu` factory below.
@@ -20,10 +26,12 @@ import type { ShaderSource } from '../../materials/_shared/shader-source';
 import {
   GLSL_SANITIZE_FUNCTIONS,
   GLSL_NEAR_FADE_FUNCTIONS,
+  GLSL_PROJECTION_FUNCTIONS,
   GLSL_SORTED_INDEX,
 } from '../../materials/_shared/glsl-lib';
 import { FALLOFF_FLOOR, FALLOFF_K } from '../../materials/_shared/falloff';
 import { requireTslMaterials } from '../../tsl/slot';
+import { GLSL_PICK_VISIBILITY } from '../_shared/visibility-glsl';
 
 /**
  * Picking vertex shader for points.
@@ -34,6 +42,7 @@ export const POINT_PICK_VERTEX_SHADER = /* glsl */ `
 
     ${GLSL_SANITIZE_FUNCTIONS}
     ${GLSL_NEAR_FADE_FUNCTIONS}
+    ${GLSL_PROJECTION_FUNCTIONS}
 
     // Per-vertex (4 corners shared across all instances)
     in vec2 aQuadCorner;
@@ -47,13 +56,12 @@ export const POINT_PICK_VERTEX_SHADER = /* glsl */ `
 
     // Point data texture: RGBA32F, 3 texels/point (see
     // rendering/element-texture-layout.ts). Picking needs texels 0-1
-    // only (center/radius/sharpness) -- color and scalar are not fetched.
+    // (center/radius/sharpness) and the alpha in texel 2 -- color and
+    // scalar are not fetched.
     uniform highp sampler2D uPointTex;
 
-    uniform float pointSizeFactor;
     uniform float maxPointSize;
     uniform float radiusScale;
-    uniform int uIsOrtho;
     uniform float uNearCull;
     uniform float uPixelRatio;
     uniform float uNodeId;
@@ -64,6 +72,7 @@ export const POINT_PICK_VERTEX_SHADER = /* glsl */ `
     out mediump float vNearFade;
     out mediump float vPickSize;  // RAW pick sprite size (pre-clamp) — sizeScale² parity with the visual shader
     out mediump vec2 vSpriteCoord;
+    flat out mediump float vAlpha; // per-point opacity (texel2.y; 1.0 for RGB data)
     flat out highp float vNodeId;
     flat out highp vec2 vElementId;
 
@@ -81,6 +90,9 @@ export const POINT_PICK_VERTEX_SHADER = /* glsl */ `
       ivec2 texel0 = ivec2(pointBase % pointTexW, pointBase / pointTexW);
       vec4 pointT0 = texelFetch(uPointTex, texel0, 0);
       vec4 pointT1 = texelFetch(uPointTex, ivec2(texel0.x + 1, texel0.y), 0);
+      vec4 pointT2 = texelFetch(uPointTex, ivec2(texel0.x + 2, texel0.y), 0);
+      // Sanitized exactly as the visual shader does (NaN/Inf -> 1, clamp [0, 1]).
+      vAlpha = sanitizeAlpha(pointT2.y);
       vec3 aCenter = pointT0.xyz;
       float aRadius = pointT0.w;
       float aSharpness = pointT1.w;
@@ -102,7 +114,7 @@ export const POINT_PICK_VERTEX_SHADER = /* glsl */ `
       // [nearCull, 2*nearCull] fade; ortho = 1, NDC clip authority).
       // 1e-20 floor = degenerate-smoothstep guard only; uNearCull is
       // scene-bounds-scaled (see the visual point shader).
-      vNearFade = perspectiveNearFade(uIsOrtho, mvPosition.z, max(uNearCull, 1e-20));
+      vNearFade = perspectiveNearFade(luxarIsOrthoProjection(), mvPosition.z, max(uNearCull, 1e-20));
       if (vNearFade < 0.01) {
         gl_Position = vec4(0.0, 0.0, -2.0, 1.0); // off-screen → no fragments
         return;
@@ -114,8 +126,9 @@ export const POINT_PICK_VERTEX_SHADER = /* glsl */ `
       // pick footprint stays congruent with the visible sprite. 1e-20 =
       // pure INF guard (near-fade reject bounds surviving depths at the
       // scene-relative ~uNearCull; the size clamp bounds the output).
-      float invDistance = (uIsOrtho == 1) ? 1.0 : 1.0 / max(-mvPosition.z, 1e-20);
-      float basePointSize = normalizedRadius * pointSizeFactor * invDistance;
+      float invDistance = (luxarIsOrthoProjection() == 1) ? 1.0 : 1.0 / max(-mvPosition.z, 1e-20);
+      float sizeFactor = 2.0 * uResolution.y * luxarProjectionSizeScale();
+      float basePointSize = normalizedRadius * sizeFactor * invDistance;
 
       // Picking footprint: 80% of the visual radius (the 0.8 factor below).
       // Slightly tighter than the visible disc so dense/overlapping point
@@ -150,14 +163,19 @@ export const POINT_PICK_VERTEX_SHADER = /* glsl */ `
  */
 export const POINT_PICK_FRAGMENT_SHADER = /* glsl */ `
     precision highp float;
+    ${GLSL_PICK_VISIBILITY}
 
     uniform float uPixelRatio;
+    // 1 = surface modes (opaque/normal): real projected depth (front-most
+    // wins). 0 = commutative modes: brightness-as-depth (brightest wins).
+    uniform int uSurfaceDepth;
 
     in highp float vRadius;
     in mediump float vBeta;
     in mediump float vNearFade;
     in mediump float vPickSize; // raw pick sprite size (sub-pixel compensation)
     in mediump vec2 vSpriteCoord;
+    flat in mediump float vAlpha;
     flat in highp float vNodeId;
     flat in highp vec2 vElementId;
 
@@ -187,11 +205,17 @@ export const POINT_PICK_FRAGMENT_SHADER = /* glsl */ `
       // salience, or a sub-pixel (visually dimmed) point wins the
       // brightness-as-depth tie-break over a visually brighter neighbor.
       mediump float pickSizeScale = min(vPickSize / (1.5 * max(uPixelRatio, 1.0)), 1.0);
-      float brightness = falloff * vNearFade * pickSizeScale * pickSizeScale;
+      // ...and the visual weight: per-point alpha (optical depth under
+      // volumetric), node opacity, the gain the visual discard honours.
+      float brightness = falloff * vNearFade * pickSizeScale * pickSizeScale * luxarPickWeight(vAlpha);
       if (brightness < 1e-4) discard;
 
       fragColor = vec4(vNodeId, vElementId.x, brightness, vElementId.y);
-      gl_FragDepth = 1.0 - clamp(brightness, 0.0, 1.0);
+      // Pick depth convention, synced from the visual node's blending mode:
+      // the surface modes (opaque/normal) write the real projected depth so
+      // the FRONT-MOST element wins; the commutative modes keep
+      // brightness-as-depth (BRIGHTEST wins).
+      gl_FragDepth = (uSurfaceDepth == 1) ? gl_FragCoord.z : 1.0 / (1.0 + brightness);
     }
 `;
 

@@ -65,7 +65,7 @@ export interface PointsRefinementCtx {
   isActive?(): boolean;
   /**
    * Per-refinement-run abort signal. The orchestrator assigns the run's
-   * controller to the SceneLoader's `_updateAbortController`, so a
+   * controller to the SceneLoader's live controller (`PassScheduler.controller`), so a
    * superseding `updateView` (or dispose) aborts in-flight refinement
    * chunk reads MID-PASS instead of waiting out the whole pass. An
    * `AbortError` in the per-loader catch is cancellation, not failure.
@@ -90,7 +90,7 @@ export async function runPointsRefinement(ctx: PointsRefinementCtx): Promise<voi
       // typed as plain `PointsDataLoader`: single-shot PointsSpatialIndexLoader
       // has no ladder. `admitRefinementCandidate` gates on `hasMoreLODs`.
       const progressiveLoader = loader as PointsDataLoader & RefinableLoader;
-      const admission = admitRefinementCandidate(
+      const admission = await admitRefinementCandidate(
         path,
         progressiveLoader,
         ctx.residencyBudget,

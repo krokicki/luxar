@@ -30,13 +30,13 @@ export interface AtomicCommitInput<TStaged> {
 }
 
 export interface AtomicCommitCtx {
-  /** Optional GPU buffer pool — frame counter is bumped once per cycle. */
+  /** Optional GPU buffer pool — its commit counter is bumped once per cycle. */
   gpuBufferPool: GPUBufferPool | null;
   /** Pickable-state invalidator (cached pick buffer goes stale on geometry change). */
   nodeFactory: NodeFactory;
   /**
    * Per-update abort signal. When `aborted`, this update was superseded:
-   * SKIP every geometry mutation (beginFrame / commits / markPickingDirty)
+   * SKIP every geometry mutation (beginCommit / commits / markPickingDirty)
    * so no stale or partial frame reaches the GPU — but STILL end every
    * profiler session below (the sessions were opened in `runLoaderUpdates`
    * and must be closed exactly once regardless of commit). See Guards G5/G6.
@@ -44,11 +44,20 @@ export interface AtomicCommitCtx {
   signal?: AbortSignal;
   /** Skip all geometry mutations while still ending every profiler session. */
   discard?: boolean;
-  /** Per-type commit callbacks routed through the orchestrator's delegates. */
-  updatePointsGeometry(path: string, data: LoadedPointsData, session?: UpdateSession): void;
-  commitLinesGeometry(staged: StagedLinesCommit, session?: UpdateSession): void;
-  commitGSplatsGeometry(staged: StagedGSplatsCommit, session?: UpdateSession): void;
-  commitMeshGeometry(staged: StagedMeshCommit, session?: UpdateSession): void;
+  /**
+   * Per-type commit callbacks routed through the orchestrator's delegates.
+   * Each returns whether the commit can have changed the drawn frame (its
+   * node was visible); `false` only when it was not — anything else counts as
+   * drawn.
+   */
+  updatePointsGeometry(
+    path: string,
+    data: LoadedPointsData,
+    session?: UpdateSession
+  ): boolean | void;
+  commitLinesGeometry(staged: StagedLinesCommit, session?: UpdateSession): boolean | void;
+  commitGSplatsGeometry(staged: StagedGSplatsCommit, session?: UpdateSession): boolean | void;
+  commitMeshGeometry(staged: StagedMeshCommit, session?: UpdateSession): boolean | void;
   /** Restore the owning progressive loader when its staged commit fails. */
   onCommitFailed?(path: string): void;
 }
@@ -72,18 +81,26 @@ export function runAtomicCommit(
   // the staged === null case (loader failed or marked skipped) so
   // every opened session is closed exactly once.
   //
-  // Belt-and-braces: if a commit (or beginFrame) throws synchronously,
+  // Belt-and-braces: if a commit (or beginCommit) throws synchronously,
   // the remaining iterations and the later geometry-type loops never
   // run, leaving their sessions un-ended. The outer `finally` sweeps
   // every staged session afterwards. `SessionImpl.end()` is idempotent
   // (no-ops on already-ended sessions), so this is safe to overlay on
   // the per-iteration end() calls that record accurate per-node timings
-  // on the happy path. beginFrame() is inside the try so a future
+  // on the happy path. beginCommit() is inside the try so a future
   // throwing implementation can't leak the already-opened sessions.
   // Superseded or explicitly discarded: skip all geometry mutations, but the
   // session-end sweep below MUST still run (G5/G6). The shared predicate keeps
   // the skip all-or-nothing across the four geometry types.
   const discard = (ctx.signal?.aborted ?? false) || ctx.discard === true;
+
+  // Whether any commit of this pass can have changed the drawn frame (see
+  // `AtomicCommitCtx.updatePointsGeometry`); handed to `markPickingDirty` so
+  // a pass that only re-committed hidden nodes wakes the loop without a redraw.
+  let drawn = false;
+  const noteDrawn = (result: boolean | void): void => {
+    if (result !== false) drawn = true;
+  };
 
   // Per-node fault isolation: ONE malformed node's throwing commit must
   // not starve every sibling of this pass (the siblings' data is staged
@@ -94,6 +111,8 @@ export function runAtomicCommit(
   // same call site — fail-loud is preserved, sibling starvation is not.
   const commitErrors: unknown[] = [];
   const recordCommitFailure = (path: string, error: unknown): void => {
+    // A commit that threw may have half-written a visible node: count it drawn.
+    drawn = true;
     try {
       ctx.onCommitFailed?.(path);
     } catch (rollbackError) {
@@ -109,16 +128,19 @@ export function runAtomicCommit(
   };
 
   try {
-    // Advance GPU buffer pool frame counter once per update cycle
-    // (not per-acquire) so eviction timing reflects actual frames.
+    // Advance the GPU buffer pool's commit counter once per atomic commit
+    // (not per-acquire). This is the pool's ONLY clock, so its LRU ageing
+    // (`evictionCommits`) is measured in commits, not rendered frames: an
+    // idle or orbiting view runs no commit and ages nothing (#2939).
     if (ctx.gpuBufferPool && !discard) {
-      ctx.gpuBufferPool.beginFrame();
+      ctx.gpuBufferPool.beginCommit();
     }
 
     for (const { staged, session } of pointsStaged) {
       try {
         if (staged && discard) releaseLineageIfUncommitted(staged.data, false);
-        if (staged && !discard) ctx.updatePointsGeometry(staged.path, staged.data, session);
+        if (staged && !discard)
+          noteDrawn(ctx.updatePointsGeometry(staged.path, staged.data, session));
       } catch (err) {
         recordCommitFailure(staged!.path, err);
       } finally {
@@ -128,7 +150,7 @@ export function runAtomicCommit(
     for (const { staged, session } of linesStaged) {
       try {
         if (staged && discard) releaseLineageIfUncommitted(staged.sourceData, false);
-        if (staged && !discard) ctx.commitLinesGeometry(staged, session);
+        if (staged && !discard) noteDrawn(ctx.commitLinesGeometry(staged, session));
       } catch (err) {
         recordCommitFailure(staged!.path, err);
       } finally {
@@ -138,7 +160,7 @@ export function runAtomicCommit(
     for (const { staged, session } of gsplatsStaged) {
       try {
         if (staged && discard) releaseLineageIfUncommitted(staged.sourceData, false);
-        if (staged && !discard) ctx.commitGSplatsGeometry(staged, session);
+        if (staged && !discard) noteDrawn(ctx.commitGSplatsGeometry(staged, session));
       } catch (err) {
         recordCommitFailure(staged!.path, err);
       } finally {
@@ -147,7 +169,7 @@ export function runAtomicCommit(
     }
     for (const { staged, session } of meshStaged) {
       try {
-        if (staged && !discard) ctx.commitMeshGeometry(staged, session);
+        if (staged && !discard) noteDrawn(ctx.commitMeshGeometry(staged, session));
       } catch (err) {
         recordCommitFailure(staged!.path, err);
       } finally {
@@ -173,7 +195,7 @@ export function runAtomicCommit(
       gsplatsStaged.length > 0 ||
       meshStaged.length > 0)
   ) {
-    ctx.nodeFactory.markPickingDirty();
+    ctx.nodeFactory.markPickingDirty(drawn);
   }
 
   if (commitErrors.length > 0) {

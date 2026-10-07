@@ -324,6 +324,15 @@ export interface ProcessedGSplatsData {
    * that payload may be a SliceCache-owned snapshot.
    */
   elementIds?: Uint32Array;
+
+  /**
+   * The typed arrays are SHARED — retained by the post-projection stage cache
+   * (`data/scene-loader/process/projection-stage-cache.ts`) and handed to every
+   * later commit of the same slice. The commit must neither mutate nor
+   * transfer them; the depth-sort hand-off copies `centers3D` instead of
+   * detaching it.
+   */
+  sharedBuffers?: boolean;
 }
 
 // ============================================================================
@@ -449,20 +458,6 @@ export interface GSplatsUserData {
 // ============================================================================
 // Type Guards
 // ============================================================================
-
-/**
- * Check if metadata is for a GSplats node.
- *
- * @param attrs - Unknown attributes object
- * @returns True if attrs is GSplatsMetadata
- */
-export function isGSplatsMetadata(attrs: unknown): attrs is GSplatsMetadata {
-  return (
-    typeof attrs === 'object' &&
-    attrs !== null &&
-    (attrs as Record<string, unknown>).type === 'gsplats'
-  );
-}
 
 /**
  * Check if userData indicates a GSplats object.

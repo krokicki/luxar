@@ -18,8 +18,10 @@
  * captured values, which would go stale on the second scene.
  */
 
+import { findObjectByName } from '../../utils/scene-graph-index';
 import * as THREE from 'three';
 import type { SceneNode } from '../../data/data-loader-types';
+import type { SceneNodeIndex } from '../../data/scene-loader/view-state/scene-node-index';
 import type { BlendingMode } from '../../rendering';
 import { materialManager } from '../../rendering';
 import { scheduleBlendModeProgramWarmupForObject } from '../../rendering/webgl-blend-warmup';
@@ -40,9 +42,8 @@ import {
 } from '../../types/geometry-capabilities';
 import {
   composeAttrs,
-  collectAncestorNodes,
   collectDataDescendants,
-  getEffectiveAttrs,
+  getEffectiveAttrsOfChain,
   type ComposableAttrs,
   type EffectiveAttrs,
 } from '../../data/attrs-composer';
@@ -54,6 +55,7 @@ import {
   type LayerStateManager,
 } from './layer-state';
 import { remapWindowToLeafRange } from '../../rendering/display-range';
+import { rebaseLodFade } from '../../scene/lod-fade';
 import {
   applyColorAdjustments,
   isColormapActive,
@@ -69,34 +71,174 @@ function isIdentityGain(intensity: number | undefined, offset: number | undefine
   return (intensity ?? 1) === 1 && (offset ?? 0) === 0;
 }
 
+/** What a per-leaf write touched: the material, and (also) its pick material. */
+export interface LeafWrite {
+  applied: boolean;
+  pickDirty: boolean;
+}
+
+const NOTHING_WRITTEN: LeafWrite = { applied: false, pickDirty: false };
+
+export const PUSHED_KINDS = [
+  'colormap',
+  'layerOrder',
+  'labelStyle',
+  'meshAppearance',
+  'physicalKnobs',
+] as const;
+export type PushedKind = (typeof PUSHED_KINDS)[number];
+
 /**
  * Dependencies injected by the owning {@link LayersPanel}. `getRootGroup` /
- * `getSceneGraph` are accessors because both fields are replaced on every
- * `initFromScene`; `state` is the panel's (stable) layer-state manager and
+ * `getSceneNodeIndex` are accessors because both fields are replaced on every
+ * `initFromScene`; the index (the scene loader's `SceneNodeIndex`, whose `root`
+ * is the scene graph) answers every leaf's root→leaf chain in O(1), so a slider
+ * tick over a P-part layer is O(P · depth) rather than a `children.find`
+ * descent per leaf (O(P²)); `state` is the panel's (stable) layer-state manager and
  * `requestRender` wakes the on-demand render loop after a material write, and
  * `requestReprocess` refreshes a layer that became load-eligible again.
  */
 export interface LayerApplyEngineDeps {
   getRootGroup: () => THREE.Group | null;
-  getSceneGraph: () => SceneNode | null;
+  getSceneNodeIndex: () => SceneNodeIndex | null;
   state: LayerStateManager;
   requestRender: () => void;
   requestReprocess: (paths: readonly string[]) => void;
   /**
    * Marks the cached GPU pick buffer dirty so it re-renders after a panel edit
-   * changed a mesh's pick coverage (opacity/cutoff/blending/physical knobs).
+   * changed pick coverage (opacity/gain/cutoff/blending/physical knobs).
    * No-op when picking is inactive.
    */
   invalidatePickBuffer?: () => void;
 }
 
 export class LayerApplyEngine {
+  /**
+   * The layers whose state of each kind the panel has pushed into the scene.
+   *
+   * Composed state (opacity, absorption, window, gamma, blend) is pushed for
+   * EVERY layer at `initFromScene`, so a leaf materialising later always gets
+   * it. The rest is pushed only when the user (or a reset) touches it; until
+   * then the node factory's authored value IS the layer's value, and re-pushing
+   * it onto a late leaf could only make that leaf differ from its already-drawn
+   * siblings (a group layer's colormap is `undefined` over a MIXED subtree, for
+   * example, which would strip each part's own palette). Recording what was
+   * pushed is what lets {@link applyToNewLeaf} reproduce exactly the state the
+   * existing leaves are in.
+   */
+  private readonly pushed: Record<PushedKind, Map<string, number>> = {
+    colormap: new Map(),
+    layerOrder: new Map(),
+    labelStyle: new Map(),
+    meshAppearance: new Map(),
+    physicalKnobs: new Map(),
+  };
+  private pushSequence = 0;
+
   constructor(private deps: LayerApplyEngineDeps) {}
+
+  /** Forget what was pushed (a new scene's layers start from their authored state). */
+  resetPushed(): void {
+    for (const paths of Object.values(this.pushed)) paths.clear();
+    this.pushSequence = 0;
+  }
+
+  /**
+   * Bring a leaf that materialised AFTER the panel initialised into the state
+   * its layers are in now, before it is first drawn.
+   *
+   * The panel pushes state only at `initFromScene` and on edits, and both skip
+   * a leaf with no scene object yet — so a partition part the LOD registry
+   * activates later (B4 gated loading), or any other late leaf, rendered its
+   * authored appearance until the next edit re-pushed everything.
+   *
+   * Replays the last push of each kind on the leaf's ancestry in edit order,
+   * then the innermost layer's composed state. An outer layer edited after an
+   * inner layer also overwrote the existing leaves last. A hidden layer on the
+   * way up whose object is as new as the leaf (the leaf itself, or a group
+   * built with it inside the same deferred part) is stamped hidden too: the
+   * panel's visibility push skipped it for having no object yet. An older
+   * hidden ancestor was stamped when it was hidden, and hides the leaf through
+   * the scene graph.
+   */
+  applyToNewLeaf(leafPath: string, obj: THREE.Object3D): void {
+    const target = this.resolveNewLeaf(leafPath);
+    if (!target) return;
+    const { sceneIndex, ancestors, leaf, layers } = target;
+    let pickDirty = false;
+    for (const { layer, kind } of this.pushedReplay(layers)) {
+      pickDirty = this.replayPushedToLeaf(kind, layer, leaf, obj, sceneIndex) || pickDirty;
+    }
+    const owner = layers[layers.length - 1];
+    this.applyComposedToLeaf(owner, leaf, obj, ancestors, true);
+    hideHiddenLayerObjects(obj, layers);
+    if (pickDirty) this.deps.invalidatePickBuffer?.();
+    this.deps.requestRender();
+  }
+
+  /** The last push of each kind on this ancestry, in the order existing leaves saw it. */
+  private pushedReplay(
+    layers: readonly LayerInfo[]
+  ): { layer: LayerInfo; kind: PushedKind; order: number }[] {
+    const replay: { layer: LayerInfo; kind: PushedKind; order: number }[] = [];
+    for (const layer of layers) {
+      for (const kind of PUSHED_KINDS) {
+        const order = this.pushed[kind].get(layer.path);
+        if (order !== undefined) replay.push({ layer, kind, order });
+      }
+    }
+    return replay.sort((a, b) => a.order - b.order);
+  }
+
+  /**
+   * The data leaf at `leafPath` with its root→leaf chain and the layers on it
+   * (outermost first), or `null` when the path is not a data leaf of the
+   * current graph or no layer owns it.
+   */
+  private resolveNewLeaf(leafPath: string): {
+    sceneIndex: SceneNodeIndex;
+    ancestors: readonly SceneNode[];
+    leaf: SceneNode;
+    layers: LayerInfo[];
+  } | null {
+    const sceneIndex = this.deps.getSceneNodeIndex();
+    if (!sceneIndex) return null;
+    const ancestors = sceneIndex.ancestorChain(leafPath);
+    const leaf = ancestors[ancestors.length - 1];
+    if (leaf?.path !== leafPath || !isGeometryType(leaf.type)) return null;
+    const layers = ancestors.flatMap((node) => this.deps.state.getLayer(node.path) ?? []);
+    if (layers.length === 0) return null;
+    return { sceneIndex, ancestors, leaf, layers };
+  }
+
+  /** {@link applyToNewLeaf}'s replay of one pushed kind. Returns pick-dirtiness. */
+  private replayPushedToLeaf(
+    kind: PushedKind,
+    layer: LayerInfo,
+    leaf: SceneNode,
+    obj: THREE.Object3D,
+    sceneIndex: SceneNodeIndex
+  ): boolean {
+    switch (kind) {
+      case 'colormap':
+        this.applyColormapToLeaf(layer, leaf, obj, sceneIndex);
+        return false;
+      case 'layerOrder':
+        this.applyLayerOrderToLeaf(layer, leaf, obj, sceneIndex);
+        return false;
+      case 'labelStyle':
+        return this.applyLabelStyleToLeaf(layer, leaf, obj).pickDirty;
+      case 'meshAppearance':
+        return this.applyMeshAppearanceToLeaf(layer, obj).pickDirty;
+      case 'physicalKnobs':
+        return this.applyPhysicalKnobsToLeaf(layer, obj);
+    }
+  }
 
   private getMesh(path: string): THREE.Object3D | null {
     const rootGroup = this.deps.getRootGroup();
     if (!rootGroup) return null;
-    return rootGroup.getObjectByName(path) ?? null;
+    return findObjectByName(rootGroup, path) ?? null;
   }
 
   /**
@@ -123,12 +265,12 @@ export class LayerApplyEngine {
   /**
    * Resolve every data-leaf affected by changes to a layer at `path`.
    * Data-node layers map to themselves; group layers fan out to all
-   * descendant points/lines/gsplats.
+   * descendant points/lines/gsplats/mesh leaves.
    */
   private getAffectedDataLeaves(path: string): SceneNode[] {
-    const sceneGraph = this.deps.getSceneGraph();
-    if (!sceneGraph) return [];
-    const chain = collectAncestorNodes(sceneGraph, path);
+    const sceneIndex = this.deps.getSceneNodeIndex();
+    if (!sceneIndex) return [];
+    const chain = sceneIndex.ancestorChain(path);
     const target = chain[chain.length - 1];
     if (!target) return [];
     if (target.type === 'group') return collectDataDescendants(target);
@@ -171,11 +313,8 @@ export class LayerApplyEngine {
    * (a mixed group layer), so the scalar window is never applied as a colour
    * gain. Ancestor/leaf-authored windows still compose.
    *
-   * `precomputedAncestors` lets a caller that already walked the chain (both
-   * fan-out loops do) hand it over instead of paying for a second walk.
-   * `collectAncestorNodes` resolves each step with a linear `children.find`, so
-   * one fan-out over a P-part wrapper costs ~P²/2 path comparisons — and
-   * `applyComposed` runs on every slider tick.
+   * `precomputedAncestors` lets a caller that already resolved the chain (both
+   * fan-out loops do) hand it over instead of looking it up again.
    */
   private composeEffective(
     leafPath: string,
@@ -187,9 +326,9 @@ export class LayerApplyEngine {
     if (precomputedAncestors) {
       ancestors = precomputedAncestors;
     } else {
-      const sceneGraph = this.deps.getSceneGraph();
-      if (!sceneGraph) return null;
-      ancestors = collectAncestorNodes(sceneGraph, leafPath);
+      const sceneIndex = this.deps.getSceneNodeIndex();
+      if (!sceneIndex) return null;
+      ancestors = sceneIndex.ancestorChain(leafPath);
     }
     // Required, not optional: an omitted `layerPath` would silently disable the
     // subtree rule below and re-open the inert-Blend-control bug.
@@ -359,9 +498,9 @@ export class LayerApplyEngine {
     if (precomputedAncestors) {
       ancestors = precomputedAncestors;
     } else {
-      const sceneGraph = this.deps.getSceneGraph();
-      if (!sceneGraph) return false;
-      ancestors = collectAncestorNodes(sceneGraph, leafPath);
+      const sceneIndex = this.deps.getSceneNodeIndex();
+      if (!sceneIndex) return false;
+      ancestors = sceneIndex.ancestorChain(leafPath);
     }
     const layerDepth = ancestors.findIndex((n) => n.path === layerPath);
     if (layerDepth < 0) return false;
@@ -505,127 +644,145 @@ export class LayerApplyEngine {
    * Push each composed effective attribute (except colormap, which is
    * per-leaf and doesn't chain through ancestors) to every affected leaf
    * material. Colormap is handled separately because textures don't
-   * compose — the nearest ancestor's colormap wins.
+   * compose — the last colormap push to a leaf wins.
    */
   private applyComposed(layer: LayerInfo): void {
     const leaves = this.getAffectedDataLeaves(layer.path);
     if (leaves.length === 0) return;
     // Non-null whenever `leaves` is non-empty (`getAffectedDataLeaves` returns
-    // nothing without a graph); read once so the ancestry is walked ONCE per
-    // leaf below rather than once per consumer of it.
-    const sceneGraph = this.deps.getSceneGraph();
-    if (!sceneGraph) return;
+    // nothing without an index).
+    const sceneIndex = this.deps.getSceneNodeIndex();
+    if (!sceneIndex) return;
 
     for (const leaf of leaves) {
       const obj = this.getMesh(leaf.path);
       if (!obj) continue;
-      const mat = this.getLeafMaterial(obj);
-      if (!mat) continue;
-      // ONE ancestry walk per leaf, shared by the composition and the
-      // reference-basis gate. `collectAncestorNodes` resolves each step with a
-      // linear `children.find` that allocates a string per comparison, so a
-      // fan-out over a P-part wrapper is ~P²/2 comparisons — measured at 7.0 ms
-      // for 512 parts and 129 ms for 2000, per slider tick. Walking it twice
-      // doubled that.
-      const ancestors = collectAncestorNodes(sceneGraph, leaf.path);
-      // Per-leaf window routing. A layer whose window is a SCALAR window
-      // (colormap in play) can still contain leaves rendering direct colour:
-      // the C1 guard suppresses the LUT on geometry with no scalars bound,
-      // and a MIXED group keeps the scalar window because some other leaf
-      // accepted it. Pushing that window into a direct-colour leaf's colour
-      // GOG is exactly the contrast stretch this panel no longer does — such
-      // a leaf gets the identity window instead.
-      const identityLayerWindow = layer.scalarWindow && !isColormapActive(mat);
-      const eff = this.composeEffective(leaf.path, layer.path, identityLayerWindow, ancestors);
-      if (!eff) continue;
-      // An in-flight LOD fade owns the live opacity uniform: it re-renders
-      // `_lodFadeBase × fadeProduct` every frame (scene/lod-fade.ts), so a
-      // direct uniform write here would be clobbered on the next fade frame
-      // and the panel edit lost until the fade ends. Rebase the fade's
-      // snapshot instead — the registry composes `newBase × product` on the
-      // very next frame and restores `newBase` when the fade completes.
-      if (obj.userData._lodFadeBase != null) {
-        obj.userData._lodFadeBase = eff.opacity;
-      } else {
-        mat.updateOpacity(eff.opacity);
-      }
-      // A mesh's PICK material reads the same coverage the visual one does — node
-      // opacity times per-vertex alpha (§6.5) — so it has to move with the slider.
-      // Without this, dragging opacity below the `opaque` cutoff would dissolve the
-      // surface on screen while leaving every triangle pickable, and hover tooltips
-      // would keep naming vertices of an invisible mesh. A no-op for the other three
-      // types, whose pick materials derive coverage from their own element data.
-      //
-      // Written OUTSIDE the LOD-fade branch above on purpose: a mesh CAN be a
-      // substitutive LOD level now (§9), so the sync has to run whichever branch the
-      // node took — an unconditional sync is what keeps a faded mesh level pickable
-      // at the coverage it actually renders with.
-      //
-      // When the sync actually touched a mesh pick material, invalidate the cached
-      // pick buffer: a stationary-camera layers-panel edit invalidates nothing else,
-      // so hover would otherwise keep naming vertices of the pre-edit coverage.
-      if (syncMeshPickAppearance(obj as THREE.Mesh, { opacity: eff.opacity })) {
-        this.deps.invalidatePickBuffer?.();
-      }
-      // All three geometry-material families implement it (gsplats
-      // phase 1, points phase 3, lines phase 4); optional-chained for
-      // non-Luxar materials.
-      mat.updateAbsorption?.(eff.absorption);
-      // A colormap-active leaf windows a SCALAR, and (when the composed window
-      // really is stated on the layer's reference range — see
-      // `composedWindowIsInReferenceBasis`) it is re-expressed in this leaf's
-      // own range, so a multi-level / multi-part layer stops rendering every
-      // leaf on the reference leaf's window (#1753). A direct-colour leaf has
-      // no scalar window at all, so it is not computed there.
-      const scalarWindow = isColormapActive(mat)
-        ? this.leafScalarWindow(leaf, layer, eff, ancestors)
-        : undefined;
-      applyColorAdjustments(mat, eff.gamma, eff.intensity, eff.offset, scalarWindow);
-      const prevBlendingMode = mat.userData?.blendingMode as BlendingMode | undefined;
-      // An unset ancestry composes to `undefined`; apply this leaf's per-type
-      // default (mesh → opaque, emissive → additive) — the same mode the
-      // material factory would have baked in.
-      const blendingMode = eff.blending_mode ?? defaultBlendingMode(leaf.type);
-      this.applyBlendingStateToMaterial(mat, blendingMode);
-      // Depth sorting: a sortable layer switching blending mode may need
-      // to start (TO an effective sorted mode: clear the committed-data
-      // stamp + reprocess so the next commit registers with the SortWorker)
-      // or stop (AWAY: release) depth sorting. Only types that register
-      // per-element centers with the coordinator qualify (gsplats/points
-      // centers, lines segment midpoints, mesh face centroids) — see
-      // `depthSortable` in `types/geometry-capabilities`.
-      //
-      // BOTH arguments must be the RESOLVED mode, which is why the new one is
-      // re-read off the material AFTER `applyBlendingStateToMaterial` rather
-      // than passing the requested `blendingMode`. `prevBlendingMode` above was
-      // already resolved (it came off `userData`), so passing the request here
-      // made the pair asymmetric — invisible for the three emissive types,
-      // whose request IS their resolved mode, and wrong for mesh, which maps
-      // the unsupported `volumetric` onto `opaque`:
-      //   normal → volumetric  looked like sorted → sorted, so the node kept
-      //     its worker registration and retained `triangleSource` after the
-      //     material had gone opaque and would never sort again;
-      //   opaque → volumetric  looked like a switch INTO a sorted mode and
-      //     triggered a full clear + O(N) reprocess for nothing.
-      // The coordinator's own `liveBlendingMode` reads the resolved mode, so
-      // this is also what makes the hook and the per-frame scheduler agree.
-      // A physical mesh deliberately leaves the stamp unset while translucent,
-      // but is never triangle-sorted; resolve it to opaque for this hook rather
-      // than falling back to an ignored inherited mode. The `?? blendingMode`
-      // covers the generic fallback arm of
-      // `applyBlendingStateToMaterial` (a material without `applyBlendingMode`,
-      // kept for external/future materials): that arm never stamps
-      // `userData.blendingMode`, so reading the material alone would leave the
-      // value unchanged and silently make this hook a no-op for such a node.
-      if (isDepthSortable(obj.userData?.nodeType)) {
-        const resolvedMode = isPhysicalMeshMaterial(mat)
-          ? 'opaque'
-          : ((mat.userData?.blendingMode as BlendingMode | undefined) ?? blendingMode);
-        noteDepthSortBlendingModeSwitch(obj as THREE.Mesh, resolvedMode, prevBlendingMode);
-      }
-      scheduleBlendModeProgramWarmupForObject(obj);
+      // ONE chain per leaf, shared by the composition and the reference-basis
+      // gate, and read from the index. The `collectAncestorNodes` descent this
+      // replaced resolved each step with a linear `children.find`, so a fan-out
+      // over a P-part wrapper was ~P²/2 comparisons per slider tick.
+      this.applyComposedToLeaf(layer, leaf, obj, sceneIndex.ancestorChain(leaf.path));
     }
     this.deps.requestRender();
+  }
+
+  /**
+   * The per-leaf body of {@link applyComposed}: push `layer`'s composed state
+   * into ONE leaf's material. Shared with {@link applyToNewLeaf}, so a leaf that
+   * materialises after the panel initialised is styled by exactly the code an
+   * edit uses. `ancestors` is the leaf's root→leaf chain. `uncommitted`: the
+   * leaf has received no data yet (a fresh placeholder), so its first commit
+   * registers it with the depth sorter under the live mode and no blending
+   * switch needs reporting.
+   */
+  private applyComposedToLeaf(
+    layer: LayerInfo,
+    leaf: SceneNode,
+    obj: THREE.Object3D,
+    ancestors: readonly SceneNode[],
+    uncommitted = false
+  ): void {
+    const mat = this.getLeafMaterial(obj);
+    if (!mat) return;
+    // Per-leaf window routing. A layer whose window is a SCALAR window
+    // (colormap in play) can still contain leaves rendering direct colour:
+    // the C1 guard suppresses the LUT on geometry with no scalars bound,
+    // and a MIXED group keeps the scalar window because some other leaf
+    // accepted it. Pushing that window into a direct-colour leaf's colour
+    // GOG is exactly the contrast stretch this panel no longer does — such
+    // a leaf gets the identity window instead.
+    const identityLayerWindow = layer.scalarWindow && !isColormapActive(mat);
+    const eff = this.composeEffective(leaf.path, layer.path, identityLayerWindow, ancestors);
+    if (!eff) return;
+    const pickUniforms = (
+      mat as LuxarMaterial & {
+        uniforms?: { uOpacity?: { value: number }; uIntensity?: { value: number } };
+      }
+    ).uniforms;
+    const previousOpacity = pickUniforms?.uOpacity?.value;
+    const previousIntensity = pickUniforms?.uIntensity?.value;
+    // A live LOD fade (cross-fade, streaming energy or density-guard
+    // compensation) owns the live opacity uniform as `_lodFadeBase × product`
+    // (scene/lod-fade.ts), so a direct write of the authored value would be
+    // clobbered by the next recompose — or, on a density-thinned node nothing
+    // recomposes per frame, drop its compensation. Rebase the fade instead:
+    // `rebaseLodFade` moves the snapshot and redraws `newBase × product` now.
+    if (!rebaseLodFade(obj, mat, eff.opacity)) mat.updateOpacity(eff.opacity);
+    // A mesh's PICK material reads the same coverage the visual one does — node
+    // opacity times per-vertex alpha (§6.5) — so it has to move with the slider.
+    // The value it renders with is NOT the one pushed here: every pick render
+    // copies the visual material's LIVE opacity across
+    // (rendering/picking/picking-system/visibility-sync.ts), which also covers
+    // the writers that never come through this panel — the LOD cross-fade and
+    // the embedder exposure path. What this call adds is the pick-buffer
+    // invalidation: a stationary-camera panel edit otherwise keeps the cached
+    // pre-edit coverage. Run outside the LOD-fade branch above.
+    const meshPickDirty = syncMeshPickAppearance(obj as THREE.Mesh, { opacity: eff.opacity });
+    // The three emissive geometry-material families implement it (gsplats
+    // phase 1, points phase 3, lines phase 4); optional-chained for a mesh
+    // material, which has none (a surface resolves `volumetric` to `opaque`).
+    mat.updateAbsorption?.(eff.absorption);
+    // A colormap-active leaf windows a SCALAR, and (when the composed window
+    // really is stated on the layer's reference range — see
+    // `composedWindowIsInReferenceBasis`) it is re-expressed in this leaf's
+    // own range, so a multi-level / multi-part layer stops rendering every
+    // leaf on the reference leaf's window (#1753). A direct-colour leaf has
+    // no scalar window at all, so it is not computed there.
+    const scalarWindow = isColormapActive(mat)
+      ? this.leafScalarWindow(leaf, layer, eff, ancestors)
+      : undefined;
+    applyColorAdjustments(mat, eff.gamma, eff.intensity, eff.offset, scalarWindow);
+    if (
+      meshPickDirty ||
+      (obj.userData.pickNode &&
+        (previousOpacity !== pickUniforms?.uOpacity?.value ||
+          previousIntensity !== pickUniforms?.uIntensity?.value))
+    ) {
+      this.deps.invalidatePickBuffer?.();
+    }
+    const prevBlendingMode = mat.userData?.blendingMode as BlendingMode | undefined;
+    // An unset ancestry composes to `undefined`; apply this leaf's per-type
+    // default (mesh → opaque, emissive → additive) — the same mode the
+    // material factory would have baked in.
+    const blendingMode = eff.blending_mode ?? defaultBlendingMode(leaf.type);
+    this.applyBlendingStateToMaterial(mat, blendingMode);
+    // Depth sorting: a sortable layer switching blending mode may need
+    // to start (TO an effective sorted mode: clear the committed-data
+    // stamp + reprocess so the next commit registers with the SortWorker)
+    // or stop (AWAY: release) depth sorting. Only types that register
+    // per-element centers with the coordinator qualify (gsplats/points
+    // centers, lines segment midpoints, mesh face centroids) — see
+    // `depthSortable` in `types/geometry-capabilities`.
+    //
+    // BOTH arguments must be the RESOLVED mode, which is why the new one is
+    // re-read off the material AFTER `applyBlendingStateToMaterial` rather
+    // than passing the requested `blendingMode`. `prevBlendingMode` above was
+    // already resolved (it came off `userData`), so passing the request here
+    // made the pair asymmetric — invisible for the three emissive types,
+    // whose request IS their resolved mode, and wrong for mesh, which maps
+    // the unsupported `volumetric` onto `opaque`:
+    //   normal → volumetric  looked like sorted → sorted, so the node kept
+    //     its worker registration and retained `triangleSource` after the
+    //     material had gone opaque and would never sort again;
+    //   opaque → volumetric  looked like a switch INTO a sorted mode and
+    //     triggered a full clear + O(N) reprocess for nothing.
+    // The coordinator's own `liveBlendingMode` reads the resolved mode, so
+    // this is also what makes the hook and the per-frame scheduler agree.
+    // A physical mesh deliberately leaves the stamp unset while translucent,
+    // but is never triangle-sorted; resolve it to opaque for this hook rather
+    // than falling back to an ignored inherited mode. The `?? blendingMode`
+    // covers the generic fallback arm of
+    // `applyBlendingStateToMaterial` (a material without `applyBlendingMode`,
+    // kept for external/future materials): that arm never stamps
+    // `userData.blendingMode`, so reading the material alone would leave the
+    // value unchanged and silently make this hook a no-op for such a node.
+    if (!uncommitted && isDepthSortable(obj.userData?.nodeType)) {
+      const resolvedMode = isPhysicalMeshMaterial(mat)
+        ? 'opaque'
+        : ((mat.userData?.blendingMode as BlendingMode | undefined) ?? blendingMode);
+      noteDepthSortBlendingModeSwitch(obj as THREE.Mesh, resolvedMode, prevBlendingMode);
+    }
+    scheduleBlendModeProgramWarmupForObject(obj);
   }
 
   applyVisibility(path: string, visible: boolean): void {
@@ -677,41 +834,58 @@ export class LayerApplyEngine {
    * gsplats and would make a panel edit look authored on the next composition.
    */
   applyLayerOrder(layer: LayerInfo): void {
-    const sceneGraph = this.deps.getSceneGraph();
+    this.pushed.layerOrder.set(layer.path, ++this.pushSequence);
+    const sceneIndex = this.deps.getSceneNodeIndex();
     for (const leaf of this.getAffectedDataLeaves(layer.path)) {
       const obj = this.getMesh(leaf.path);
       if (!obj) continue;
-      const ancestors = sceneGraph ? collectAncestorNodes(sceneGraph, leaf.path) : undefined;
-      const eff = this.composeEffective(leaf.path, layer.path, false, ancestors);
-      obj.userData.layerOrder = eff?.layer_order;
+      this.applyLayerOrderToLeaf(layer, leaf, obj, sceneIndex);
     }
     this.deps.requestRender();
   }
 
+  private applyLayerOrderToLeaf(
+    layer: LayerInfo,
+    leaf: SceneNode,
+    obj: THREE.Object3D,
+    sceneIndex: SceneNodeIndex | null
+  ): void {
+    const ancestors = sceneIndex?.ancestorChain(leaf.path);
+    const eff = this.composeEffective(leaf.path, layer.path, false, ancestors);
+    obj.userData.layerOrder = eff?.layer_order;
+  }
+
   applyLabelStyle(layer: LayerInfo): void {
+    this.pushed.labelStyle.set(layer.path, ++this.pushSequence);
     let applied = false;
     let pickDirty = false;
     for (const leaf of this.getAffectedDataLeaves(layer.path)) {
       const obj = this.getMesh(leaf.path);
       if (!obj) continue;
-      const mat = this.getLeafMaterial(obj);
-      if (!mat?.updateLabelStyle) continue;
-      const vocabulary = leaf.attrs.label_vocabulary as Record<string, string> | undefined;
-      const labelFilterIndex = layer.labelFilterId
-        ? Object.keys(vocabulary ?? {}).indexOf(layer.labelFilterId) + 1
-        : 0;
-      mat.updateLabelStyle(layer.colorByLabel, labelFilterIndex);
-      applied = true;
-      const pickMaterial = (obj.userData.pickNode as THREE.Mesh | undefined)?.material;
-      if (pickMaterial && !Array.isArray(pickMaterial) && 'updateLabelFilter' in pickMaterial) {
-        (
-          pickMaterial as THREE.Material & { updateLabelFilter(index: number): void }
-        ).updateLabelFilter(labelFilterIndex);
-        pickDirty = true;
-      }
+      const result = this.applyLabelStyleToLeaf(layer, leaf, obj);
+      applied ||= result.applied;
+      pickDirty ||= result.pickDirty;
     }
     if (pickDirty) this.deps.invalidatePickBuffer?.();
     if (applied) this.deps.requestRender();
+  }
+
+  private applyLabelStyleToLeaf(layer: LayerInfo, leaf: SceneNode, obj: THREE.Object3D): LeafWrite {
+    const mat = this.getLeafMaterial(obj);
+    if (!mat?.updateLabelStyle) return NOTHING_WRITTEN;
+    const vocabulary = leaf.attrs.label_vocabulary as Record<string, string> | undefined;
+    const labelFilterIndex = layer.labelFilterId
+      ? Object.keys(vocabulary ?? {}).indexOf(layer.labelFilterId) + 1
+      : 0;
+    mat.updateLabelStyle(layer.colorByLabel, labelFilterIndex);
+    const pickMaterial = (obj.userData.pickNode as THREE.Mesh | undefined)?.material;
+    if (pickMaterial && !Array.isArray(pickMaterial) && 'updateLabelFilter' in pickMaterial) {
+      (
+        pickMaterial as THREE.Material & { updateLabelFilter(index: number): void }
+      ).updateLabelFilter(labelFilterIndex);
+      return { applied: true, pickDirty: true };
+    }
+    return { applied: true, pickDirty: false };
   }
 
   /**
@@ -736,26 +910,33 @@ export class LayerApplyEngine {
    * buffer would make a freshly-dissolved region still hoverable.
    */
   applyMeshAppearance(layer: LayerInfo): void {
+    this.pushed.meshAppearance.set(layer.path, ++this.pushSequence);
     let applied = false;
     let pickDirty = false;
     for (const leaf of this.getAffectedDataLeaves(layer.path)) {
       const obj = this.getMesh(leaf.path);
       if (!obj) continue;
-      const mat = this.getLeafMaterial(obj);
-      if (!mat) continue;
-      applied = true;
-      mat.updateAmbient?.(layer.ambient);
-      mat.updateShadeExponent?.(layer.shadeExponent);
-      mat.updateSpecular?.(layer.specular);
-      mat.updateShininess?.(layer.shininess);
-      mat.updateAlphaCutoff?.(layer.alphaCutoff);
-      if (syncMeshPickAppearance(obj as THREE.Mesh, { alphaCutoff: layer.alphaCutoff })) {
-        pickDirty = true;
-      }
-      scheduleBlendModeProgramWarmupForObject(obj);
+      const result = this.applyMeshAppearanceToLeaf(layer, obj);
+      applied ||= result.applied;
+      pickDirty ||= result.pickDirty;
     }
     if (pickDirty) this.deps.invalidatePickBuffer?.();
     if (applied) this.deps.requestRender();
+  }
+
+  private applyMeshAppearanceToLeaf(layer: LayerInfo, obj: THREE.Object3D): LeafWrite {
+    const mat = this.getLeafMaterial(obj);
+    if (!mat) return NOTHING_WRITTEN;
+    mat.updateAmbient?.(layer.ambient);
+    mat.updateShadeExponent?.(layer.shadeExponent);
+    mat.updateSpecular?.(layer.specular);
+    mat.updateShininess?.(layer.shininess);
+    mat.updateAlphaCutoff?.(layer.alphaCutoff);
+    const pickDirty = syncMeshPickAppearance(obj as THREE.Mesh, {
+      alphaCutoff: layer.alphaCutoff,
+    });
+    scheduleBlendModeProgramWarmupForObject(obj);
+    return { applied: true, pickDirty };
   }
 
   /**
@@ -765,25 +946,31 @@ export class LayerApplyEngine {
    * emissive leaf simply lacks it. A no-op for a layer with no knob record.
    */
   applyPhysicalKnobs(layer: LayerInfo): void {
-    const knobs = layer.physicalKnobs;
-    if (!knobs) return;
+    if (!layer.physicalKnobs) return;
+    this.pushed.physicalKnobs.set(layer.path, ++this.pushSequence);
     let applied = false;
     for (const leaf of this.getAffectedDataLeaves(layer.path)) {
       const obj = this.getMesh(leaf.path);
       if (!obj) continue;
-      const mat = this.getLeafMaterial(obj);
-      if (!mat?.updatePhysicalKnob) continue;
-      for (const key of PHYSICAL_MESH_KNOB_KEYS) {
-        mat.updatePhysicalKnob(key, knobs[key]);
-      }
-      // The `refract_data` switch rides the same record (spec §3.4 Phase 3).
-      mat.updateRefractData?.(knobs.refract_data === true);
-      applied = true;
+      applied = this.applyPhysicalKnobsToLeaf(layer, obj) || applied;
     }
     if (applied) {
       this.deps.invalidatePickBuffer?.();
       this.deps.requestRender();
     }
+  }
+
+  private applyPhysicalKnobsToLeaf(layer: LayerInfo, obj: THREE.Object3D): boolean {
+    const knobs = layer.physicalKnobs;
+    if (!knobs) return false;
+    const mat = this.getLeafMaterial(obj);
+    if (!mat?.updatePhysicalKnob) return false;
+    for (const key of PHYSICAL_MESH_KNOB_KEYS) {
+      mat.updatePhysicalKnob(key, knobs[key]);
+    }
+    // The `refract_data` switch rides the same record (spec §3.4 Phase 3).
+    mat.updateRefractData?.(knobs.refract_data === true);
+    return true;
   }
 
   applyBlendingMode(layer: LayerInfo): void {
@@ -810,83 +997,18 @@ export class LayerApplyEngine {
   applyColormap(layer: LayerInfo): boolean {
     const leaves = this.getAffectedDataLeaves(layer.path);
     if (leaves.length === 0) return false;
-    const sceneGraph = this.deps.getSceneGraph();
-    if (!sceneGraph) return false;
+    const sceneIndex = this.deps.getSceneNodeIndex();
+    if (!sceneIndex) return false;
+    this.pushed.colormap.set(layer.path, ++this.pushSequence);
 
     let colormapInEffect = false;
     let anyMaterialReached = false;
     for (const leaf of leaves) {
       const obj = this.getMesh(leaf.path);
       if (!obj) continue;
-      const mat = this.getLeafMaterial(obj);
-      if (!mat || !mat.updateColormapTexture) continue;
-      anyMaterialReached = true;
-      const tex = layer.colormap
-        ? getColormapTexture(
-            layer.colormap,
-            getEffectiveAttrs(sceneGraph, leaf.path).customLutBytes
-          )
-        : null;
-      if (layer.colormap && tex) {
-        // C1 fail-closed guard: enabling USE_COLORMAP requires real
-        // scalar data behind the geometry (the `userData.hasScalars`
-        // stamp for points/lines texel storage; always true for gsplats,
-        // whose amplitude is the scalar).
-        //
-        // `leaf.type` is a raw string off the node, so narrow it rather than
-        // asserting: `supportsScalarColormap` is exhaustive over the geometry
-        // vocabulary and must not be handed a value outside it.
-        const geometry = (obj as THREE.Points | THREE.Mesh).geometry as THREE.BufferGeometry;
-        const nodeType: GeometryTypeName | undefined = isGeometryType(leaf.type)
-          ? leaf.type
-          : undefined;
-        if (!nodeType || !supportsScalarColormap(nodeType, geometry)) {
-          log.warning(
-            Modules.UI,
-            `[LayersPanel][${leaf.path}] Scalar colormap suppressed: required attribute(s) not bound on geometry (pending C4 implementation).`
-          );
-          continue;
-        }
-        mat.updateColormapTexture(tex);
-        colormapInEffect = true;
-        // The scalar window (value→LUT mapping) is driven by the display
-        // range, not a static attr — recover it from the composed
-        // gain/offset so it matches what `applyComposed` will push. Falls
-        // back to the authored scalar range when no composition exists.
-        //
-        // Routed through the SAME `leafScalarWindow` helper `applyComposed`
-        // uses, per-leaf remap included. The `applyComposed(layer)` at the end
-        // of this method immediately supersedes what is written here, so the
-        // two agreeing is about not leaving a trap for the next reader (#1753).
-        if (mat.updateScalarRange) {
-          // One walk, shared by the composition and the gate — see the same
-          // note in `applyComposed`.
-          const ancestors = collectAncestorNodes(sceneGraph, leaf.path);
-          const eff = this.composeEffective(leaf.path, layer.path, false, ancestors);
-          if (eff) {
-            const { min, max } = this.leafScalarWindow(leaf, layer, eff, ancestors);
-            mat.updateScalarRange(min, max);
-          } else if (layer.scalarDataRange) {
-            mat.updateScalarRange(layer.scalarDataRange[0], layer.scalarDataRange[1]);
-          }
-          // The composed window drives the LUT lookup; reset the post-LUT
-          // color GOG to identity so a previously-stamped gain never
-          // double-applies once the colormap takes over (#936). Only on the
-          // colormap-active path — the direct-color branch below leaves the
-          // GOG to `applyComposed`.
-          mat.updateIntensity(1);
-          mat.updateOffset(0);
-        }
-      } else {
-        mat.updateColormapTexture(null);
-      }
-      // do NOT mark `mat.needsUpdate = true` here. Material methods
-      // (`updateColormapTexture`, `applyColormapTextureToMaterial`)
-      // already toggle `needsUpdate` when defines change. Setting it
-      // unconditionally for every per-leaf colormap apply caused
-      // shader recompilation on every UI tick during group-layer
-      // scalar-range drags, even when the colormap define hadn't
-      // toggled.
+      const outcome = this.applyColormapToLeaf(layer, leaf, obj, sceneIndex);
+      anyMaterialReached ||= outcome !== 'unreached';
+      colormapInEffect ||= outcome === 'colormap';
     }
     // Enabling/disabling a colormap flips how display-range + gamma must
     // be routed (value window vs color GOG). Recompose so each affected
@@ -898,5 +1020,104 @@ export class LayerApplyEngine {
     // material was actually evaluated; with none reachable (still streaming),
     // report the requested state so the caller doesn't fight the user.
     return colormapInEffect || (!anyMaterialReached && !!layer.colormap);
+  }
+
+  /**
+   * The per-leaf body of {@link applyColormap}. Reports whether the leaf's
+   * material was reachable at all and, if so, whether it now renders through
+   * the LUT (`'colormap'`) or direct colour (`'direct'`: cleared, or the C1
+   * guard suppressed it).
+   */
+  private applyColormapToLeaf(
+    layer: LayerInfo,
+    leaf: SceneNode,
+    obj: THREE.Object3D,
+    sceneIndex: SceneNodeIndex
+  ): 'unreached' | 'colormap' | 'direct' {
+    const mat = this.getLeafMaterial(obj);
+    if (!mat || !mat.updateColormapTexture) return 'unreached';
+    let inEffect = false;
+    const tex = layer.colormap
+      ? getColormapTexture(
+          layer.colormap,
+          getEffectiveAttrsOfChain(sceneIndex.ancestorChain(leaf.path)).customLutBytes
+        )
+      : null;
+    if (layer.colormap && tex) {
+      // C1 fail-closed guard: enabling USE_COLORMAP requires real
+      // scalar data behind the geometry (the `userData.hasScalars`
+      // stamp for points/lines texel storage; always true for gsplats,
+      // whose amplitude is the scalar).
+      //
+      // `leaf.type` is a raw string off the node, so narrow it rather than
+      // asserting: `supportsScalarColormap` is exhaustive over the geometry
+      // vocabulary and must not be handed a value outside it.
+      const geometry = (obj as THREE.Points | THREE.Mesh).geometry as THREE.BufferGeometry;
+      const nodeType: GeometryTypeName | undefined = isGeometryType(leaf.type)
+        ? leaf.type
+        : undefined;
+      if (!nodeType || !supportsScalarColormap(nodeType, geometry)) {
+        log.warning(
+          Modules.UI,
+          `[LayersPanel][${leaf.path}] Scalar colormap suppressed: the leaf carries no per-element scalars (its geometry has no hasScalars stamp), so it keeps its direct colours.`
+        );
+        return 'direct';
+      }
+      mat.updateColormapTexture(tex);
+      inEffect = true;
+      // The scalar window (value→LUT mapping) is driven by the display
+      // range, not a static attr — recover it from the composed
+      // gain/offset so it matches what `applyComposed` will push. Falls
+      // back to the authored scalar range when no composition exists.
+      //
+      // Routed through the SAME `leafScalarWindow` helper `applyComposed`
+      // uses, per-leaf remap included. The `applyComposed(layer)` at the end
+      // of this method immediately supersedes what is written here, so the
+      // two agreeing is about not leaving a trap for the next reader (#1753).
+      if (mat.updateScalarRange) {
+        // One chain, shared by the composition and the gate — see the same
+        // note in `applyComposed`.
+        const ancestors = sceneIndex.ancestorChain(leaf.path);
+        const eff = this.composeEffective(leaf.path, layer.path, false, ancestors);
+        if (eff) {
+          const { min, max } = this.leafScalarWindow(leaf, layer, eff, ancestors);
+          mat.updateScalarRange(min, max);
+        } else if (layer.scalarDataRange) {
+          mat.updateScalarRange(layer.scalarDataRange[0], layer.scalarDataRange[1]);
+        }
+        // The composed window drives the LUT lookup; reset the post-LUT
+        // color GOG to identity so a previously-stamped gain never
+        // double-applies once the colormap takes over (#936). Only on the
+        // colormap-active path — the direct-color branch below leaves the
+        // GOG to `applyComposed`.
+        mat.updateIntensity(1);
+        mat.updateOffset(0);
+      }
+    } else {
+      mat.updateColormapTexture(null);
+    }
+    // do NOT mark `mat.needsUpdate = true` here. Material methods
+    // (`updateColormapTexture`, `applyColormapTextureToMaterial`)
+    // already toggle `needsUpdate` when defines change. Setting it
+    // unconditionally for every per-leaf colormap apply caused
+    // shader recompilation on every UI tick during group-layer
+    // scalar-range drags, even when the colormap define hadn't
+    // toggled.
+    return inEffect ? 'colormap' : 'direct';
+  }
+}
+
+/**
+ * Stamp hidden every object on `obj`'s parent chain (itself included) that is a
+ * hidden layer of `layers` and not yet stamped — the ones built after the panel
+ * pushed that layer's visibility (see `LayerApplyEngine.applyToNewLeaf`).
+ */
+function hideHiddenLayerObjects(obj: THREE.Object3D, layers: readonly LayerInfo[]): void {
+  const hidden = new Set(layers.filter((layer) => !layer.visible).map((layer) => layer.path));
+  if (hidden.size === 0) return;
+  for (let node: THREE.Object3D | null = obj; node; node = node.parent) {
+    if (!hidden.has(node.name) || node.userData.layerVisible === false) continue;
+    node.userData.layerVisible = false;
+    node.visible = false;
   }
 }

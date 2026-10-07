@@ -41,9 +41,12 @@ export interface LuxarEventMap {
   /**
    * Animation-loop frame-end hook. Fired right after per-frame
    * work — including post-processing render — completes. Pair with
-   * `frame-start` for timing.
+   * `frame-start` for timing. `rendered` is false on a tick that drew
+   * nothing (render-on-change skipped an unchanged frame, or the context is
+   * lost) — a frame-rate readout counts only `rendered !== false` ticks.
+   * Absent means rendered (a publisher that predates the flag).
    */
-  'frame-end': Record<string, never>;
+  'frame-end': { rendered?: boolean };
   /**
    * Aggregate loading progress from the data layer. Used by the
    * loading-monitor UI to render the progress bar / spinner.
@@ -60,8 +63,12 @@ export interface LuxarEventMap {
    * WHAT IS RESIDENT (the scene-derived environment capture in
    * `rendering/environment/`) mark themselves stale on it and rebuild once the
    * loader settles, rather than polling the scene graph.
+   *
+   * `drawn: false` means no committed node was on screen (an LOD level the
+   * registry keeps hidden, a hidden layer): the frame cannot have changed, so
+   * the render loop keeps ticking without a redraw. Omitted counts as drawn.
    */
-  'geometry-committed': Record<string, never>;
+  'geometry-committed': { drawn?: boolean };
 
   // ── Command events (input → UI panel toggles) ───────────────
   /**

@@ -5,14 +5,22 @@ import {
   buildUrl,
   fetchWithRetry as fetchWithRetryScoped,
   hashUrl,
-  mergeAbortSignals,
 } from '../../../cache/multi-level-caching-store/fetch-retry';
 import {
-  MAX_CONCURRENT_CHUNK_FETCHES,
+  getFetchLaneLimit,
   resetFetchProgressEpoch,
+  resetFetchTransport,
   withFetchGate,
 } from '../../../utils/fetch-concurrency';
+import { config } from '../../../config';
 import { log } from '../../../utils/log';
+import { forceAbortSignalAnyFallback } from '../../helpers/abort-signal-any';
+
+/** The gate's widths, as configured (`config.dataLoading.network.fetchGate`). */
+const {
+  http1MaxChunkFetches: HTTP1_MAX_CONCURRENT_CHUNK_FETCHES,
+  maxChunkFetches: MAX_CONCURRENT_CHUNK_FETCHES,
+} = config.dataLoading.network.fetchGate;
 
 function mockResponse(status: number, body: ArrayBuffer | string = ''): Response {
   return {
@@ -58,115 +66,6 @@ async function fetchWithRetry(
 ): Promise<Response | undefined> {
   return fetchWithRetryScoped(url, options, async ({ response }) => response);
 }
-
-function forceAbortSignalAnyFallback(): () => void {
-  const descriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
-  Object.defineProperty(AbortSignal, 'any', { configurable: true, value: undefined });
-  return () => {
-    if (descriptor) Object.defineProperty(AbortSignal, 'any', descriptor);
-    else delete (AbortSignal as unknown as { any?: unknown }).any;
-  };
-}
-
-describe('mergeAbortSignals', () => {
-  it('returns the primary signal in a no-op scope when no caller is provided', () => {
-    const primary = new AbortController().signal;
-    const merged = mergeAbortSignals(primary);
-    expect(merged.signal).toBe(primary);
-    expect(() => merged.dispose()).not.toThrow();
-  });
-
-  it('keeps the native AbortSignal.any path unchanged', () => {
-    const descriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
-    const nativeSignal = new AbortController().signal;
-    const any = vi.fn(() => nativeSignal);
-    Object.defineProperty(AbortSignal, 'any', { configurable: true, value: any });
-    try {
-      const primary = new AbortController().signal;
-      const caller = new AbortController().signal;
-      const merged = mergeAbortSignals(primary, caller);
-      expect(any).toHaveBeenCalledWith([primary, caller]);
-      expect(merged.signal).toBe(nativeSignal);
-      expect(() => merged.dispose()).not.toThrow();
-    } finally {
-      if (descriptor) Object.defineProperty(AbortSignal, 'any', descriptor);
-      else delete (AbortSignal as unknown as { any?: unknown }).any;
-    }
-  });
-
-  it('fallback abort from primary relays immediately and removes both listeners', () => {
-    const restore = forceAbortSignalAnyFallback();
-    try {
-      const primary = new AbortController();
-      const caller = new AbortController();
-      const merged = mergeAbortSignals(primary.signal, caller.signal);
-      expect(getEventListeners(primary.signal, 'abort')).toHaveLength(1);
-      expect(getEventListeners(caller.signal, 'abort')).toHaveLength(1);
-
-      const reason = new Error('primary timeout');
-      primary.abort(reason);
-
-      expect(merged.signal.aborted).toBe(true);
-      expect(merged.signal.reason).toBe(reason);
-      expect(getEventListeners(primary.signal, 'abort')).toHaveLength(0);
-      expect(getEventListeners(caller.signal, 'abort')).toHaveLength(0);
-    } finally {
-      restore();
-    }
-  });
-
-  it('fallback abort from caller relays immediately and removes both listeners', () => {
-    const restore = forceAbortSignalAnyFallback();
-    try {
-      const primary = new AbortController();
-      const caller = new AbortController();
-      const merged = mergeAbortSignals(primary.signal, caller.signal);
-
-      const reason = new Error('caller cancelled');
-      caller.abort(reason);
-
-      expect(merged.signal.aborted).toBe(true);
-      expect(merged.signal.reason).toBe(reason);
-      expect(getEventListeners(primary.signal, 'abort')).toHaveLength(0);
-      expect(getEventListeners(caller.signal, 'abort')).toHaveLength(0);
-    } finally {
-      restore();
-    }
-  });
-
-  it('fallback dispose is idempotent and prevents completed merges from accumulating', () => {
-    const restore = forceAbortSignalAnyFallback();
-    try {
-      const primary = new AbortController();
-      for (let i = 0; i < 100; i++) {
-        const caller = new AbortController();
-        const merged = mergeAbortSignals(primary.signal, caller.signal);
-        merged.dispose();
-        merged.dispose();
-      }
-      expect(getEventListeners(primary.signal, 'abort')).toHaveLength(0);
-    } finally {
-      restore();
-    }
-  });
-
-  it('fallback returns an already-aborted scope without registering listeners', () => {
-    const restore = forceAbortSignalAnyFallback();
-    try {
-      const primary = new AbortController();
-      const reason = new Error('already timed out');
-      primary.abort(reason);
-      const caller = new AbortController();
-      const merged = mergeAbortSignals(primary.signal, caller.signal);
-      expect(merged.signal.aborted).toBe(true);
-      expect(merged.signal.reason).toBe(reason);
-      expect(getEventListeners(primary.signal, 'abort')).toHaveLength(0);
-      expect(getEventListeners(caller.signal, 'abort')).toHaveLength(0);
-    } finally {
-      restore();
-    }
-  });
-});
 
 describe('buildUrl', () => {
   it('joins a clean base + key with a single slash', () => {
@@ -231,8 +130,24 @@ describe('fetchWithRetry', () => {
 
   afterEach(() => {
     global.fetch = originalFetch;
+    resetFetchTransport();
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it('narrows the fetch lane for plain HTTP requests only', async () => {
+    const fetchMock = vi.fn(async () => mockResponse(200));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await fetchWithRetry('https://example.com/x');
+    expect(getFetchLaneLimit('data', 'https://example.com')).toBe(MAX_CONCURRENT_CHUNK_FETCHES);
+
+    await fetchWithRetry('http://example.com/x');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(getFetchLaneLimit('data', 'http://example.com')).toBe(
+      HTTP1_MAX_CONCURRENT_CHUNK_FETCHES
+    );
+    expect(getFetchLaneLimit('data', 'https://example.com')).toBe(MAX_CONCURRENT_CHUNK_FETCHES);
   });
 
   it('returns the response on first success', async () => {
@@ -897,5 +812,57 @@ describe('fetchWithRetry', () => {
     const totalElapsed = callTimes[callTimes.length - 1] - start;
     expect(totalElapsed).toBeLessThan(1500);
     expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe('fetchWithRetry — request shape and gate priority', () => {
+  it('forwards a `cache` mode to fetch', async () => {
+    // The zip range reader needs `no-store`: Chrome serialises same-URL Range
+    // GETs through the HTTP-cache writer lock otherwise.
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => mockResponse(200, 'ok'));
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await fetchWithRetryScoped(
+      'https://example.com/archive.zip',
+      { cache: 'no-store' },
+      async ({ response }) => response
+    );
+
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ cache: 'no-store' });
+  });
+
+  it('queues by priority: a demand request overtakes an earlier speculative one', async () => {
+    const release: Array<() => void> = [];
+    const held = Array.from({ length: MAX_CONCURRENT_CHUNK_FETCHES }, () =>
+      withFetchGate(() => new Promise<void>((resolve) => release.push(resolve)))
+    );
+    const started: string[] = [];
+    global.fetch = vi.fn(async (url: string) => {
+      started.push(url);
+      return mockResponse(200, 'ok');
+    }) as unknown as typeof fetch;
+    try {
+      const speculative = fetchWithRetryScoped(
+        'https://example.com/speculative',
+        { priority: 'speculative' },
+        async ({ response }) => response
+      );
+      const demand = fetchWithRetryScoped(
+        'https://example.com/demand',
+        { priority: 'demand' },
+        async ({ response }) => response
+      );
+      await Promise.resolve();
+
+      release.shift()!();
+      await vi.waitFor(() => expect(started.length).toBeGreaterThan(0));
+      expect(started[0]).toBe('https://example.com/demand');
+
+      release.forEach((r) => r());
+      await Promise.all([speculative, demand]);
+    } finally {
+      release.forEach((r) => r());
+      await Promise.all(held);
+    }
   });
 });

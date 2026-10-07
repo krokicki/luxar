@@ -39,9 +39,15 @@ export function initScaleBar(ports: InitScaleBarPorts): ScaleBar {
   });
 
   // Register per-frame update for live camera tracking
-  ports.animationController.addPerFrameCallback('scale-bar', () => {
-    scaleBar.update();
-  });
+  ports.animationController.addPerFrameCallback(
+    'scale-bar',
+    () => {
+      scaleBar.update();
+      // A DOM overlay: nothing the canvas draws.
+      return false;
+    },
+    { phase: 'ui' }
+  );
 
   // Wire to input handler for keyboard toggle
   ports.inputHandler.setScaleBar(scaleBar);

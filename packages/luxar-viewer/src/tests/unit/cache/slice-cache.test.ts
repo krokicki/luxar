@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { SliceCache } from '../../../cache/slice-cache';
+import { perfCounters } from '../../../profiling/perf-counters';
 
 /** A payload of `bytes` bytes (a single typed array) for size-accounting tests. */
 function entry(bytes: number, tag = 'x') {
@@ -233,5 +234,240 @@ describe('SliceCache — markOversizedWarned (warn-once, cleared on clear)', () 
     expect(c.markOversizedWarned(k)).toBe(true);
     c.clear();
     expect(c.markOversizedWarned(k)).toBe(true); // reset by clear()
+  });
+});
+
+describe('SliceCache pinned perf gauges', () => {
+  const pinned = () => [
+    perfCounters.get('scache.pinnedEntries'),
+    perfCounters.get('scache.pinnedBytes'),
+  ];
+
+  it('tracks pin on set, release on hit, and drop on clear', () => {
+    perfCounters.reset();
+    const c = new SliceCache({ maxSize: 1024 });
+    const a = SliceCache.makeKey('/n', 'a');
+    const b = SliceCache.makeKey('/n', 'b');
+    c.set(a, entry(100), { pin: true });
+    c.set(b, entry(50), { pin: true });
+    c.set(SliceCache.makeKey('/n', 'u'), entry(10)); // unpinned: not counted
+    expect(pinned()).toEqual([2, 150]);
+
+    c.get(a); // the consuming hit releases the pin
+    expect(pinned()).toEqual([1, 50]);
+    c.get(a); // already unpinned: no change
+    expect(pinned()).toEqual([1, 50]);
+
+    c.clear();
+    expect(pinned()).toEqual([0, 0]);
+  });
+
+  it('an oversized pinned re-set neither keeps nor pins the stale entry', () => {
+    perfCounters.reset();
+    const c = new SliceCache({ maxSize: 1024 });
+    const a = SliceCache.makeKey('/n', 'a');
+    c.set(a, entry(100, 'old'));
+    c.set(a, entry(4096, 'new'), { pin: true }); // larger than the whole budget
+
+    expect(c.has(a)).toBe(false);
+    expect(pinned()).toEqual([0, 0]);
+    expect(c.getStats().size).toBe(0);
+  });
+
+  it('keeps a re-set pinned key pinned at its new size (as the LRU does)', () => {
+    perfCounters.reset();
+    const c = new SliceCache({ maxSize: 1024 });
+    const a = SliceCache.makeKey('/n', 'a');
+    c.set(a, entry(100), { pin: true });
+    c.set(a, entry(300)); // replace without pin: LRU pin persists
+    expect(pinned()).toEqual([1, 300]);
+    c.delete(a);
+    expect(pinned()).toEqual([0, 0]);
+  });
+
+  it('drops a pinned entry evicted as a last resort', () => {
+    perfCounters.reset();
+    const c = new SliceCache({ maxSize: 100 });
+    c.set(SliceCache.makeKey('/n', 'a'), entry(60), { pin: true });
+    c.set(SliceCache.makeKey('/n', 'b'), entry(60), { pin: true }); // evicts pinned a
+    expect(pinned()).toEqual([1, 60]);
+  });
+
+  it('a new S-cache (the next scene) starts the gauges from its own empty state', () => {
+    // A dataset switch builds a fresh SliceCache and drops the old one without
+    // clearing it. The gauges describe what is pinned NOW, so the outgoing
+    // scene's pins must not survive into the incoming scene's readings.
+    const outgoing = new SliceCache({ maxSize: 1024 });
+    const a = SliceCache.makeKey('/n', 'a');
+    const ea = entry(100);
+    outgoing.set(a, ea, { pin: true });
+    outgoing.setStage(a, ea.payload, { sig: 's', value: {}, bytes: 20 });
+    expect(pinned()).toEqual([1, 120]);
+    expect(perfCounters.get('scache.stage.bytes')).toBe(20);
+
+    new SliceCache({ maxSize: 1024 });
+    expect(pinned()).toEqual([0, 0]);
+    expect(perfCounters.get('scache.stage.bytes')).toBe(0);
+  });
+
+  it('does not count a pin request for an oversized (rejected) entry', () => {
+    // Gauges survive perfCounters.reset() (they describe current state); a new
+    // cache publishes its own empty state rather than inherit the last test's.
+    const c = new SliceCache({ maxSize: 100 });
+    expect(pinned()).toEqual([0, 0]);
+    c.set(SliceCache.makeKey('/n', 'big'), entry(500), { pin: true });
+    expect(pinned()).toEqual([0, 0]);
+  });
+});
+
+describe('SliceCache stage outputs (#2944 B2)', () => {
+  const stage = (sig: string, bytes: number) => ({ sig, value: { sig }, bytes });
+  const pinned = () => [
+    perfCounters.get('scache.pinnedEntries'),
+    perfCounters.get('scache.pinnedBytes'),
+  ];
+
+  it('answers a stage lookup only for the same payload object and signature', () => {
+    const c = new SliceCache({ maxSize: 1024 });
+    const k = SliceCache.makeKey('/n', 'a');
+    const e = entry(100);
+    c.set(k, e);
+    expect(c.setStage(k, e.payload, stage('s1', 50))).toBe(true);
+    expect(c.getStage(k, e.payload, 's1')).toEqual({ sig: 's1' });
+    expect(c.getStage(k, e.payload, 's2')).toBeUndefined(); // other params
+    expect(c.getStage(k, { ...(e.payload as object) }, 's1')).toBeUndefined(); // other payload
+    const s = c.getStats();
+    expect([s.stageHits, s.stageMisses]).toEqual([1, 1]);
+    // Bookkeeping reads never touch the slice hit/miss statistic.
+    expect([s.hits, s.misses]).toEqual([0, 0]);
+  });
+
+  it('counts the stage inside the budget and keeps the entry recency and pin', () => {
+    perfCounters.reset();
+    const c = new SliceCache({ maxSize: 1000 });
+    const a = SliceCache.makeKey('/n', 'a');
+    const b = SliceCache.makeKey('/n', 'b');
+    const ea = entry(100);
+    c.set(a, ea, { pin: true });
+    c.set(b, entry(100));
+    expect(c.setStage(a, ea.payload, stage('s', 200))).toBe(true);
+    expect(c.getStats().size).toBe(400);
+    expect(c.getStats().stageBytes).toBe(200);
+    expect(pinned()).toEqual([1, 300]);
+    // Attaching did not promote `a`: after its pin is released it is still
+    // the LRU entry, so an overflow that shedding alone cannot absorb evicts
+    // `a`, not `b`.
+    c.unpin(a);
+    c.set(SliceCache.makeKey('/n', 'c'), entry(850));
+    expect(c.has(a)).toBe(false);
+    expect(c.has(b)).toBe(true);
+    expect(c.getStats().stageBytes).toBe(0);
+  });
+
+  it('never evicts a slice to admit a stage output', () => {
+    const c = new SliceCache({ maxSize: 300 });
+    const a = SliceCache.makeKey('/n', 'a');
+    const ea = entry(100);
+    c.set(a, ea);
+    c.set(SliceCache.makeKey('/n', 'b'), entry(150));
+    expect(c.canAdmitStage(a, ea.payload, 80)).toBe(false);
+    expect(c.setStage(a, ea.payload, stage('s', 80))).toBe(false);
+    expect(c.getStats().count).toBe(2);
+    expect(c.getStats().stageRejected).toBe(2);
+    expect(c.getStage(a, ea.payload, 's')).toBeUndefined();
+  });
+
+  it('sheds stage outputs (oldest first) before evicting any slice', () => {
+    const c = new SliceCache({ maxSize: 1000 });
+    const keys = ['a', 'b', 'c'].map((v) => SliceCache.makeKey('/n', v));
+    const entries = keys.map(() => entry(100));
+    keys.forEach((k, i) => c.set(k, entries[i]));
+    keys.forEach((k, i) => expect(c.setStage(k, entries[i].payload, stage('s', 200))).toBe(true));
+    expect(c.getStats().size).toBe(900);
+    // A 250-byte slice needs 150 bytes: shedding `a`'s stage (oldest) suffices.
+    c.set(SliceCache.makeKey('/n', 'd'), entry(250));
+    expect(c.getStats().count).toBe(4);
+    expect(c.getStage(keys[0], entries[0].payload, 's')).toBeUndefined();
+    expect(c.getStage(keys[1], entries[1].payload, 's')).toEqual({ sig: 's' });
+    expect(c.getStats().stageShed).toBe(1);
+    expect(c.getStats().size).toBe(950);
+  });
+
+  it('inside a playback scan: admits into free budget only and sheds most-recent first', () => {
+    // Under a cyclic scan the OLDEST outputs are the ones the loop reaches
+    // next, so displacing them for the newest would only churn.
+    const c = new SliceCache({ maxSize: 1000 });
+    const keys = ['a', 'b', 'c', 'd'].map((v) => SliceCache.makeKey('/n', v));
+    const entries = keys.map(() => entry(100));
+    keys.forEach((k, i) => c.set(k, entries[i], { scan: true }));
+    // 400 slice bytes + two 200-byte outputs fit; the third does not.
+    expect(c.setStage(keys[0], entries[0].payload, stage('s', 200), { scan: true })).toBe(true);
+    expect(c.setStage(keys[1], entries[1].payload, stage('s', 200), { scan: true })).toBe(true);
+    expect(c.canAdmitStage(keys[2], entries[2].payload, 250, { scan: true })).toBe(false);
+    expect(c.setStage(keys[2], entries[2].payload, stage('s', 250), { scan: true })).toBe(false);
+    expect(c.getStats().stageShed).toBe(0); // nothing displaced to try
+    // Outside a scan the same request would shed the oldest output instead.
+    expect(c.canAdmitStage(keys[2], entries[2].payload, 250)).toBe(true);
+    // A scan slice store needing room sheds the MOST recent output (b's).
+    c.set(SliceCache.makeKey('/n', 'e'), entry(250), { scan: true });
+    expect(c.getStage(keys[0], entries[0].payload, 's')).toEqual({ sig: 's' });
+    expect(c.getStage(keys[1], entries[1].payload, 's')).toBeUndefined();
+    expect(c.getStats().count).toBe(5);
+  });
+
+  it('releases a stage output with its slice (eviction, replacement, clear)', () => {
+    const c = new SliceCache({ maxSize: 1000 });
+    const a = SliceCache.makeKey('/n', 'a');
+    const ea = entry(100);
+    c.set(a, ea);
+    c.setStage(a, ea.payload, stage('s', 100));
+    const upgraded = entry(150);
+    c.set(a, upgraded); // storeLadder's upgrade-if-longer replacement
+    expect(c.getStats().stageBytes).toBe(0);
+    expect(c.getStats().size).toBe(150);
+    expect(c.getStage(a, upgraded.payload, 's')).toBeUndefined();
+    c.setStage(a, upgraded.payload, stage('s', 100));
+    c.delete(a);
+    expect(c.getStats().stageBytes).toBe(0);
+    c.set(a, ea);
+    c.setStage(a, ea.payload, stage('s', 100));
+    c.clear();
+    expect(c.getStats().stageBytes).toBe(0);
+    expect(c.getStats().size).toBe(0);
+  });
+});
+
+describe('SliceCache stage perf counters', () => {
+  const stage = (sig: string, bytes: number) => ({ sig, value: { sig }, bytes });
+
+  it('count stage hits, misses, rejections and sheds, and gauge the retained stage bytes', () => {
+    perfCounters.reset();
+    const c = new SliceCache({ maxSize: 1000 });
+    const keys = ['a', 'b', 'c'].map((v) => SliceCache.makeKey('/n', v));
+    const entries = keys.map(() => entry(100));
+    keys.forEach((k, i) => c.set(k, entries[i]));
+    keys.forEach((k, i) => c.setStage(k, entries[i].payload, stage('s', 200)));
+    expect(perfCounters.get('scache.stage.bytes')).toBe(600);
+
+    c.getStage(keys[1], entries[1].payload, 's'); // hit
+    c.getStage(keys[1], entries[1].payload, 'other-params'); // miss
+    c.getStage(keys[1], { other: 'payload' }, 's'); // not this entry's payload: neither
+    // 2000 bytes cannot fit even after shedding every other output.
+    expect(c.canAdmitStage(keys[2], entries[2].payload, 2000)).toBe(false);
+    // A 250-byte slice needs 150 bytes: shedding the oldest output (a's) suffices.
+    c.set(SliceCache.makeKey('/n', 'd'), entry(250));
+
+    expect(perfCounters.get('scache.stage.hits')).toBe(1);
+    expect(perfCounters.get('scache.stage.misses')).toBe(1);
+    expect(perfCounters.get('scache.stage.rejected')).toBe(1);
+    expect(perfCounters.get('scache.stage.shed')).toBe(1);
+    expect(perfCounters.get('scache.stage.bytes')).toBe(400);
+    const s = c.getStats();
+    expect([s.stageHits, s.stageMisses, s.stageRejected, s.stageShed, s.stageBytes]).toEqual([
+      1, 1, 1, 1, 400,
+    ]);
+
+    c.clear();
+    expect(perfCounters.get('scache.stage.bytes')).toBe(0);
   });
 });

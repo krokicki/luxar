@@ -8,6 +8,7 @@ import {
   snapshotProjectedDensity,
 } from '../../../scene/projected-density';
 import { setCommittedData } from '../../../types/committed-data';
+import { ViewContextProvider } from '../../../scene/view-context';
 
 /** A committed gsplats node the tracker can measure. */
 function node(path: string, radius: number, splats: number, position = new THREE.Vector3()) {
@@ -73,6 +74,45 @@ describe('projectSphereAreaPx', () => {
     });
   });
 
+  it('is off-screen when the sphere lies wholly behind the camera (#2944 A4)', () => {
+    const camera = perspective(1600, 1000, 100);
+    // view-space z > 0 is behind the eye; the sphere does not reach z = 0.
+    expect(projectSphereAreaPx({ x: 0, y: 0, z: 100 }, 5, camera, 1600, 1000)).toEqual({
+      areaPx: 0,
+      onScreen: false,
+    });
+    // The eye INSIDE the sphere (|centre| <= radius) fills the buffer.
+    expect(projectSphereAreaPx({ x: 0, y: 0, z: 3 }, 5, camera, 1600, 1000)).toEqual({
+      areaPx: 1_600_000,
+      onScreen: true,
+    });
+  });
+
+  it('culls a sphere beside the camera that crosses the eye plane outside the frustum', () => {
+    const camera = perspective(1600, 1000, 100);
+    // Depth span [-1, 1] crosses the eye plane, but the eye is 99 units outside
+    // the sphere and the sphere sits far to the side of the 60° frustum.
+    expect(projectSphereAreaPx({ x: 100, y: 0, z: 0 }, 1, camera, 1600, 1000)).toEqual({
+      areaPx: 0,
+      onScreen: false,
+    });
+    // Same, wholly behind the near plane (depth in [0, 0.05] < near 0.1).
+    expect(projectSphereAreaPx({ x: 0, y: 0, z: 0.5 }, 0.45, camera, 1600, 1000)).toEqual({
+      areaPx: 0,
+      onScreen: false,
+    });
+  });
+
+  it('measures the near-clipped footprint of a sphere grazing the edge of the view', () => {
+    const camera = perspective(1600, 1000, 100);
+    // Centre beside the eye (|c| = 3 > r = 2), its front part reaching into the
+    // right edge of the view: partly on screen, but nowhere near full-buffer.
+    const { areaPx, onScreen } = projectSphereAreaPx({ x: 3, y: 0, z: 0 }, 2, camera, 1600, 1000);
+    expect(onScreen).toBe(true);
+    expect(areaPx).toBeGreaterThan(0);
+    expect(areaPx).toBeLessThan(0.5 * 1_600_000);
+  });
+
   it('handles an orthographic camera without the depth division', () => {
     const camera = new THREE.OrthographicCamera(-10, 10, 5, -5, 0.1, 100);
     camera.updateProjectionMatrix();
@@ -80,10 +120,79 @@ describe('projectSphereAreaPx', () => {
     const { areaPx } = projectSphereAreaPx({ x: 0, y: 0, z: -50 }, 5, camera, 1600, 1000);
     expect(areaPx).toBeCloseTo(Math.PI * 400 * 500, 3);
   });
+
+  it('uses perspective view offsets when testing whether a sphere is on-screen', () => {
+    const camera = perspective(1000, 1000, 0);
+    camera.setViewOffset(2000, 2000, 0, 0, 1000, 1000);
+    const outside = projectSphereAreaPx({ x: 1, y: 0, z: -10 }, 0.1, camera, 1000, 1000);
+    const inside = projectSphereAreaPx({ x: -3, y: 3, z: -10 }, 0.1, camera, 1000, 1000);
+    const centred = perspective(1000, 1000, 0);
+    centred.setViewOffset(2000, 2000, 500, 500, 1000, 1000);
+    const centredArea = projectSphereAreaPx(
+      { x: 0, y: 0, z: -10 },
+      0.1,
+      centred,
+      1000,
+      1000
+    ).areaPx;
+
+    expect(outside).toEqual({ areaPx: 0, onScreen: false });
+    expect(inside.onScreen).toBe(true);
+    expect(inside.areaPx).toBeGreaterThan(0);
+    expect(inside.areaPx).toBeCloseTo(centredArea);
+  });
 });
 
 describe('ProjectedDensityTracker', () => {
   afterEach(() => getProjectedDensityTracker().reset());
+
+  it('measures from the shared view snapshot when one is injected', () => {
+    const root = new THREE.Scene();
+    root.add(node('/dense', 1, 1_000_000));
+    root.updateMatrixWorld(true);
+    const near = perspective(1600, 1000, 100);
+    const far = perspective(1600, 1000, 200);
+    const views = new ViewContextProvider({
+      getCamera: () => near,
+      getViewportCss: () => null,
+      getDrawingBuffer: () => ({ width: 1600, height: 1000 }),
+    });
+    const own = new ProjectedDensityTracker();
+    own.configure({
+      enabled: () => true,
+      getRoot: () => root,
+      getCamera: () => near,
+      getDrawingBufferSize: () => ({ width: 1600, height: 1000 }),
+    });
+    const shared = new ProjectedDensityTracker();
+    shared.configure({
+      enabled: () => true,
+      getRoot: () => root,
+      // The getters disagree with the snapshot; the snapshot wins.
+      getCamera: () => far,
+      getDrawingBufferSize: () => ({ width: 10, height: 10 }),
+      getViewContext: () => views.get(),
+    });
+    expect(own.evaluate()).toBe(true);
+    expect(shared.evaluate()).toBe(true);
+    expect(shared.get('/dense')!.areaPx).toBe(own.get('/dense')!.areaPx);
+
+    // No drawing buffer in the snapshot → no evaluation.
+    const empty = new ViewContextProvider({
+      getCamera: () => near,
+      getViewportCss: () => null,
+      getDrawingBuffer: () => null,
+    });
+    const blind = new ProjectedDensityTracker();
+    blind.configure({
+      enabled: () => true,
+      getRoot: () => root,
+      getCamera: () => near,
+      getDrawingBufferSize: () => ({ width: 1600, height: 1000 }),
+      getViewContext: () => empty.get(),
+    });
+    expect(blind.evaluate()).toBe(false);
+  });
 
   it('measures elements per drawing-buffer pixel for committed, named emissive meshes only', () => {
     const root = new THREE.Scene();

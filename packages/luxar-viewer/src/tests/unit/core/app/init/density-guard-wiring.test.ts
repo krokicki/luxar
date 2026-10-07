@@ -116,7 +116,8 @@ describe('wireDensityGuard', () => {
     const wiring = wireDensityGuard(deps);
     const mesh = deps.sceneManager.scene!.children[0] as THREE.Mesh;
 
-    wiring.perFrame();
+    // Returns true on the frame the keep step changed (render-on-change).
+    expect(wiring.perFrame()).toBe(true);
     // 1 M points in a ~235 px footprint → floor of the ladder.
     expect(mesh.userData.densityKeep).toBe(densityGuardConfig.minKeepFraction);
     expect(deps.spies.notify).toHaveBeenCalledTimes(1);
@@ -128,11 +129,29 @@ describe('wireDensityGuard', () => {
     expect(sample!.areaPx).toBeGreaterThan(0);
     expect(wiring.thinning()).toEqual({ nodes: 1, minKeep: densityGuardConfig.minKeepFraction });
 
-    // Steady state: no further content-change signal, resume still polled.
-    wiring.perFrame();
+    // Steady state: no further content-change signal, resume still polled,
+    // and nothing drawn changed.
+    expect(wiring.perFrame()).toBe(false);
     expect(deps.spies.notify).toHaveBeenCalledTimes(1);
     expect(deps.spies.render).toHaveBeenCalledTimes(1);
     expect(deps.spies.resume).toHaveBeenCalledTimes(2);
+  });
+
+  it('a keep step invalidates the cached pick buffer, even with a still camera', () => {
+    // The pick pass drops exactly the elements the visual pass drops (same
+    // hash, synced uDensityDrop), but only when it re-renders. A guard step
+    // with no camera motion dirtied nothing the picking system listens to, so
+    // hover kept resolving against the pre-step buffer: thinned-away elements
+    // stayed pickable, and restored ones were not.
+    const invalidatePickBuffer = vi.fn();
+    const deps = makeDeps({ invalidatePickBuffer } as Partial<DensityGuardWiringDeps>);
+    const wiring = wireDensityGuard(deps);
+
+    expect(wiring.perFrame()).toBe(true);
+    expect(invalidatePickBuffer).toHaveBeenCalledTimes(1);
+    // Steady state: no step, no invalidation.
+    expect(wiring.perFrame()).toBe(false);
+    expect(invalidatePickBuffer).toHaveBeenCalledTimes(1);
   });
 
   it('is inert when disabled: null provider, no evaluation, no thinning', () => {

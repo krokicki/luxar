@@ -15,7 +15,7 @@
  * gsplats, points, lines and mesh; needsDepthSort on the live mode).
  *
  * Per-frame protocol (driven by `evaluateDepthSortPerFrame`):
- * 1. {@link clearRenderOrderFrameState} at the top of the frame,
+ * 1. {@link beginRenderOrderFrame} at the top of the frame,
  * 2. {@link collectRenderOrderSlot} once per surviving sorted-mode mesh,
  * 3. {@link assignGlobalRenderOrder} after the loop.
  *
@@ -302,19 +302,17 @@ function bspAxisToComponent(
 }
 
 /**
- * Live display-dims accessor, injected by `configureDepthSort` from the app
- * layer. NOT a direct `sceneDimsManager` import: `rendering/` must not depend
- * on `scene/` (`layer-rendering-no-upward`), and the same dependency inversion
- * already carries `getCamera` here and `getDisplayDims` into the LOD registry.
+ * Live display-dims accessor of the coordinator whose pass is running, handed
+ * in by {@link beginRenderOrderFrame}. Frame-scoped because the coordinator is
+ * per host while this module's per-frame containers are shared: each pass runs
+ * clear → collect → assign synchronously, so the accessor installed at the
+ * start of a pass is the one every lookup in that pass sees. NOT a direct
+ * `sceneDimsManager` import: `rendering/` must not depend on `scene/`
+ * (`layer-rendering-no-upward`), and the same dependency inversion already
+ * carries `getCamera` into the coordinator and `getDisplayDims` into the LOD
+ * registry.
  */
 let getDisplayDims: (() => readonly number[] | null) | null = null;
-
-/** Wire the display-dims accessor (see {@link bspAxisToComponent}). */
-export function setRenderOrderDisplayDimsAccessor(
-  accessor: (() => readonly number[] | null) | null
-): void {
-  getDisplayDims = accessor;
-}
 
 /** Identity center-column → component map for the common `[0, 1, 2]` case. */
 const IDENTITY_AXIS_MAP: readonly number[] = [0, 1, 2];
@@ -450,7 +448,7 @@ function wrapperPartRanks(
 }
 
 /**
- * One order-pass entry per visible sorted-mode gsplat mesh, rebuilt every
+ * One order-pass entry per visible sorted-mode mesh, rebuilt every
  * frame (fresh array per frame — a grow-only pool would pin disposed
  * meshes across frames; counts are tens).
  */
@@ -860,21 +858,32 @@ function orderGroupsWithContainment(byDepth: OrderGroup[]): OrderGroup[] {
 }
 
 /**
- * Reset the per-frame containers. Called FIRST in
- * `evaluateDepthSortPerFrame` — before any early-return — so a
- * disposed/dataset-switched frame can't leave the module-scoped cache
- * holding stale partition-wrapper subtrees alive; and from
- * `disposeDepthSort` (module-state reset completeness — an embedder that
- * disposes and re-inits in one page must not have the old scene pinned).
+ * Reset the per-frame containers and drop the display-dims accessor. Called
+ * from `DepthSortCoordinator.dispose` (module-state reset completeness — an
+ * embedder that disposes and re-inits in one page must not have the old scene,
+ * or the old app's accessor closure, pinned).
  */
 export function clearRenderOrderFrameState(): void {
   partitionRankCache.clear();
   orderSlots = [];
+  getDisplayDims = null;
+}
+
+/**
+ * Start one coordinator's render-order pass: reset the per-frame containers
+ * and install that coordinator's display-dims accessor (the module-private
+ * `getDisplayDims`). Called FIRST in `evaluateDepthSortPerFrame` — before
+ * any early-return — so a disposed/dataset-switched frame can't leave the
+ * module-scoped cache holding stale partition-wrapper subtrees alive.
+ */
+export function beginRenderOrderFrame(displayDims: (() => readonly number[] | null) | null): void {
+  clearRenderOrderFrameState();
+  getDisplayDims = displayDims;
 }
 
 /**
  * COLLECT half of the cross-node ordering: record one order slot for a
- * visible sorted-mode gsplat mesh. `mv` is the mesh's model-view matrix
+ * visible sorted-mode mesh. `mv` is the mesh's model-view matrix
  * and `camPos` the camera world position, both computed by the caller's
  * per-frame loop (shared with the re-sort trigger math).
  *
@@ -1041,11 +1050,15 @@ export function authoredLayerOrder(mesh: THREE.Mesh): number | undefined {
  * and draw before the globally-farthest sorted mesh. Depth interleaving
  * with unsorted content stays out of scope, unchanged from the
  * per-wrapper scheme this replaces.
+ *
+ * @returns true when any mesh's renderOrder changed — the render-on-change
+ *   loop redraws on it (a draw-order change with no camera motion, e.g. a
+ *   layer entering a sorted mode)
  */
-export function assignGlobalRenderOrder(): void {
+export function assignGlobalRenderOrder(): boolean {
   const slots = orderSlots;
   orderSlots = [];
-  if (slots.length === 0) return;
+  if (slots.length === 0) return false;
 
   // Group by wrapper/leaf identity (insertion order is stable).
   const groups = new Map<THREE.Object3D, OrderGroup>();
@@ -1092,11 +1105,17 @@ export function assignGlobalRenderOrder(): void {
   const ordered = orderGroupsWithContainment(byDepth);
   warnBucketOrderConflict(ordered);
 
-  assignRenderOrderRanks(ordered);
+  return assignRenderOrderRanks(ordered);
 }
 
-/** Write the already ordered groups onto one renderOrder scale, reserving 0. */
-function assignRenderOrderRanks(ordered: OrderGroup[]): void {
+/**
+ * Write the already ordered groups onto one renderOrder scale, reserving 0.
+ *
+ * @returns true when any mesh's renderOrder changed (the draw order differs
+ *   from the last rendered frame's, so the frame must be redrawn)
+ */
+function assignRenderOrderRanks(ordered: OrderGroup[]): boolean {
+  let changed = false;
   let prefixSize = 0;
   let negativePrefixSize = 0;
   for (const group of ordered) {
@@ -1124,7 +1143,9 @@ function assignRenderOrderRanks(ordered: OrderGroup[]): void {
     );
     for (const slot of group.slots) {
       if (nextRank === 0) nextRank = 1;
+      if (slot.mesh.renderOrder !== nextRank) changed = true;
       slot.mesh.renderOrder = nextRank++;
     }
   }
+  return changed;
 }

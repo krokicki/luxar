@@ -43,7 +43,7 @@ import { SceneGraphModel } from './data-loading-monitor/scene-graph-model';
 import { updateSceneGraphBadges } from './data-loading-monitor/tabs/scene-graph-badges';
 import { compactTooltip, presentHeadlineCounts } from './data-loading-monitor/headline-counts';
 import { escapeHtml } from '../utils/escape-html';
-import { log, Modules } from '../utils/log';
+import { log, LogEmoji, Modules } from '../utils/log';
 import { config } from '../config';
 import { notifier } from '../utils/cross-layer/notifier';
 import type { FailedLoadsProviderPort } from '../data/scene-loader-monitor-port';
@@ -83,9 +83,6 @@ import {
 } from './data-loading-monitor/timing-panel';
 
 import type { UpdateProfiler } from '../profiling/update-profiler';
-// A session whose SortWorker never came up draws every order-dependent
-// layer in storage order; without this the only trace is one console error.
-import { isDepthSortAvailable } from '../rendering/depth-sort-coordinator';
 import type { PooledGeometryType, AccumulatorProvider } from '../types/data-monitor-types';
 import type { GeometryTypeName } from '../types/format-contract';
 
@@ -202,7 +199,7 @@ export class DataLoadingMonitor {
    * Connect a loader for monitoring
    */
   public connectLoader(path: string, loader: LoaderMonitor): void {
-    log.info(Modules.DATA_MONITOR, `Connecting loader for ${path}`);
+    log.verbose(LogEmoji.INFO, Modules.DATA_MONITOR, `Connecting loader for ${path}`);
 
     this.loaders.set(path, loader);
     loader.addEventListener(this.eventListener);
@@ -355,6 +352,25 @@ export class DataLoadingMonitor {
    */
   public setDensityProvider(provider: DensityProvider | null): void {
     this.providers.setDensityProvider(provider);
+  }
+
+  /**
+   * The app's depth-sort verdict (`DepthSortCoordinator.isAvailable`) for the
+   * performance tab's footer note: a session whose SortWorker never came up
+   * draws every order-dependent layer in storage order, and without the note
+   * the only trace is one console error. App-scoped like the density provider:
+   * wired once by the init pipeline and kept across scene switches. Unwired,
+   * the monitor reports sorting as available (no note).
+   */
+  public setDepthSortAvailabilityProvider(provider: (() => boolean) | null): void {
+    this.depthSortAvailable = provider;
+  }
+
+  private depthSortAvailable: (() => boolean) | null = null;
+
+  /** Whether to show the depth-sort degrade note. */
+  private depthSortUnavailable(): boolean {
+    return this.depthSortAvailable?.() === false;
   }
 
   /**
@@ -1041,8 +1057,10 @@ export class DataLoadingMonitor {
     // is part of that HTML — so any change in the failed set or the
     // retry-in-flight flag must mark the structure dirty, or the banner
     // appears/disappears/disables only on the next unrelated rebuild.
+    const provider = this.providers.failedLoadsProvider;
+    const version = provider?.getFailedLoadsVersion?.();
     const failedLoadsSignature =
-      (this.providers.failedLoadsProvider?.getFailedPaths() ?? []).join('|') +
+      (version === undefined ? (provider?.getFailedPaths() ?? []).join('|') : `v${version}`) +
       (this.retryFailedLoadsInFlight ? '#retrying' : '');
     if (failedLoadsSignature !== this.lastFailedLoadsSignature) {
       this.lastFailedLoadsSignature = failedLoadsSignature;
@@ -1093,7 +1111,7 @@ export class DataLoadingMonitor {
                 timingData,
                 refinementData,
                 depthSortData,
-                !isDepthSortAvailable()
+                this.depthSortUnavailable()
               );
             }
           }
@@ -1382,7 +1400,7 @@ export class DataLoadingMonitor {
           timingData,
           this.providers.profiler?.getRefinementTimings(),
           this.providers.profiler?.getDepthSortTimings(),
-          !isDepthSortAvailable()
+          this.depthSortUnavailable()
         )}
       </div>
     `;

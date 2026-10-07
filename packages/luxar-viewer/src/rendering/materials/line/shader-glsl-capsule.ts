@@ -25,8 +25,11 @@
 import {
   GLSL_SANITIZE_FUNCTIONS,
   GLSL_NEAR_FADE_FUNCTIONS,
+  GLSL_PROJECTION_FUNCTIONS,
+  GLSL_LINE_SCALE,
   GLSL_LINE_JOINT_CODE,
   GLSL_SORTED_INDEX,
+  GLSL_DENSITY_ALPHA,
 } from '../_shared/glsl-lib';
 import {
   GLSL_GLASS_PARTITION_GUARD,
@@ -63,6 +66,8 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
 
     ${GLSL_SANITIZE_FUNCTIONS}
     ${GLSL_NEAR_FADE_FUNCTIONS}
+    ${GLSL_PROJECTION_FUNCTIONS}
+    ${GLSL_LINE_SCALE}
     ${GLSL_LINE_JOINT_CODE}
 
     in vec2 aQuadCorner;
@@ -72,11 +77,8 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
     uniform highp sampler2D uLineTex;
     uniform vec2 uResolution;
     uniform float uPixelRatio;
-    uniform int uIsOrtho;
     uniform float uNearCull;
     uniform float uMaxLinePixelWidth;
-    uniform float uPerspectiveLineScale;
-    uniform float uOrthoLineScale;
 
     // Stencil-LOCAL coordinates + attributes as INTERPOLATED varyings —
     // the fragment reads everything pre-blended by the rasterizer instead
@@ -141,6 +143,10 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
     }
 
     void main() {
+      // Line pixel-width scale for this draw: resY * |P11| (glsl-lib GLSL_LINE_SCALE).
+      luxarLineScale = uResolution.y * luxarProjectionSizeScale();
+      // Ortho branch from the projection this draw uses (glsl-lib GLSL_LINE_SCALE).
+      luxarLineIsOrtho = luxarIsOrthoProjection();
       int lineBase = int(luxarSortedIndex()) * 6;
       int lineTexW = LUXAR_LINE_TEX_W;
       ivec2 texel0 = ivec2(lineBase % lineTexW, lineBase / lineTexW);
@@ -156,7 +162,7 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
       float endDepth = -mvEnd.z;
       // Projected-density thinning (density-guard) rides the both-behind cull
       // so the varyings are zeroed identically.
-      if (luxarDensityDropped() || ((uIsOrtho == 0) && startDepth < nearCull && endDepth < nearCull)) {
+      if (luxarDensityDropped() || ((luxarLineIsOrtho == 0) && startDepth < nearCull && endDepth < nearCull)) {
         gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
         vLocal = vec2(0.0);
         vCutN = vec4(-1.0, 0.0, 1.0, 0.0);
@@ -176,7 +182,7 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
       // behind the near plane, which the cut construction must know.
       float tA = 0.0;
       float tB = 1.0;
-      if (uIsOrtho == 0) {
+      if (luxarLineIsOrtho == 0) {
         if (startDepth < nearCull && endDepth >= nearCull) {
           tA = (nearCull - startDepth) / (endDepth - startDepth);
         } else if (endDepth < nearCull && startDepth >= nearCull) {
@@ -212,12 +218,12 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
       // half-width, floored for AA and clamped like the quad.
       float rawA;
       float rawB;
-      if (uIsOrtho == 1) {
-        rawA = wEffA * uOrthoLineScale * ${G.RADIUS_FACTOR};
-        rawB = wEffB * uOrthoLineScale * ${G.RADIUS_FACTOR};
+      if (luxarLineIsOrtho == 1) {
+        rawA = wEffA * luxarLineScale * ${G.RADIUS_FACTOR};
+        rawB = wEffB * luxarLineScale * ${G.RADIUS_FACTOR};
       } else {
-        rawA = wEffA * uPerspectiveLineScale * ${G.RADIUS_FACTOR} / max(-mvStart.z, nearCull);
-        rawB = wEffB * uPerspectiveLineScale * ${G.RADIUS_FACTOR} / max(-mvEnd.z, nearCull);
+        rawA = wEffA * luxarLineScale * ${G.RADIUS_FACTOR} / max(-mvStart.z, nearCull);
+        rawB = wEffB * luxarLineScale * ${G.RADIUS_FACTOR} / max(-mvEnd.z, nearCull);
       }
       float appearancePixelRatio = max(uPixelRatio, 1.0);
       float minRadius = ${G.MIN_RADIUS} * appearancePixelRatio;
@@ -274,7 +280,7 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
           // normal (razor seams when zoomed into a joint).
           vec4 mvFarA = modelViewMatrix * vec4(farA.xyz, 1.0);
           float farDepthA = -mvFarA.z;
-          if (uIsOrtho == 0 && farDepthA < nearCull) {
+          if (luxarLineIsOrtho == 0 && farDepthA < nearCull) {
             float tF = (startDepth - nearCull) / max(startDepth - farDepthA, 1e-20);
             mvFarA = mix(mvStart, mvFarA, clamp(tF, 0.0, 1.0));
           }
@@ -303,10 +309,10 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
                     (dot(qq / ql, u) > 0.5 && min(rawA, rawB) >= minRadius)) {
                   float wFarA = farA.w;
                   float rpFarA;
-                  if (uIsOrtho == 1) {
-                    rpFarA = wFarA * uOrthoLineScale * ${G.RADIUS_FACTOR};
+                  if (luxarLineIsOrtho == 1) {
+                    rpFarA = wFarA * luxarLineScale * ${G.RADIUS_FACTOR};
                   } else {
-                    rpFarA = wFarA * uPerspectiveLineScale * ${G.RADIUS_FACTOR} / max(-mvFarA.z, nearCull);
+                    rpFarA = wFarA * luxarLineScale * ${G.RADIUS_FACTOR} / max(-mvFarA.z, nearCull);
                   }
                   rpFarA = clamp(rpFarA, minRadius, uMaxLinePixelWidth);
                   // Packet gate (#1495, #1501): a hard cut is only exact
@@ -356,7 +362,7 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
         if (farB.w >= 0.0) {
           vec4 mvFarB = modelViewMatrix * vec4(farB.xyz, 1.0);
           float farDepthB = -mvFarB.z;
-          if (uIsOrtho == 0 && farDepthB < nearCull) {
+          if (luxarLineIsOrtho == 0 && farDepthB < nearCull) {
             float tF = (endDepth - nearCull) / max(endDepth - farDepthB, 1e-20);
             mvFarB = mix(mvEnd, mvFarB, clamp(tF, 0.0, 1.0));
           }
@@ -375,10 +381,10 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
                     (dot(qq / ql, u) < -0.5 && min(rawA, rawB) >= minRadius)) {
                   float wFarB = farB.w;
                   float rpFarB;
-                  if (uIsOrtho == 1) {
-                    rpFarB = wFarB * uOrthoLineScale * ${G.RADIUS_FACTOR};
+                  if (luxarLineIsOrtho == 1) {
+                    rpFarB = wFarB * luxarLineScale * ${G.RADIUS_FACTOR};
                   } else {
-                    rpFarB = wFarB * uPerspectiveLineScale * ${G.RADIUS_FACTOR} / max(-mvFarB.z, nearCull);
+                    rpFarB = wFarB * luxarLineScale * ${G.RADIUS_FACTOR} / max(-mvFarB.z, nearCull);
                   }
                   rpFarB = clamp(rpFarB, minRadius, uMaxLinePixelWidth);
                   // Packet gate (#1495, #1501): a hard cut is only exact
@@ -451,7 +457,7 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
       // widthScale rule).
       float rawC = mix(rawA, rawB, tc);
       float widthScale = min(rawC / minRadius, 1.0);
-      float fade = perspectiveNearFade(uIsOrtho, mix(mvStart.z, mvEnd.z, tc), nearCull);
+      float fade = perspectiveNearFade(luxarLineIsOrtho, mix(mvStart.z, mvEnd.z, tc), nearCull);
       vFade = fade * widthScale;
       vAlpha = mix(sanitizeAlpha(lineT5.z), sanitizeAlpha(lineT5.w), tOrig);
       vSharp = mix(s0, s1, tOrig);
@@ -475,6 +481,7 @@ export const CAPSULE_LINE_VERTEX_SHADER = /* glsl */ `
 export const CAPSULE_LINE_FRAGMENT_SHADER = /* glsl */ `
     precision highp float;
     ${GLSL_GLASS_PARTITION_UNIFORMS}
+    ${GLSL_DENSITY_ALPHA}
 
     uniform float uOpacity;
     uniform float uInvGamma;
@@ -681,7 +688,8 @@ export const CAPSULE_LINE_FRAGMENT_SHADER = /* glsl */ `
       float a = intensity * uOpacity;
       fragColor = vec4(gammaColor * a, a);
       #else
-      fragColor = vec4(gammaColor, intensity * uOpacity);
+      // Density-guard alpha-over compensation — identical to the quad's.
+      fragColor = vec4(gammaColor, luxarDensityAlpha(intensity * uOpacity));
       #endif
     }
 `;
@@ -691,13 +699,11 @@ export const CAPSULE_LINE_SOURCE: ShaderSource = {
   webgl: { vertex: CAPSULE_LINE_VERTEX_SHADER, fragment: CAPSULE_LINE_FRAGMENT_SHADER },
   webgpu: (uniforms: Record<string, unknown>) => {
     const u = uniforms as Record<string, import('three').IUniform>;
-    // Projection mode at build time (see LINE_SOURCE's note). No join
-    // handling: the capsule has no miter geometry. Default config
-    // otherwise — harness consumers needing USE_COLORMAP or mode variants
+    // The projection is read per draw (see LINE_SOURCE's note). No join
+    // handling: the capsule has no miter geometry. Default config — harness consumers needing USE_COLORMAP or mode variants
     // call `capsuleLineWebGPUFactory` directly with explicit flags.
-    const isOrtho = ((u.uIsOrtho?.value as number) ?? 0) === 1;
     const { capsuleLineWebGPUFactory, buildLineTSLNodesFromUniforms } =
       requireTslMaterials().factories.capsuleLine;
-    return capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(u, {}), { isOrtho });
+    return capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(u, {}));
   },
 };

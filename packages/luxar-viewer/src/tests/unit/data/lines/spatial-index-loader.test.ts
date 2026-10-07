@@ -25,6 +25,7 @@ import type { MonitorEvent, MonitorEventListener } from '../../../../types/data-
 import { makeMockZarrLocation } from '../../../builders/spatial-loader-fixtures';
 import { SliceCache } from '../../../../cache/slice-cache';
 import { measureLodBytes } from '../../../../data/loaders/progressive/slice-cache-helper';
+import { LoaderLifetime } from '../../../../data/loaders/loader-lifetime';
 
 vi.mock('zarrita', () => ({
   registry: {},
@@ -171,12 +172,48 @@ describe('LinesSpatialIndexLoader', () => {
     let mockZarrLocation: { resolve: ReturnType<typeof vi.fn> };
     let mockNode: SceneNode;
     let mockArrays: {
-      vertices: { shape: number[]; dtype: string; attrs?: object };
-      segments: { shape: number[]; dtype: string; attrs?: object };
-      widths: { shape: number[]; dtype: string; attrs?: object };
-      colors: { shape: number[]; dtype: string; attrs?: object };
-      sharpness: { shape: number[]; dtype: string; attrs?: object };
-      scalars: { shape: number[]; dtype: string; attrs?: object };
+      vertices: {
+        shape: number[];
+        dtype: string;
+        attrs?: object;
+        chunks?: number[];
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
+      segments: {
+        shape: number[];
+        dtype: string;
+        attrs?: object;
+        chunks?: number[];
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
+      widths: {
+        shape: number[];
+        dtype: string;
+        attrs?: object;
+        chunks?: number[];
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
+      colors: {
+        shape: number[];
+        dtype: string;
+        attrs?: object;
+        chunks?: number[];
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
+      sharpness: {
+        shape: number[];
+        dtype: string;
+        attrs?: object;
+        chunks?: number[];
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
+      scalars: {
+        shape: number[];
+        dtype: string;
+        attrs?: object;
+        chunks?: number[];
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
     };
     let vertexBoundsArray: { shape: number[]; dtype: string; attrs: object };
     let segmentBoundsArray: { shape: number[]; dtype: string; attrs: object };
@@ -194,6 +231,14 @@ describe('LinesSpatialIndexLoader', () => {
         sharpness: { shape: [1000], dtype: 'float32', attrs: {} },
         scalars: { shape: [1000], dtype: 'float32', attrs: {} },
       };
+      // Prefetch warms chunk-by-chunk through getChunk (never zarr.get): give
+      // every attribute mock a chunk grid (100 rows) and a counting getChunk.
+      for (const arr of Object.values(mockArrays)) {
+        arr.chunks = arr.shape.length > 1 ? [100, arr.shape[1]] : [100];
+        arr.getChunk = vi
+          .fn()
+          .mockResolvedValue({ data: new Float32Array(1), shape: [1], stride: [1] });
+      }
 
       mockZarrLocation = makeMockZarrLocation();
       mockNode = makeLinesNode();
@@ -261,6 +306,7 @@ describe('LinesSpatialIndexLoader', () => {
 
     afterEach(() => {
       bodyLoader?.dispose();
+      vi.restoreAllMocks();
     });
 
     // ────────────────────────────────────────────────────────────────
@@ -1091,7 +1137,31 @@ describe('LinesSpatialIndexLoader', () => {
     });
 
     describe('prefetchChunks (commit 8.2)', () => {
-      it('warms the cache via zarr.get on every available array × range', async () => {
+      it('uses speculative priority for both prefetch entry points', async () => {
+        const init = vi.spyOn(LoaderLifetime.prototype, 'ensureInitialized');
+        const current: ViewState = {
+          displayDims: [0, 1, 2],
+          slicePosition: [0, 0, 0],
+          tolerance: [0, 0, 0],
+        };
+        await bodyLoader.prefetchChunks(current);
+        expect(init.mock.calls.at(-1)?.[3]).toBe('speculative');
+        await bodyLoader.prefetchChunkBoundary(current, current);
+        expect(init.mock.calls.length).toBeGreaterThan(1);
+        expect(init.mock.calls.every((call) => call[3] === 'speculative')).toBe(true);
+        init.mockRestore();
+      });
+
+      /** Chunk coords each array was warmed with (prefetch never calls get). */
+      const warmedCoords = (arr: any): string[] =>
+        (arr.getChunk.mock.calls as unknown[][]).map((call) => (call[0] as number[]).join(','));
+      const warmCalls = (): number =>
+        Object.values(mockArrays).reduce(
+          (n: number, arr: any) => n + (arr.getChunk.mock.calls.length as number),
+          0
+        );
+
+      it('warms each touched chunk of every available array (no zarr.get)', async () => {
         const viewState: ViewState = {
           displayDims: [0, 1, 2],
           slicePosition: [0, 0, 0],
@@ -1117,14 +1187,15 @@ describe('LinesSpatialIndexLoader', () => {
           metadata: { chunk_size: 100 },
         });
 
-        const reads = (zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls;
-        const segmentRead = reads.find((call) => call[0] === mockArrays.segments);
-        const vertexReads = reads.filter((call) => call[0] !== mockArrays.segments);
-        expect(segmentRead?.[1][0]).toEqual({ start: 10, end: 20 });
-        expect(vertexReads).toHaveLength(4);
-        expect(
-          vertexReads.every((call) => call[1][0].start === 100 && call[1][0].end === 120)
-        ).toBe(true);
+        // No output assembly: not a single get(). Segment rows [10, 20) sit in
+        // segment chunk 0; vertex rows [100, 120) in chunk 1 of each of the
+        // four vertex-indexed arrays.
+        expect((zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+        expect(warmedCoords(mockArrays.segments)).toEqual(['0,0']);
+        expect(warmedCoords(mockArrays.vertices)).toEqual(['1,0']);
+        expect(warmedCoords(mockArrays.widths)).toEqual(['1']);
+        expect(warmedCoords(mockArrays.colors)).toEqual(['1,0']);
+        expect(warmedCoords(mockArrays.sharpness)).toEqual(['1']);
       });
 
       it('warms scalar chunks for scalar-colored lines', async () => {
@@ -1143,11 +1214,7 @@ describe('LinesSpatialIndexLoader', () => {
           tolerance: [0, 0, 0],
         });
 
-        expect(
-          (zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls.some(
-            (call) => call[0] === mockArrays.scalars
-          )
-        ).toBe(true);
+        expect(mockArrays.scalars.getChunk!).toHaveBeenCalled();
       });
 
       it('skips fetches when the spatial query returns no ranges', async () => {
@@ -1159,7 +1226,7 @@ describe('LinesSpatialIndexLoader', () => {
           tolerance: [0, 0, 0],
         });
 
-        const callsBefore = (zarr.get as any).mock.calls.length;
+        const callsBefore = warmCalls();
 
         mockExecute.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
         await bodyLoader.prefetchChunks({
@@ -1168,7 +1235,7 @@ describe('LinesSpatialIndexLoader', () => {
           tolerance: [0, 0, 0],
         });
 
-        const callsAfter = (zarr.get as any).mock.calls.length;
+        const callsAfter = warmCalls();
         expect(callsAfter).toBe(callsBefore);
       });
 
@@ -1219,7 +1286,16 @@ describe('LinesSpatialIndexLoader', () => {
           SpatialQueryBuilder as unknown as ReturnType<typeof vi.fn>
         ).mock.calls.map((call) => (call[1] as ViewState).slicePosition[3]);
         expect(queriedTimes).toEqual([1, 1, 2, 2, 4, 4]);
-        expect((zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(12);
+        // Two warmed views; in each, rows [100, 200) touch one chunk of every
+        // array (segments 400, vertices 600, widths 800, colors/sharpness 1000).
+        expect(warmCalls()).toBe(10);
+        // The only get() calls are initialize()'s two chunk-bounds probes.
+        const attributeArrays = new Set<unknown>(Object.values(mockArrays));
+        expect(
+          (zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls.filter((call) =>
+            attributeArrays.has(call[0])
+          )
+        ).toHaveLength(0);
       });
 
       it('falls back to predicted-slice warming when boundary planning fails', async () => {
@@ -1244,11 +1320,71 @@ describe('LinesSpatialIndexLoader', () => {
           [0, 0, 1],
           [0, 0, 1],
         ]);
-        expect((zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(7);
+        // The predicted view alone: segment chunk 0 + chunk 1 of four vertex arrays.
+        expect(warmCalls()).toBe(5);
+      });
+
+      it('forwards the predicted-view signal to the warm-up it falls back to', async () => {
+        const current: ViewState = {
+          displayDims: [0, 1, 2],
+          slicePosition: [0, 0, 0],
+          tolerance: [0, 0, 0],
+        };
+        const predicted = { ...current, slicePosition: [0, 0, 1] };
+        mockExecute.mockRejectedValueOnce(new Error('malformed current view'));
+        mockExecute.mockResolvedValue([{ start: 10, end: 20 }]);
+        const spy = vi.spyOn(bodyLoader, 'prefetchChunks');
+        const signal = new AbortController().signal;
+
+        await bodyLoader.prefetchChunkBoundary(current, predicted, signal);
+
+        expect(spy).toHaveBeenCalledWith(predicted, signal);
       });
     });
 
     describe('resource cleanup', () => {
+      it('an initialize still in flight at dispose does not repopulate the loader', async () => {
+        // dispose() resets the one-shot initializer and clears the arrays, but an
+        // initialize() already awaiting its metadata opens used to finish afterwards
+        // and write chunkIndex / arrays back into the disposed loader.
+        const view: ViewState = {
+          displayDims: [0, 1, 2],
+          slicePosition: [0, 0, 0],
+          tolerance: [0, 0, 0],
+        };
+        const open = zarr.open as any;
+        const original = open.getMockImplementation() as (...args: unknown[]) => unknown;
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        open.mockImplementation((...args: unknown[]) => gate.then(() => original(...args)));
+        const load = bodyLoader.loadLines(view);
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+
+        bodyLoader.dispose();
+        release();
+
+        await expect(load).rejects.toMatchObject({ name: 'AbortError' });
+        expect((bodyLoader as any).chunkIndex).toBeNull();
+        expect((bodyLoader as any).arrays).toEqual({});
+      });
+
+      it('a disposed loader refuses to re-initialize', async () => {
+        bodyLoader.dispose();
+        (zarr.open as unknown as ReturnType<typeof vi.fn>).mockClear();
+        await expect(
+          bodyLoader.loadLines({
+            displayDims: [0, 1, 2],
+            slicePosition: [0, 0, 0],
+            tolerance: [0, 0, 0],
+          })
+        ).rejects.toMatchObject({
+          name: 'AbortError',
+        });
+        expect(zarr.open).not.toHaveBeenCalled();
+      });
+
       it('dispose clears the active-query map (mid-flight leak guard)', async () => {
         // Regression (×3 symmetric): points dispose() historically omitted
         // activeQueries.clear(), so a dispose mid-flight leaked the tracked

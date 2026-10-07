@@ -74,6 +74,7 @@ vi.mock('../../../../../data/zarr', () => ({
 }));
 
 import { SlicePrefetcher } from '../../../../../data/scene-loader/prefetch/slice-prefetcher';
+import { SceneNodeIndex } from '../../../../../data/scene-loader/view-state/scene-node-index';
 
 function makeNode(path: string, attrs: SceneNode['attrs'] = {}): SceneNode {
   return { path, type: 'gsplats', attrs, hasSpatialIndex: true, children: [] };
@@ -123,6 +124,7 @@ describe('SlicePrefetcher', () => {
     resolveObject = vi.fn((path) => objects.get(path));
     prefetcher = new SlicePrefetcher({
       getSceneGraph: () => graph,
+      getSceneNodeIndex: () => new SceneNodeIndex(graph),
       factoryDeps: () => ({ zarrStore: {} }) as never,
       registry: registry as never,
       applyEffectiveAttrs: (node) => node.attrs,
@@ -167,6 +169,7 @@ describe('SlicePrefetcher', () => {
     objects.get('/pts')!.userData.partitionFrustumVisible = false;
     prefetcher = new SlicePrefetcher({
       getSceneGraph: () => graph,
+      getSceneNodeIndex: () => new SceneNodeIndex(graph),
       factoryDeps: () => ({ zarrStore: {} }) as never,
       registry: registry as never,
       applyEffectiveAttrs: (node) => node.attrs,
@@ -298,6 +301,27 @@ describe('SlicePrefetcher', () => {
     // Playback end / dataset switch DOES tear the batch down.
     prefetcher.abortInFlight();
     expect(signal.aborted).toBe(true);
+  });
+
+  it('prefetchTargets warms a node registered after the in-flight batch began, under its signal', async () => {
+    prefetcher.prefetch(view, 10);
+    // A partition part activated for the predicted slice registers its loader
+    // while the batch runs (B4): the batch enumerated its nodes already.
+    graph.children!.push(makeNode('/tiled/part_1'));
+    registry.gsplatLoaders.set('/tiled/part_1', foregroundLoader as unknown as DataLoader);
+    objects.set('/tiled/part_1', new THREE.Group());
+    prefetcher.prefetchTargets(view, 10, undefined, new Set(['/tiled/part_1']));
+    // A second request for the same node while its pass runs does not overlap it.
+    prefetcher.prefetchTargets(view, 10, undefined, new Set(['/tiled']));
+    await flushAsync();
+
+    const part = shadowLoaders.get('/tiled/part_1')!;
+    expect(part.updateView).toHaveBeenCalledTimes(1);
+    // Only the target: the batch's nodes are not re-run.
+    expect(shadowLoaders.get('/splats')!.updateView).toHaveBeenCalledTimes(1);
+    // It joined the running batch, so playback end tears it down with the batch.
+    const batchSignal = shadowLoaders.get('/splats')!.updateView.mock.calls[0][2] as AbortSignal;
+    expect(part.updateView.mock.calls[0][2]).toBe(batchSignal);
   });
 
   it('re-targets on the NEXT tick once the in-flight batch has settled', async () => {

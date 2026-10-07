@@ -8,7 +8,7 @@
  */
 
 import type { BlendingMode } from './blending';
-import { LINE_TYPES, type LineTypeName, type OrderingMethodName } from './format-contract';
+import type { LineTypeName, OrderingMethodName } from './format-contract';
 import type { ViewState } from '../data/data-loader-types';
 import type { ScalarArray } from './points';
 import type { PositionBounds } from './zarr';
@@ -414,6 +414,15 @@ export interface ProcessedLinesData {
    * onto the loaded payload — that payload may be a SliceCache-owned snapshot.
    */
   elementIds?: Uint32Array;
+
+  /**
+   * The typed arrays are SHARED — retained by the post-projection stage cache
+   * (`data/scene-loader/process/projection-stage-cache.ts`) and handed to every
+   * later commit of the same slice. The commit must neither mutate nor
+   * transfer them (the lines commit already hands the depth sort a freshly
+   * computed midpoint array, never a view of these).
+   */
+  sharedBuffers?: boolean;
 }
 
 // ============================================================================
@@ -552,20 +561,6 @@ export interface LinesUserData {
 // ============================================================================
 
 /**
- * Check if metadata is for a Lines node.
- *
- * @param attrs - Unknown attributes object
- * @returns True if attrs is LinesMetadata
- */
-export function isLinesMetadata(attrs: unknown): attrs is LinesMetadata {
-  return (
-    typeof attrs === 'object' &&
-    attrs !== null &&
-    (attrs as Record<string, unknown>).type === 'lines'
-  );
-}
-
-/**
  * Check if userData indicates a Lines object.
  *
  * @param userData - THREE.Object3D userData
@@ -577,14 +572,4 @@ export function isLinesUserData(userData: unknown): userData is LinesUserData {
     userData !== null &&
     (userData as Record<string, unknown>).nodeType === 'lines'
   );
-}
-
-/**
- * Check if a line type is valid.
- *
- * @param lineType - String to check
- * @returns True if lineType is a valid LineType
- */
-export function isValidLineType(lineType: unknown): lineType is LineType {
-  return typeof lineType === 'string' && (LINE_TYPES as readonly string[]).includes(lineType);
 }

@@ -25,18 +25,11 @@ import {
   type PickResult,
 } from '../../../../rendering/picking/picking-system';
 import { MAX_PICK_NODE_ID } from '../../../../rendering/picking/picking-system/pick-render';
+import { LinePickingTSLMaterial } from '../../../../rendering/picking/line/material-tsl';
 import { buildPickResultHandler } from '../../../../core/app/picking/pick-result-handler';
 import { setElementIdMap } from '../../../../types/committed-data';
 import { log } from '../../../../utils/log';
-
-/** A promise plus its external `resolve` — lets a test gate when the readback completes. */
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((r) => {
-    resolve = r;
-  });
-  return { promise, resolve };
-}
+import { deferred } from '../../../helpers/deferred';
 
 function makeStubRenderer(): THREE.WebGLRenderer {
   // PickingSystem ctor + the lifecycle methods we test only need
@@ -67,7 +60,6 @@ function makeStubCapabilities(): import('../../../../rendering/renderer-capabili
     },
     maxMSAASamples: 0,
     pointSizeRange: [1, 64] as const,
-    readBackbufferPixels: vi.fn(),
   } as unknown as import('../../../../rendering/renderer-capabilities').RendererCapabilities;
 }
 
@@ -82,11 +74,10 @@ describe('computePickBufferSize', () => {
 
   it('caps the larger axis to MAX_PICK_BUFFER_DIM and scales the other to preserve aspect', () => {
     // 4K → half-res 1920×1080 → uniform scale 1024/1920 → 1024×576.
-    // Aspect preservation is load-bearing: the gsplat pick shader maps
-    // view space to pixels with uFx == uFy (square-pixel assumption), so
-    // a pick buffer with a different aspect than the camera displaces
-    // gsplat picks horizontally (points/lines go through the
-    // aspect-aware projectionMatrix and were unaffected).
+    // Aspect preservation keeps the pick buffer a uniform downscale of the
+    // view. (It was once load-bearing for gsplats, whose pick shader mapped
+    // view space with a square-pixel focal length; all four types now go
+    // through the aspect-aware projectionMatrix.)
     expect(computePickBufferSize(3840, 2160)).toEqual({
       w: MAX_PICK_BUFFER_DIM,
       h: 576,
@@ -207,6 +198,24 @@ describe('PickingSystem — registration', () => {
     system.registerNode(new THREE.Object3D(), pickNode, system.allocatePickId());
     expect(pickNode.matrixAutoUpdate).toBe(false);
     expect(pickNode.matrixWorldAutoUpdate).toBe(false);
+  });
+
+  it('registerNode installs the per-draw projection-variant hook on a mesh pick node', () => {
+    // Every pick-node builder (createLinesNode, the retro-registration pass)
+    // goes through here, so the TSL pick quad cannot miss its variant hook.
+    const material = new LinePickingTSLMaterial({ nodeId: 1, primitive: 'screen-space' });
+    const pickNode = new THREE.Mesh(new THREE.BufferGeometry(), material);
+    system.registerNode(new THREE.Object3D(), pickNode, system.allocatePickId());
+    const persp = material.vertexNode;
+    pickNode.onBeforeRender(
+      {} as THREE.WebGLRenderer,
+      new THREE.Scene(),
+      new THREE.OrthographicCamera(),
+      pickNode.geometry,
+      material,
+      null as unknown as THREE.Group
+    );
+    expect(material.vertexNode).not.toBe(persp);
   });
 
   it('unregisterNode decrements registeredNodeCount', () => {
@@ -982,10 +991,10 @@ describe('PickingSystem — surface-pick depth sync', () => {
 
     renderPickBuffer();
 
+    // (resolution, nearCull, pixelRatio) — no FOV or camera kind: every pick
+    // shader reads its projection terms from the projection matrix.
     expect(updateCameraParams).toHaveBeenCalledWith(
-      expect.any(Number),
       expect.objectContaining({ x: 800, y: 300 }),
-      false,
       undefined,
       0.5
     );

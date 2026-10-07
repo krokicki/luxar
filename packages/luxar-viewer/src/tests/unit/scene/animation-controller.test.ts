@@ -35,6 +35,9 @@ vi.mock('../../../rendering/adaptive-dpr-manager', () => ({
 
 import { AnimationController } from '../../../scene/animation/animation-controller';
 import { config } from '../../../config';
+import { log } from '../../../utils/log';
+import { eventBus } from '../../../utils/cross-layer/event-bus';
+import { perfCounters } from '../../../profiling/perf-counters';
 
 describe('AnimationController', () => {
   let controller: AnimationController;
@@ -73,6 +76,20 @@ describe('AnimationController', () => {
     // Create controller with mock dependencies
     controller = new AnimationController(mockControls, mockPostProcessing);
   });
+
+  /**
+   * Run the frame the most recent requestAnimationFrame armed.
+   *
+   * `startAnimation()` on a stopped loop only ARMS the first frame (see
+   * RafDriver.start); nothing is drawn until the armed rAF callback fires.
+   * The rAF is a plain spy here, so a test that wants that first frame's
+   * effects runs it explicitly.
+   */
+  function runArmedFrame(): void {
+    const calls = mockRAF.mock.calls;
+    const callback = calls[calls.length - 1][0] as FrameRequestCallback;
+    callback(performance.now());
+  }
 
   afterEach(() => {
     controller.dispose();
@@ -119,8 +136,9 @@ describe('AnimationController', () => {
       controller.addPerFrameCallback('cb2', callback2);
 
       controller.startAnimation();
+      // startAnimation() only arms the first frame; run it.
+      runArmedFrame();
 
-      // The animate() is called synchronously from startAnimation
       expect(callback1).toHaveBeenCalledTimes(1);
       expect(callback2).toHaveBeenCalledTimes(1);
     });
@@ -131,6 +149,7 @@ describe('AnimationController', () => {
       controller.removePerFrameCallback('test');
 
       controller.startAnimation();
+      runArmedFrame();
 
       expect(callback).not.toHaveBeenCalled();
     });
@@ -142,9 +161,184 @@ describe('AnimationController', () => {
       controller.addPerFrameCallback('test', callback2);
 
       controller.startAnimation();
+      runArmedFrame();
 
       expect(callback1).not.toHaveBeenCalled();
       expect(callback2).toHaveBeenCalled();
+    });
+  });
+
+  describe('frame phases', () => {
+    const order: string[] = [];
+    const push = (name: string) => (): boolean => {
+      order.push(name);
+      return false;
+    };
+
+    beforeEach(() => {
+      order.length = 0;
+    });
+
+    it('runs camera → view → pre-render → ui whatever the registration order', () => {
+      controller.addPerFrameCallback('ui', push('ui'), { phase: 'ui' });
+      controller.addPerFrameCallback('pre', push('pre-render'), { phase: 'pre-render' });
+      controller.addPerFrameCallback('view', push('view'), { phase: 'view' });
+      controller.addPerFrameCallback('cam', push('camera'), { phase: 'camera' });
+
+      controller.tick();
+
+      expect(order).toEqual(['camera', 'view', 'pre-render', 'ui']);
+    });
+
+    it('defaults to the view phase and keeps registration order within a phase', () => {
+      controller.addPerFrameCallback('v1', push('v1'));
+      controller.addPerFrameCallback('ui', push('ui'), { phase: 'ui' });
+      controller.addPerFrameCallback('v2', push('v2'), { phase: 'view' });
+      controller.addPerFrameCallback('v3', push('v3'));
+
+      controller.tick();
+
+      expect(order).toEqual(['v1', 'v2', 'v3', 'ui']);
+    });
+
+    it('a camera writer registered after the view callbacks still runs before them', () => {
+      // The flight case: clipping/LOD register at init, the flight when it starts.
+      controller.addPerFrameCallback('dynamic-clipping', push('clipping'));
+      controller.addPerFrameCallback('lod', push('lod'));
+      controller.startAnimation();
+      order.length = 0;
+
+      controller.addPerFrameCallback('flight', push('flight'), { phase: 'camera' });
+      controller.tick();
+
+      expect(order).toEqual(['flight', 'clipping', 'lod']);
+    });
+
+    it('re-registering in the same phase keeps the position; a new phase moves it', () => {
+      controller.addPerFrameCallback('a', push('a'));
+      controller.addPerFrameCallback('b', push('b'));
+      controller.addPerFrameCallback('a', push('a2'));
+      controller.tick();
+      expect(order).toEqual(['a2', 'b']);
+
+      order.length = 0;
+      controller.addPerFrameCallback('b', push('b-camera'), { phase: 'camera' });
+      controller.tick();
+      expect(order).toEqual(['b-camera', 'a2']);
+      expect(controller.hasPerFrameCallback('b')).toBe(true);
+    });
+
+    it('removes a callback from whichever phase holds it', () => {
+      controller.addPerFrameCallback('cam', push('camera'), { phase: 'camera' });
+      controller.addPerFrameCallback('ui', push('ui'), { phase: 'ui' });
+
+      expect(controller.removePerFrameCallback('cam')).toBe(true);
+      expect(controller.removePerFrameCallback('cam')).toBe(false);
+      expect(controller.hasPerFrameCallback('cam')).toBe(false);
+      controller.tick();
+
+      expect(order).toEqual(['ui']);
+    });
+
+    it('keeps the mid-frame semantics: a later-phase add runs this frame, a pending removal is skipped', () => {
+      controller.addPerFrameCallback(
+        'cam',
+        () => {
+          order.push('camera');
+          controller.addPerFrameCallback('late-ui', push('late-ui'), { phase: 'ui' });
+          controller.removePerFrameCallback('doomed');
+          return false;
+        },
+        { phase: 'camera' }
+      );
+      controller.addPerFrameCallback('doomed', push('doomed'));
+
+      controller.tick();
+
+      expect(order).toEqual(['camera', 'late-ui']);
+    });
+
+    it('a continuous callback in any phase keeps the loop awake', () => {
+      controller.addPerFrameCallback('cam', () => false, { continuous: true, phase: 'camera' });
+      controller.startAnimation();
+
+      vi.advanceTimersByTime(config.animation.idleTimeoutMs + 10);
+
+      expect(controller.isActive).toBe(true);
+    });
+  });
+
+  describe('per-frame callback isolation', () => {
+    let logError: MockInstance;
+    const events: string[] = [];
+    let offs: Array<() => void> = [];
+
+    beforeEach(() => {
+      logError = vi.spyOn(log, 'error').mockImplementation(() => {});
+      events.length = 0;
+      offs = [
+        eventBus.on('frame-start', () => events.push('frame-start')),
+        eventBus.on('frame-end', () => events.push('frame-end')),
+      ];
+    });
+
+    afterEach(() => {
+      for (const off of offs) off();
+    });
+
+    it('a throwing callback does not skip the callbacks after it, or the render', () => {
+      const before = vi.fn();
+      const after = vi.fn();
+      controller.addPerFrameCallback('before', before);
+      controller.addPerFrameCallback('broken', () => {
+        throw new Error('broken subsystem');
+      });
+      controller.addPerFrameCallback('after', after);
+
+      // A dirty frame (render-on-change renders only when something changed).
+      controller.requestRender('test');
+      controller.tick();
+
+      expect(before).toHaveBeenCalledTimes(1);
+      expect(after).toHaveBeenCalledTimes(1);
+      expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
+      expect(events).toEqual(['frame-start', 'frame-end']);
+    });
+
+    it('logs a failing callback once, not once per frame', () => {
+      controller.addPerFrameCallback('broken', () => {
+        throw new Error('broken subsystem');
+      });
+
+      controller.tick();
+      controller.tick();
+      controller.tick();
+
+      expect(logError).toHaveBeenCalledTimes(1);
+      expect(String(logError.mock.calls[0][1])).toContain("'broken'");
+    });
+
+    it('a re-registered callback reports its own first failure', () => {
+      const broken = (): boolean => {
+        throw new Error('broken subsystem');
+      };
+      controller.addPerFrameCallback('broken', broken);
+      controller.tick();
+      controller.removePerFrameCallback('broken');
+      controller.addPerFrameCallback('broken', broken);
+      controller.tick();
+
+      expect(logError).toHaveBeenCalledTimes(2);
+    });
+
+    it('frame-end still pairs frame-start when the render throws', () => {
+      mockPostProcessing.render.mockImplementation(() => {
+        throw new Error('render failed');
+      });
+
+      controller.requestRender('test');
+      expect(() => controller.tick()).toThrow('render failed');
+      expect(events).toEqual(['frame-start', 'frame-end']);
     });
   });
 
@@ -156,8 +350,11 @@ describe('AnimationController', () => {
 
       controller.setAdaptiveDPRManager(mockDPRManager as any);
 
-      // Verify it's used during animation
+      // Verify it's used during animation. A sample measures the PREVIOUS
+      // tick, so the frame after the wake's rendered frame records it.
       controller.startAnimation();
+      runArmedFrame();
+      runArmedFrame();
 
       expect(mockDPRManager.recordFrame).toHaveBeenCalledWith(expect.any(Number));
     });
@@ -170,6 +367,8 @@ describe('AnimationController', () => {
       // Set manager and verify it's called during animation
       controller.setAdaptiveDPRManager(mockDPRManager as any);
       controller.startAnimation();
+      runArmedFrame();
+      runArmedFrame();
       expect(mockDPRManager.recordFrame).toHaveBeenCalled();
 
       // Clear the call history, set to null, then restart animation
@@ -177,6 +376,8 @@ describe('AnimationController', () => {
       controller.stopAnimation();
       controller.setAdaptiveDPRManager(null);
       controller.startAnimation();
+      runArmedFrame();
+      runArmedFrame();
 
       // Should not call recordFrame after null
       expect(mockDPRManager.recordFrame).not.toHaveBeenCalled();
@@ -203,21 +404,51 @@ describe('AnimationController', () => {
       controller.startAnimation();
       controller.startAnimation();
 
-      // animate() is called once in the first startAnimation
-      // The second startAnimation should not trigger another animate()
-      // since isAnimating is already true
-      // It only calls RAF once from the first animate() call
+      // The first startAnimation arms one frame; the second finds the loop
+      // already running and arms nothing more.
       expect(mockRAF).toHaveBeenCalledTimes(1);
+    });
+
+    it('startAnimation on a stopped loop arms the first frame and draws nothing synchronously', () => {
+      const callback = vi.fn();
+      const events: string[] = [];
+      const offStart = eventBus.on('frame-start', () => events.push('frame-start'));
+      const offEnd = eventBus.on('frame-end', () => events.push('frame-end'));
+      controller.addPerFrameCallback('cb', callback);
+
+      try {
+        controller.startAnimation();
+
+        // Armed, not run: the frame waits for the next animation frame.
+        expect(controller.isActive).toBe(true);
+        expect(mockRAF).toHaveBeenCalledTimes(1);
+        expect(mockControls.update).not.toHaveBeenCalled();
+        expect(callback).not.toHaveBeenCalled();
+        expect(mockPostProcessing.render).not.toHaveBeenCalled();
+        expect(events).toEqual([]);
+
+        // The armed rAF fires: exactly one frame.
+        runArmedFrame();
+        expect(mockControls.update).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
+        expect(events).toEqual(['frame-start', 'frame-end']);
+      } finally {
+        offStart();
+        offEnd();
+      }
     });
 
     it('should call controls.update during animation', () => {
       controller.startAnimation();
+      runArmedFrame();
 
       expect(mockControls.update).toHaveBeenCalledTimes(1);
     });
 
     it('should call postProcessing.render during animation', () => {
       controller.startAnimation();
+      runArmedFrame();
 
       expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
     });
@@ -232,7 +463,7 @@ describe('AnimationController', () => {
       const rafCallback = mockRAF.mock.calls[0][0] as FrameRequestCallback;
       expect(typeof rafCallback).toBe('function');
 
-      // Invoking the scheduled callback should run another animate() pass:
+      // Invoking the scheduled callback should run a frame:
       // - controls.update fires again
       // - postProcessing.render fires again
       // - rAF is re-scheduled
@@ -253,6 +484,7 @@ describe('AnimationController', () => {
     it('skips postProcessing.render() while context is lost', () => {
       controller.setContextLostPredicate(() => true);
       controller.startAnimation();
+      runArmedFrame();
 
       expect(mockControls.update).toHaveBeenCalledTimes(1);
       expect(mockPostProcessing.render).not.toHaveBeenCalled();
@@ -261,6 +493,7 @@ describe('AnimationController', () => {
     it('renders normally when context-lost predicate returns false', () => {
       controller.setContextLostPredicate(() => false);
       controller.startAnimation();
+      runArmedFrame();
 
       expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
     });
@@ -269,6 +502,7 @@ describe('AnimationController', () => {
       // Predicate is null by default — backward-compat for tests/embed
       // contexts that never lose the context.
       controller.startAnimation();
+      runArmedFrame();
       expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
     });
 
@@ -291,6 +525,7 @@ describe('AnimationController', () => {
 
       try {
         controller.startAnimation();
+        runArmedFrame();
 
         expect(mockControls.update).toHaveBeenCalledTimes(1);
         expect(callback).toHaveBeenCalledTimes(1);
@@ -314,6 +549,7 @@ describe('AnimationController', () => {
     it('renders normally when the render-skip predicate returns false', () => {
       controller.setRenderSkipPredicate(() => false);
       controller.startAnimation();
+      runArmedFrame();
 
       expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
     });
@@ -322,6 +558,7 @@ describe('AnimationController', () => {
       controller.setRenderSkipPredicate(() => true);
       controller.setRenderSkipPredicate(null);
       controller.startAnimation();
+      runArmedFrame();
 
       expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
     });
@@ -352,6 +589,69 @@ describe('AnimationController', () => {
       expect(mockControls.update.mock.calls.length).toBe(updateCallsBefore);
       expect(mockPostProcessing.render.mock.calls.length).toBe(renderCallsBefore);
       expect(controller.isActive).toBe(false);
+    });
+  });
+
+  describe('renderOnce', () => {
+    it('on a stopped loop runs exactly one frame synchronously and leaves the loop running', () => {
+      const callback = vi.fn();
+      controller.addPerFrameCallback('cb', callback);
+
+      controller.renderOnce();
+
+      expect(mockControls.update).toHaveBeenCalledTimes(1);
+      expect(callback).toHaveBeenCalledTimes(1);
+      expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
+      // The loop is running with its next frame armed, not drawn.
+      expect(controller.isActive).toBe(true);
+      expect(mockRAF).toHaveBeenCalledTimes(1);
+    });
+
+    it('on a running loop draws nothing extra and resets the idle timer', () => {
+      controller.startAnimation();
+      runArmedFrame();
+      expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
+      const rafCalls = mockRAF.mock.calls.length;
+
+      vi.advanceTimersByTime(1000);
+      controller.renderOnce();
+
+      // No synchronous frame: the running loop paints at its next frame.
+      expect(mockPostProcessing.render).toHaveBeenCalledTimes(1);
+      expect(mockRAF.mock.calls.length).toBe(rafCalls);
+
+      // Past the ORIGINAL idle deadline (2000ms after start) the loop is
+      // still alive, because renderOnce() restarted the countdown...
+      vi.advanceTimersByTime(1500);
+      expect(controller.isActive).toBe(true);
+      // ...and it idles once the reset countdown runs out.
+      vi.advanceTimersByTime(500);
+      expect(controller.isActive).toBe(false);
+    });
+  });
+
+  describe('prepareFrame', () => {
+    it('runs controls.update and the per-frame callbacks, but no render and no frame events', () => {
+      const callback = vi.fn();
+      const events: string[] = [];
+      const offStart = eventBus.on('frame-start', () => events.push('frame-start'));
+      const offEnd = eventBus.on('frame-end', () => events.push('frame-end'));
+      controller.addPerFrameCallback('cb', callback);
+
+      try {
+        controller.prepareFrame();
+
+        expect(mockControls.update).toHaveBeenCalledTimes(1);
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(mockPostProcessing.render).not.toHaveBeenCalled();
+        expect(events).toEqual([]);
+        // Nor does it start the loop.
+        expect(controller.isActive).toBe(false);
+        expect(mockRAF).not.toHaveBeenCalled();
+      } finally {
+        offStart();
+        offEnd();
+      }
     });
   });
 
@@ -493,6 +793,7 @@ describe('AnimationController', () => {
       controller.setContextLostPredicate(() => true);
 
       controller.startAnimation();
+      runArmedFrame();
 
       expect(manager.recordFrame).not.toHaveBeenCalled();
     });
@@ -680,6 +981,10 @@ describe('AnimationController', () => {
       now = 1000;
       vi.spyOn(performance, 'now').mockImplementation(() => now);
       setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+      // Pacing is about the frame PERIOD, rendered or not; these tests model
+      // a scene that changes every tick (e.g. a camera in motion), so every
+      // frame renders and adaptive DPR samples the stream.
+      controller.addPerFrameCallback('always-changed', () => true);
     });
 
     /**
@@ -750,6 +1055,7 @@ describe('AnimationController', () => {
 
     it('leaves the 60fps path alone — a fast frame re-arms rAF and arms no timer', () => {
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       expect(mockRAF).toHaveBeenCalledTimes(1);
 
       runNextFrame(16);
@@ -760,6 +1066,7 @@ describe('AnimationController', () => {
 
     it('paces after a STREAK of slow frames: a hop, then the real cooldown, then rAF', () => {
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
 
       // First slow frame: a streak of one is an isolated hiccup, not the
       // sustained slowness pacing exists for — still the fast path.
@@ -793,6 +1100,7 @@ describe('AnimationController', () => {
     it('the cooldown is a quarter of the frame cost, clamped to maxCooldownMs', () => {
       // Below the clamp: 400ms frames → 100ms gap.
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       runNextFrame(400); // streak of 1, unpaced
       runNextFrame(400);
       expect(pacedDelaysAfterHop()).toEqual([0, 100]);
@@ -801,6 +1109,7 @@ describe('AnimationController', () => {
       controller.stopAnimation();
       setTimeoutSpy.mockClear();
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       runNextFrame(2000); // streak of 1, unpaced
       runNextFrame(2000);
       expect(pacedDelaysAfterHop()).toEqual([0, 250]);
@@ -812,6 +1121,7 @@ describe('AnimationController', () => {
     // path. This is the test that goes red if the streak gate is removed.
     it('a SINGLE slow frame is never paced — an isolated hiccup keeps the fast path', () => {
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
 
       runNextFrame(1000);
       expect(mockRAF).toHaveBeenCalledTimes(1);
@@ -832,6 +1142,7 @@ describe('AnimationController', () => {
     // no matter how long it runs.
     it('an alternating slow/fast cadence is never paced', () => {
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
 
       for (let i = 0; i < 4; i++) {
         runNextFrame(1000);
@@ -849,6 +1160,7 @@ describe('AnimationController', () => {
     // against a `<` mutation, and the delay against a fraction/rounding one.
     it('the threshold boundary: cost === slowFrameMs is not paced, +1ms is', () => {
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       runNextFrame(config.animation.pacing.slowFrameMs);
       runNextFrame(config.animation.pacing.slowFrameMs);
       runNextFrame(config.animation.pacing.slowFrameMs);
@@ -858,6 +1170,7 @@ describe('AnimationController', () => {
       controller.stopAnimation();
       setTimeoutSpy.mockClear();
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       runNextFrame(config.animation.pacing.slowFrameMs + 1); // 251ms, streak of 1
       expect(mockRAF).toHaveBeenCalledTimes(1);
       expect(pacedDelaysAfterHop()).toEqual([]);
@@ -872,6 +1185,7 @@ describe('AnimationController', () => {
       // subtract the cooldown WE inserted — the period would then read
       // cost + cooldown and pacing would latch on forever.
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       runNextFrame(1000);
       runNextFrame(1000);
       expect(pacedDelaysAfterHop()).toEqual([0, 250]);
@@ -909,7 +1223,8 @@ describe('AnimationController', () => {
       controller.setAdaptiveDPRManager(dprManager as never);
 
       try {
-        controller.startAnimation(); // frame 1: nothing measured yet, fast path
+        controller.startAnimation();
+        runNextFrame(0); // frame 1: nothing measured yet, fast path
         runNextFrame(1000); // frame 2: first slow frame, still unpaced
         startListener.mockClear();
         endListener.mockClear();
@@ -953,10 +1268,11 @@ describe('AnimationController', () => {
     // the interactions that once argued for one cannot arise, because an
     // isolated slow frame is never paced (the streak above).
     it('hands adaptive DPR the raw frame timestamps, paced frames included', () => {
-      const dprManager = { recordFrame: vi.fn() };
+      const dprManager = { recordFrame: vi.fn(), notifyStreamBreak: vi.fn() };
       controller.setAdaptiveDPRManager(dprManager as never);
 
-      controller.startAnimation(); // t=1000, first frame
+      controller.startAnimation();
+      runNextFrame(0); // t=1000, first frame
       runNextFrame(16); // t=1016, a 16ms frame
       runNextFrame(1000); // t=2016, first slow frame — streak of 1, unpaced
       expect(pacedDelaysAfterHop()).toEqual([]);
@@ -965,16 +1281,23 @@ describe('AnimationController', () => {
       advancePacing(250);
       runNextFrame(266); // t=3282: our 250ms gap + a 16ms frame
 
+      // The first rendered frame after the (re)start has no rendered
+      // predecessor: it re-bases the interval clock at its own start instead
+      // of recording a sample. Every later tick records the one before it.
+      expect(dprManager.notifyStreamBreak.mock.calls.map((call) => call[0])).toEqual([1000]);
       const stamps = dprManager.recordFrame.mock.calls.map((call) => call[0] as number);
-      expect(stamps).toEqual([1000, 1016, 2016, 3016, 3282]);
+      expect(stamps).toEqual([1016, 2016, 3016, 3282]);
       // The paced frame's interval INCLUDES our cooldown — 266ms, not 16ms.
-      const intervals = stamps.slice(1).map((t, i) => t - stamps[i]);
+      // (Intervals from the re-based t=1000.)
+      const clock = [1000, ...stamps];
+      const intervals = stamps.map((t, i) => t - clock[i]);
       expect(intervals).toEqual([16, 1000, 1000, 266]);
     });
 
     it('the suspend predicate disables pacing (a recording keeps its cadence)', () => {
       controller.setPacingSuspendPredicate(() => true);
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
 
       runNextFrame(1000);
       runNextFrame(1000);
@@ -992,6 +1315,7 @@ describe('AnimationController', () => {
       let recording = false;
       controller.setPacingSuspendPredicate(() => recording);
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
 
       runNextFrame(1000);
       runNextFrame(1000);
@@ -1023,6 +1347,7 @@ describe('AnimationController', () => {
       config.animation.pacing.enabled = false;
       try {
         controller.startAnimation();
+        runNextFrame(0); // frame 1, at the same clock value
 
         runNextFrame(1000);
         runNextFrame(1000);
@@ -1036,6 +1361,7 @@ describe('AnimationController', () => {
 
     it('a resting gap is not a slow frame — the first frame after a resume is not paced', () => {
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       // Genuinely SLOW frames before the rest, so the measurement carried
       // across it is non-zero: this is what makes the test fail if
       // `lastFrameCostMs = 0` were dropped from startAnimation().
@@ -1051,6 +1377,7 @@ describe('AnimationController', () => {
       mockRAF.mockClear();
 
       controller.startAnimation();
+      runNextFrame(0); // the resume frame, at the same clock value
 
       expect(mockRAF).toHaveBeenCalledTimes(1);
       expect(pacingDelays()).toEqual([]);
@@ -1067,6 +1394,7 @@ describe('AnimationController', () => {
     // not leave one banked for the frames after the resume.
     it('the slow-frame streak does not survive a stop/resume', () => {
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       runNextFrame(1000);
       runNextFrame(1000);
       expect(pacedDelaysAfterHop()).toEqual([0, 250]);
@@ -1075,6 +1403,7 @@ describe('AnimationController', () => {
       setTimeoutSpy.mockClear();
       mockRAF.mockClear();
       controller.startAnimation();
+      runNextFrame(0); // the resume frame, at the same clock value
 
       // One slow frame after the resume: a fresh streak of one, unpaced.
       runNextFrame(1000);
@@ -1089,6 +1418,7 @@ describe('AnimationController', () => {
 
     it('stopAnimation clears a pending cooldown at either stage, and a late fire does not re-arm a frame', () => {
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       runNextFrame(1000);
       runNextFrame(1000);
       expect(pacingDelays()).toEqual([0]); // the hop, cooldown not armed yet
@@ -1109,6 +1439,7 @@ describe('AnimationController', () => {
       // Same at the second stage: stop the loop with the real cooldown armed.
       setTimeoutSpy.mockClear();
       controller.startAnimation();
+      runNextFrame(0); // frame 1, at the same clock value
       runNextFrame(1000);
       runNextFrame(1000);
       vi.advanceTimersByTime(0); // the hop fires, arming the cooldown
@@ -1131,6 +1462,8 @@ describe('AnimationController', () => {
       });
 
       expect(() => controller.startAnimation()).not.toThrow();
+      expect(mockRAF).toHaveBeenCalledTimes(1);
+      expect(() => runNextFrame(0)).not.toThrow(); // frame 1 re-arms
       expect(mockRAF).toHaveBeenCalledTimes(1);
 
       // Slow frames still re-arm — paced, since a throw is not a suspend.
@@ -1155,8 +1488,8 @@ describe('AnimationController', () => {
 
       try {
         controller.startAnimation();
-        // The mock requestAnimationFrame should have fired the loop body
-        // at least once already (see makeMockRAF in this file's setup).
+        // startAnimation() only arms the first frame; run it.
+        runArmedFrame();
         expect(startListener).toHaveBeenCalled();
         expect(endListener).toHaveBeenCalled();
       } finally {
@@ -1164,6 +1497,54 @@ describe('AnimationController', () => {
         offEnd();
         controller.stopAnimation();
       }
+    });
+  });
+
+  describe('perf counters', () => {
+    beforeEach(() => perfCounters.reset());
+
+    it('counts ticks, renders by reason, skipped ticks and adaptive-DPR samples', () => {
+      controller.setAdaptiveDPRManager({ recordFrame: vi.fn() } as never);
+      controller.requestRender('test');
+      controller.tick(); // dirty: renders (reason `event`), no predecessor to sample
+      controller.tick(); // clean: skipped, samples the rendered tick before it
+      controller.tick(); // clean: skipped, nothing rendered before it to sample
+
+      expect(perfCounters.get('render.ticks')).toBe(3);
+      expect(perfCounters.get('render.count')).toBe(1);
+      expect(perfCounters.get('render.byReason.event')).toBe(1);
+      expect(perfCounters.get('render.skippedTicks')).toBe(2);
+      expect(perfCounters.get('adaptiveDpr.samples')).toBe(1);
+      expect(perfCounters.get('render.once')).toBe(0);
+    });
+
+    it('under ?renderAlways every tick renders and samples, as before render-on-change', () => {
+      controller.setRenderOnChange(false);
+      controller.setAdaptiveDPRManager({ recordFrame: vi.fn() } as never);
+      perfCounters.reset();
+      controller.tick();
+      controller.tick();
+
+      expect(perfCounters.get('render.ticks')).toBe(2);
+      expect(perfCounters.get('render.count')).toBe(2);
+      expect(perfCounters.get('render.skippedTicks')).toBe(0);
+      expect(perfCounters.get('adaptiveDpr.samples')).toBe(2);
+    });
+
+    it('counts a tick but no render while the context is lost', () => {
+      controller.setContextLostPredicate(() => true);
+      controller.tick();
+
+      expect(perfCounters.get('render.ticks')).toBe(1);
+      expect(perfCounters.get('render.count')).toBe(0);
+    });
+
+    it('counts a renderOnce() frame as a once render', () => {
+      controller.renderOnce();
+
+      expect(perfCounters.get('render.once')).toBe(1);
+      expect(perfCounters.get('render.count')).toBe(1);
+      expect(perfCounters.get('render.byReason.once')).toBe(1);
     });
   });
 });

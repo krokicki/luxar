@@ -11,7 +11,9 @@
  */
 
 import * as zarr from '../zarr';
-import { log, Modules } from '../../utils/log';
+import { LoaderLifetime } from '../loaders/loader-lifetime';
+import type { FetchPriority } from '../../utils/fetch-concurrency';
+import { log, LogEmoji, Modules } from '../../utils/log';
 import type {
   GSplatsMetadata,
   LoadedGSplatsData,
@@ -36,12 +38,9 @@ import {
   buildSpatialIndexMetrics,
   loadSliceWithCache,
   recordLoadMetrics,
-  runWithActiveSignal,
-  runWithResidencyProbe,
   type SpatialFacadeCtx,
   type ToleranceOptions,
   LoaderEventEmitter,
-  OnceInit,
   warnExtendToAllNoDimensions,
   announceExtendToAllOnce,
 } from '../loaders';
@@ -73,7 +72,6 @@ import {
   type DecompressedChunkCacheStats,
 } from '../../cache/decompressed-chunk-cache';
 import { wrapWithCache } from '../../cache/decompressed-chunk-cache/cached-zarr-array';
-import { ResidencyAccumulator } from '../../cache/residency-probe';
 import { ChunkPrefetcher } from '../../cache/chunk-prefetcher';
 import type { SliceCache } from '../../cache/slice-cache';
 
@@ -256,7 +254,13 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
   private chunkIndex: ChunkSpatialIndex | null = null;
   private zarrLocation: zarr.Location<zarr.Readable>;
   private node: SceneNode;
-  private _onceInit = new OnceInit();
+  /**
+   * Disposed latch, lifetime signal, one-shot initialization and the per-call
+   * demand-load context (`lifetime.calls`) the wrapped arrays' getChunk reads
+   * through the `() => this._lifetime.calls.signal` / `.probe` thunks below
+   * (see `LoaderLifetime`, `ActiveLoadContext`).
+   */
+  private readonly _lifetime = new LoaderLifetime();
   private rangeLoader: RangeLoader;
   private zarrStore: zarr.Readable | null = null;
 
@@ -269,14 +273,6 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
 
   // L0 decompressed chunk cache (optional, avoids Blosc decompression on repeat access)
   private l0Cache: DecompressedChunkCache | null = null;
-
-  // Active cache-residency probe for the in-flight demand load (see
-  // updateViewWithResidency); null at all other times.
-  private _activeProbe: ResidencyAccumulator | null = null;
-  // Per-update abort signal for the in-flight `updateView`; set at its top and
-  // cleared in `finally`. Read by the `wrapWithCache` L0 proxy so a superseded
-  // update bails before fetch/decode. Mirrors `_activeProbe`'s lifetime.
-  private _activeSignal: AbortSignal | null = null;
 
   // Chunk prefetcher (optional, for registering array bounds to suppress 404s)
   private prefetcher: ChunkPrefetcher | null = null;
@@ -340,7 +336,7 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
   async planPrefetch(viewState: GSplatsViewState): Promise<GSplatsPrefetchPlan> {
     const fallback = this.prefetchByteUpperBound;
     try {
-      await this.ensureInitialized();
+      await this.ensureInitialized('speculative');
       const ranges = await this.queryVisibleSplatRanges(viewState);
       return {
         bytes: this.prefetchArrays().reduce(
@@ -378,11 +374,22 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
     this.zarrLocation = zarrLocation;
     this.node = node;
     this.rangeLoader = new RangeLoader(refRegistry || new ArrayRefRegistry());
-    // Forward the per-update abort signal into worker decodes (LUT/quantized/
-    // broadcasted) so a superseded update's decode bails before dispatch.
-    this.rangeLoader.setSignalSource(() => this._activeSignal);
+    // Initial builds have no update signal; their decodes still belong to this loader.
+    this.rangeLoader.setSignalSource(() => this._lifetime.calls.signal ?? this._lifetime.signal);
     this.zarrStore = zarrStore || null;
     this.l0Cache = l0Cache || null;
+    // array_ref targets: opened once per (store, target) and read through L0
+    // with this loader's hooks, exactly like its own attribute arrays.
+    if (l0Cache) {
+      this.rangeLoader.setRefTargetWrapper({
+        wrap: (array, targetPath) =>
+          wrapWithCache(array, l0Cache, targetPath, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          }),
+        epoch: () => l0Cache.generation,
+      });
+    }
     this.prefetcher = prefetcher || null;
     this.sliceCache = sliceCache || null;
     // Geometry-neutral counters: elementsLoaded / visibleElements count
@@ -397,6 +404,7 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
       nextQueryId: () => this.nextQueryId++,
       accumulatorMemoryMB: () => this.getAccumulatorStats()?.memoryMB ?? 0,
       emit: (event) => this.emitEvent(event),
+      activeSignal: () => this._lifetime.calls.signal,
     };
   }
 
@@ -412,20 +420,25 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
   /**
    * Initialize the loader by loading spatial index and opening arrays
    */
-  async initialize(): Promise<void> {
+  async initialize(signal?: AbortSignal): Promise<void> {
     const attrs = this.node.attrs as unknown as GSplatsMetadata;
 
     // Load spatial index
     try {
-      this.chunkIndex = await this.loadChunkBounds(attrs);
+      this.chunkIndex = await this.loadChunkBounds(attrs, signal);
 
       if (!this.chunkIndex) {
-        log.info(
+        // Verbose, not info: every single-chunk rung takes this path (see
+        // loadGSplatsChunkIndex), so at info level a partitioned timelapse
+        // printed one line per rung per timepoint.
+        log.verbose(
+          LogEmoji.QUERY,
           Modules.GSPLATS_SPATIAL_INDEX_LOADER,
           `No spatial index for GSplats ${this.node.path} - will load all data`
         );
       } else {
-        log.query(
+        log.verbose(
+          LogEmoji.QUERY,
           Modules.GSPLATS_SPATIAL_INDEX_LOADER,
           `GSplats index loaded: ${this.chunkIndex.chunkCount} chunks`
         );
@@ -449,19 +462,18 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
       });
       // Wrap with L0 cache if enabled (caches decoded chunks to avoid Blosc decompression)
       if (this.l0Cache) {
-        centersArray = wrapWithCache(
-          centersArray,
-          this.l0Cache,
-          `${this.node.path}/centers`,
-          () => this._activeProbe,
-          () => this._activeSignal
-        );
+        centersArray = wrapWithCache(centersArray, this.l0Cache, `${this.node.path}/centers`, {
+          getProbe: () => this._lifetime.calls.probe,
+          getSignal: () => this._lifetime.calls.signal,
+        });
         amplitudesArray = wrapWithCache(
           amplitudesArray,
           this.l0Cache,
           `${this.node.path}/amplitudes`,
-          () => this._activeProbe,
-          () => this._activeSignal
+          {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          }
         );
       }
       this.arrays.centers = centersArray;
@@ -491,13 +503,10 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
         let colorsArray = await zarr.open(this.zarrLocation.resolve('colors'), { kind: 'array' });
         this.registerBounds('colors', colorsArray);
         if (this.l0Cache) {
-          colorsArray = wrapWithCache(
-            colorsArray,
-            this.l0Cache,
-            `${this.node.path}/colors`,
-            () => this._activeProbe,
-            () => this._activeSignal
-          );
+          colorsArray = wrapWithCache(colorsArray, this.l0Cache, `${this.node.path}/colors`, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          });
         }
         this.arrays.colors = colorsArray;
         // Layout (3 = RGB, 4 = RGBA) is a property of the dataset, read once
@@ -518,13 +527,10 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
       });
       this.registerBounds('label_ids', labelIdsArray);
       if (this.l0Cache) {
-        labelIdsArray = wrapWithCache(
-          labelIdsArray,
-          this.l0Cache,
-          `${this.node.path}/label_ids`,
-          () => this._activeProbe,
-          () => this._activeSignal
-        );
+        labelIdsArray = wrapWithCache(labelIdsArray, this.l0Cache, `${this.node.path}/label_ids`, {
+          getProbe: () => this._lifetime.calls.probe,
+          getSignal: () => this._lifetime.calls.signal,
+        });
       }
       this.arrays.label_ids = labelIdsArray;
     }
@@ -557,9 +563,29 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
     }
   }
 
-  /** Initialize metadata once without loading any attribute payload chunks. */
-  async ensureInitialized(): Promise<void> {
-    await this._onceInit.ensure(() => this.initialize());
+  /**
+   * Initialize metadata once without loading any attribute payload chunks.
+   *
+   * `priority` classes the `chunk_bounds` read of an initialisation THIS call
+   * starts (B6: the progressive loader warms rung k+1 at `'refinement'` while
+   * rung k loads). A later call without one needs the index now, so it raises
+   * an in-flight warm to `demand` — no priority inversion behind a warm. So
+   * the speculative entry points (`planPrefetch`, `prefetchChunks`,
+   * `prefetchChunkBoundary`) pass `'speculative'`: they are not a frame
+   * waiting on the index, and an untagged call from them would raise a
+   * refinement-class warm to demand.
+   *
+   * Runs under the disposed latch (`LoaderLifetime.ensureInitialized`): a
+   * disposed loader refuses to re-initialize, and one still in flight at
+   * {@link dispose} is discarded rather than repopulating the loader.
+   */
+  async ensureInitialized(priority?: FetchPriority): Promise<void> {
+    await this._lifetime.ensureInitialized(
+      `GSplats loader ${this.node.path}`,
+      (signal) => this.initialize(signal),
+      () => this.dispose(),
+      priority
+    );
   }
 
   /**
@@ -639,12 +665,17 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
     if (splatRanges.length === 0) {
       // No visible splats — return empty dataset; the wrapper caches it
       // (an empty slice is a valid, ~0-byte result that revisits should skip).
-      log.info(Modules.GSPLATS_SPATIAL_INDEX_LOADER, 'No visible gsplats - returning empty data');
+      log.verbose(
+        LogEmoji.INFO,
+        Modules.GSPLATS_SPATIAL_INDEX_LOADER,
+        'No visible gsplats - returning empty data'
+      );
       return createEmptyGSplatsData(attrs);
     }
 
     if (!this._initialLoadDone) {
-      log.load(
+      log.verbose(
+        LogEmoji.LOAD,
         Modules.GSPLATS_SPATIAL_INDEX_LOADER,
         `Loading ${totalSplats} gsplats from ${splatRanges.length} ranges`
       );
@@ -821,33 +852,26 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
     session?: UpdateSession,
     signal?: AbortSignal
   ): Promise<LoadedGSplatsData> {
-    return runWithActiveSignal(
-      (s) => (this._activeSignal = s),
-      signal,
-      async () => {
-        const result = await this.loadGSplats(viewState, session);
-        if (!this._initialLoadDone) {
-          this._initialLoadDone = true;
-          this.rangeLoader.setVerbose(false);
-        }
-        return result;
+    return this._lifetime.calls.runWithSignal(signal, async () => {
+      const result = await this.loadGSplats(viewState, session);
+      if (!this._initialLoadDone) {
+        this._initialLoadDone = true;
+        this.rangeLoader.setVerbose(false);
       }
-    );
+      return result;
+    });
   }
 
   /**
    * Like {@link updateView} but also reports whether the load was served
-   * entirely from cache (see `runWithResidencyProbe`).
+   * entirely from cache (see `ActiveLoadContext.runWithProbe`).
    */
   async updateViewWithResidency(
     viewState: GSplatsViewState,
     session?: UpdateSession,
     signal?: AbortSignal
   ): Promise<{ data: LoadedGSplatsData; allResident: boolean }> {
-    return runWithResidencyProbe(
-      (p) => (this._activeProbe = p),
-      () => this.updateView(viewState, session, signal)
-    );
+    return this._lifetime.calls.runWithProbe(() => this.updateView(viewState, session, signal));
   }
 
   /**
@@ -857,8 +881,11 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
    * wrapper here exists for symmetry with the points + lines facades,
    * which follow the same pattern.
    */
-  private async loadChunkBounds(attrs: GSplatsMetadata): Promise<ChunkSpatialIndex | null> {
-    return loadGSplatsChunkIndex(this.zarrLocation, attrs);
+  private async loadChunkBounds(
+    attrs: GSplatsMetadata,
+    signal?: AbortSignal
+  ): Promise<ChunkSpatialIndex | null> {
+    return loadGSplatsChunkIndex(this.zarrLocation, attrs, signal);
   }
 
   /**
@@ -956,13 +983,10 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
       name: string
     ): zarr.Array<zarr.DataType, zarr.Readable> =>
       this.l0Cache
-        ? wrapWithCache(
-            arr,
-            this.l0Cache,
-            `${this.node.path}/${name}`,
-            () => this._activeProbe,
-            () => this._activeSignal
-          )
+        ? wrapWithCache(arr, this.l0Cache, `${this.node.path}/${name}`, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          })
         : arr;
 
     let diagArray: zarr.Array<zarr.DataType, zarr.Readable> | undefined;
@@ -1191,7 +1215,7 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
         zarr.readArray(
           array,
           [zarr.slice(range.start, range.end)],
-          zarr.abortOptions(this._activeSignal)
+          zarr.abortOptions(this._lifetime.calls.signal)
         )
       )
     );
@@ -1231,16 +1255,16 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
   }
 
   /**
-   * Prefetch chunks for the given view state into the cache without decoding.
+   * Prefetch chunks for the given view state into the cache without producing
+   * geometry.
    *
    * Uses planned visible ranges when supplied; otherwise performs the same
-   * spatial index query as updateView(). Issues zarr get() calls for each
-   * visible range on every array. The fetched data
-   * populates the HTTP cache and L0 decompressed-chunk cache but is NOT
-   * accumulated into output buffers — the typed-array results are immediately
-   * discarded.  This makes the subsequent updateView() call a fast cache hit
-   * without the memory cost of allocating full-size output arrays that would
-   * only be thrown away.
+   * spatial index query as updateView(). Every distinct chunk the visible
+   * ranges touch, on every array, is fetched (L1/L2) and decoded into the L0
+   * decompressed-chunk cache through the proxy's `warmChunk` — NOT through zarr
+   * `get()`, so no output selection is allocated or filled, and the demand
+   * load's abort signal and residency probe are not consulted (the warm-up
+   * uses `signal` only). The subsequent updateView() is then a fast L0 hit.
    */
   async prefetchChunks(
     viewState: GSplatsViewState,
@@ -1248,7 +1272,7 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
     plannedRanges?: readonly SplatRange[]
   ): Promise<void> {
     if (signal?.aborted) return;
-    await this.ensureInitialized();
+    await this.ensureInitialized('speculative');
 
     if (!this.arrays.centers) return;
 
@@ -1265,8 +1289,8 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
     }
     if (splatRanges.length === 0) return;
 
-    // Warm every array over the visible ranges. The reads populate L0/L1/L2 as
-    // a side-effect and are discarded — no output buffers allocated.
+    // Warm every chunk the visible ranges touch into L0 (decode only — no
+    // output assembly, no demand-probe record).
     const arrays = this.prefetchArrays();
 
     await prefetchRangesIntoCache(arrays, splatRanges, signal);
@@ -1274,23 +1298,25 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
 
   async prefetchChunkBoundary(
     current: GSplatsViewState,
-    predicted: GSplatsViewState
+    predicted: GSplatsViewState,
+    signal?: AbortSignal
   ): Promise<void> {
-    await this.ensureInitialized();
+    if (signal?.aborted) return;
+    await this.ensureInitialized('speculative');
     if (!this.chunkIndex || !this.arrays.centers) {
-      await this.prefetchChunks(predicted);
+      await this.prefetchChunks(predicted, signal);
       return;
     }
     let ranges: readonly SplatRange[];
     try {
       ranges = await this.queryVisibleSplatRanges(current);
     } catch {
-      await this.prefetchChunks(predicted);
+      await this.prefetchChunks(predicted, signal);
       return;
     }
     const arrays = this.prefetchArrays();
     const views = planChunkBoundaryViewStates(current, predicted, ranges, this.chunkIndex, arrays);
-    await Promise.all(views.map((view) => this.prefetchChunks(view)));
+    await Promise.all(views.map((view) => this.prefetchChunks(view, signal)));
   }
 
   private prefetchArrays(): zarr.Array<zarr.DataType, zarr.Readable>[] {
@@ -1365,9 +1391,9 @@ export class GSplatsSpatialIndexLoader implements GSplatsDataLoader {
    * Clean up resources
    */
   dispose(): void {
+    this._lifetime.dispose();
     this.chunkIndex = null;
     this.arrays = {};
-    this._onceInit.reset();
     this.events.clear();
     this.activeQueries.clear();
 

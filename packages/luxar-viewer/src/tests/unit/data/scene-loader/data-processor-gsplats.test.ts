@@ -50,6 +50,12 @@ import {
 } from '../../../../data/scene-loader/process/data-processor-gsplats';
 import type { LoadedGSplatsData, GSplatsViewState } from '../../../../types/gsplats';
 import { WorkerTimeoutError, WorkerUnavailableError } from '../../../../workers/worker-pool/errors';
+import { SliceCache } from '../../../../cache/slice-cache';
+import { perfCounters } from '../../../../profiling/perf-counters';
+import {
+  restoreLadder,
+  storeLadder,
+} from '../../../../data/loaders/progressive/slice-cache-helper';
 
 /**
  * Dispatcher-shaped result (keyed by `visibleCount`, as the worker /
@@ -452,6 +458,24 @@ describe('projectGSplatsTo3DUsingWorker', () => {
     expect(Array.from(result.centers3D)).toEqual([1, 2, 3]);
   });
 
+  it('projection.gsplats.worker counts every projection handed to the pool, a fallback included', async () => {
+    perfCounters.reset();
+    const projectGSplatsTo3D = vi.fn(async () => makeDispatcherResult(1));
+    mockGetWorkerPool.mockReturnValue({
+      runWithTimeout: vi.fn(async (_op, _kind, fn) => fn({ projectGSplatsTo3D })),
+    });
+    await projectGSplatsTo3DUsingWorker(makeData(), makeViewState(), 3.0, 1);
+    mockGetWorkerPool.mockReturnValue({
+      runWithTimeout: vi.fn(async () => {
+        throw new WorkerUnavailableError('[WorkerPool] No workers available after initialization');
+      }),
+    });
+    mockProcessGSplats.mockReturnValue(makeDispatcherResult(7));
+    await projectGSplatsTo3DUsingWorker(makeData(), makeViewState(), 3.0, 1);
+
+    expect(perfCounters.get('projection.gsplats.worker')).toBe(2);
+  });
+
   // Worker UNAVAILABILITY — the pool never got the work to a worker at all, so
   // the in-process dispatcher is the only executor left.
   it('falls back to the in-process dispatcher on WorkerUnavailableError', async () => {
@@ -553,5 +577,110 @@ describe('projectGSplatsTo3DUsingWorker', () => {
       abort
     );
     expect(mockProcessGSplats).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A pool whose `runWithTimeout` honours the caller's signal the way the real
+ * pool does (rejects with a WorkerAbortError when it aborts) and otherwise
+ * never settles — a projection that would hold the update lock for its whole
+ * 50-150 ms run at 1-3M elements.
+ */
+function makeAbortablePool() {
+  const runWithTimeout = vi.fn(
+    (_op: string, _kind: string, _fn: unknown, signal?: AbortSignal) =>
+      new Promise((_, reject) => {
+        signal?.addEventListener('abort', () => {
+          const error = new Error('aborted by caller signal');
+          error.name = 'WorkerAbortError';
+          reject(error);
+        });
+      })
+  );
+  mockGetWorkerPool.mockReturnValue({ runWithTimeout });
+  return runWithTimeout;
+}
+
+describe('per-update abort signal through the gsplat projection (B7)', () => {
+  it('projectGSplatsTo3DUsingWorker passes the signal to runWithTimeout and rejects on abort', async () => {
+    const runWithTimeout = makeAbortablePool();
+    const controller = new AbortController();
+    const pass = projectGSplatsTo3DUsingWorker(
+      makeData(),
+      makeViewState(),
+      3.0,
+      1,
+      controller.signal
+    );
+    expect(runWithTimeout.mock.calls[0][3]).toBe(controller.signal);
+    controller.abort();
+    await expect(pass).rejects.toMatchObject({ name: 'WorkerAbortError' });
+    expect(mockProcessGSplats).not.toHaveBeenCalled();
+  });
+
+  it('processGSplatsData forwards the signal so a superseded pass rejects promptly', async () => {
+    const root = new THREE.Group();
+    root.add(makeMesh('/g'));
+    const runWithTimeout = makeAbortablePool();
+    const controller = new AbortController();
+    const pass = processGSplatsData(
+      '/g',
+      makeData(2000, 4),
+      makeViewState(),
+      root,
+      1,
+      undefined,
+      controller.signal
+    );
+    await vi.waitFor(() => expect(runWithTimeout).toHaveBeenCalledTimes(1));
+    expect(runWithTimeout.mock.calls[0][3]).toBe(controller.signal);
+    controller.abort();
+    await expect(pass).rejects.toMatchObject({ name: 'WorkerAbortError' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Post-projection stage cache (#2944 B2).
+//
+// A slice restored from the S-cache is the SAME decoded payload on every visit,
+// so re-running the worker projection on it (structured clone in, kernel,
+// clone out) is repeated work whenever every other projection input is
+// unchanged. The projected output rides on the S-cache entry, keyed by a
+// signature of those other inputs.
+// ---------------------------------------------------------------------------
+describe('projection stage cache (S-cache hit skips the worker projection)', () => {
+  function makeCountingPool() {
+    const projectGSplatsTo3D = vi.fn(async () => makeDispatcherResult(2000));
+    const runWithTimeout = vi.fn(
+      async (_op: string, _kind: string, fn: (api: unknown) => unknown) =>
+        fn({ projectGSplatsTo3D })
+    );
+    mockGetWorkerPool.mockReturnValue({ runWithTimeout });
+    return runWithTimeout;
+  }
+
+  function restoreHit(cache: SliceCache, view: GSplatsViewState): LoadedGSplatsData {
+    const lods = restoreLadder<LoadedGSplatsData>(cache, '/g', view, 1);
+    if (!lods) throw new Error('expected an S-cache hit');
+    return lods[0];
+  }
+
+  it('an S-cache hit with unchanged projection params triggers no worker projection', async () => {
+    const root = new THREE.Group();
+    root.add(makeMesh('/g'));
+    const runWithTimeout = makeCountingPool();
+    const cache = new SliceCache({ maxSize: 64 * 1024 * 1024 });
+    const view = makeViewState();
+    storeLadder(cache, '/g', view, [makeData(2000, 4)]);
+
+    // First hit: nothing cached for the projection stage yet -> one projection.
+    await processGSplatsData('/g', restoreHit(cache, view), view, root, 2);
+    expect(runWithTimeout).toHaveBeenCalledTimes(1);
+
+    // Second hit on the same slice with the same params -> the cached output.
+    const staged = await processGSplatsData('/g', restoreHit(cache, view), view, root, 2);
+    expect(runWithTimeout).toHaveBeenCalledTimes(1);
+    if (!staged || staged.noop) throw new Error('expected a geometry staged commit');
+    expect(staged.processed.splatCount).toBe(2000);
   });
 });

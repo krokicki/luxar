@@ -30,7 +30,7 @@
  */
 
 import * as zarr from '../zarr';
-import { log, Modules } from '../../utils/log';
+import { log, LogEmoji, Modules } from '../../utils/log';
 import { fetchChunkBoundsArray, type ChunkSpatialIndex } from '../loaders';
 import type { ChunkPrefetcher } from '../../cache/chunk-prefetcher';
 import type { LinesMetadata, SegmentRange } from '../../types/lines';
@@ -63,7 +63,8 @@ export interface LinesDualChunkIndex {
  */
 export async function loadLinesDualChunkIndex(
   zarrLocation: zarr.Location<zarr.Readable>,
-  attrs: LinesMetadata
+  attrs: LinesMetadata,
+  signal?: AbortSignal
 ): Promise<LinesDualChunkIndex | null> {
   if (attrs.ordering === 'none' || !attrs.vertex_ordering || !attrs.segment_ordering) {
     log.info(
@@ -73,11 +74,24 @@ export async function loadLinesDualChunkIndex(
     return null;
   }
 
+  if (
+    attrs.n_vertices <= attrs.vertex_ordering.chunk_size &&
+    attrs.n_segments <= attrs.segment_ordering.chunk_size
+  ) {
+    log.verbose(
+      LogEmoji.QUERY,
+      Modules.LINES_LOADER,
+      'Lines node fits one vertex and one segment chunk — no chunk_bounds probe'
+    );
+    return null;
+  }
+
   const vertexResult = await fetchChunkBoundsArray(
     zarrLocation,
     'vertex_chunk_bounds',
     Modules.LINES_LOADER,
-    'No chunk bounds found - Lines dataset has no spatial indexing'
+    'No chunk bounds found - Lines dataset has no spatial indexing',
+    signal
   );
   if (!vertexResult) return null;
 
@@ -85,7 +99,8 @@ export async function loadLinesDualChunkIndex(
     zarrLocation,
     'segment_chunk_bounds',
     Modules.LINES_LOADER,
-    'No chunk bounds found - Lines dataset has no spatial indexing'
+    'No chunk bounds found - Lines dataset has no spatial indexing',
+    signal
   );
   if (!segmentResult) return null;
 
@@ -122,9 +137,8 @@ export async function loadLinesDualChunkIndex(
 }
 
 /**
- * Register a child array's shape with the prefetcher so subsequent
- * range fetches that exceed the array's bounds can be short-circuited
- * (no spurious 404s). No-op when no prefetcher is wired up.
+ * Register a child array's shape to enable adjacency prefetch within
+ * its chunk bounds. No-op when no prefetcher is wired up.
  *
  * The path normalization mirrors the original inline call site: the
  * leading `/` (if present) is stripped from the node path, then

@@ -8,7 +8,8 @@
  * sequence of stages it always was.
  *
  * The per-frame ORDER is the invariant: schedule the orbit callback, spend one
- * rAF so it runs, remove it (fixing the pose), only THEN drain and grab. See
+ * rAF so it runs, remove it (fixing the pose), only THEN drain (LOD, then
+ * depth order) and grab. See
  * the comments inline — each step is ordered against the next for a reason.
  */
 
@@ -62,14 +63,22 @@ async function orbitToFrame(
   i: number
 ): Promise<void> {
   const { plan, animationController, captureCallbackId } = deps;
-  animationController.addPerFrameCallback(captureCallbackId, () => {
-    if (i > 0) controls.applyOrbitRotation(plan.anglePerFrame);
-    // Called on frame 0 too, deliberately: switching the interactive
-    // dolly off leaves the camera wherever the swing had reached, so
-    // this is what drives the phase to 0 and puts the capture on the
-    // true baseline distance rather than on a leftover offset.
-    if (plan.dollyCycles > 0) controls.applyOrbitDolly(plan.dollyPhaseFor(i));
-  });
+  // `camera`: the orbit step moves the camera before the view callbacks
+  // (clipping, depth sort, LOD) read it, so they follow this frame's pose.
+  animationController.addPerFrameCallback(
+    captureCallbackId,
+    () => {
+      if (i > 0) controls.applyOrbitRotation(plan.anglePerFrame);
+      // Called on frame 0 too, deliberately: switching the interactive
+      // dolly off leaves the camera wherever the swing had reached, so
+      // this is what drives the phase to 0 and puts the capture on the
+      // true baseline distance rather than on a leftover offset.
+      if (plan.dollyCycles > 0) controls.applyOrbitDolly(plan.dollyPhaseFor(i));
+      // Camera only: the view signature sees the new pose.
+      return false;
+    },
+    { phase: 'camera' }
+  );
 
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 
@@ -113,6 +122,17 @@ export async function runFrameLoop(deps: FrameLoopDeps): Promise<FrameLoopResult
     // finest level across a tiled partition would make peak residency the
     // entire dataset. Waiting costs time, not memory.
     await lodSettle.waitForFrame();
+
+    // ── Depth ordering for this pose ──
+    // After the LOD settle, so a level that just landed is sorted too; before
+    // the grab, so the frame is drawn with its own pose's permutation. Bounded
+    // by the coordinator's maxWaitMs, and a no-op when nothing is
+    // order-dependent. The loop's own render is suppressed for the whole
+    // capture and the per-frame scheduler re-sorts only past its angle
+    // threshold, so without this a `normal` / `volumetric` node is filmed
+    // with an ordering from an earlier pose. The APP's coordinator: only its
+    // nodes are on this canvas.
+    await ctx.sceneManager.depthSort.resortForCapture();
 
     if (sessionAbort.signal.aborted) break;
 

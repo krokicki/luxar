@@ -12,7 +12,9 @@
  */
 
 import * as zarr from '../zarr';
-import { log, Modules } from '../../utils/log';
+import type { FetchPriority } from '../../utils/fetch-concurrency';
+import { LoaderLifetime } from '../loaders/loader-lifetime';
+import { log, LogEmoji, Modules } from '../../utils/log';
 import type {
   LinesMetadata,
   LoadedLinesData,
@@ -37,11 +39,8 @@ import {
   buildSpatialIndexMetrics,
   loadSliceWithCache,
   recordLoadMetrics,
-  runWithActiveSignal,
-  runWithResidencyProbe,
   type SpatialFacadeCtx,
   LoaderEventEmitter,
-  OnceInit,
   warnExtendToAllNoDimensions,
   announceExtendToAllOnce,
 } from '../loaders';
@@ -56,7 +55,6 @@ import { config as appConfig } from '../../config';
 import type { UpdateSession } from '../../profiling/update-profiler';
 import { DecompressedChunkCache } from '../../cache/decompressed-chunk-cache';
 import { wrapWithCache } from '../../cache/decompressed-chunk-cache/cached-zarr-array';
-import { ResidencyAccumulator } from '../../cache/residency-probe';
 import { ChunkPrefetcher } from '../../cache/chunk-prefetcher';
 import type { SliceCache } from '../../cache/slice-cache';
 import {
@@ -99,7 +97,13 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
   private chunkIndex: LinesDualChunkIndex | null = null;
   private zarrLocation: zarr.Location<zarr.Readable>;
   private node: SceneNode;
-  private _onceInit = new OnceInit();
+  /**
+   * Disposed latch, lifetime signal, one-shot initialization and the per-call
+   * demand-load context (`lifetime.calls`) the wrapped arrays' getChunk reads
+   * through the `() => this._lifetime.calls.signal` / `.probe` thunks below
+   * (see `LoaderLifetime`, `ActiveLoadContext`).
+   */
+  private readonly _lifetime = new LoaderLifetime();
   private rangeLoader: RangeLoader;
   private zarrStore: zarr.Readable | null = null;
 
@@ -114,14 +118,6 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
 
   // L0 decompressed chunk cache (optional, avoids Blosc decompression on repeat access)
   private l0Cache: DecompressedChunkCache | null = null;
-
-  // Active cache-residency probe for the in-flight demand load (see
-  // updateViewWithResidency); null at all other times.
-  private _activeProbe: ResidencyAccumulator | null = null;
-  // Per-update abort signal for the in-flight `updateView`; set at its top and
-  // cleared in `finally`. Read by the `wrapWithCache` L0 proxy so a superseded
-  // update bails before fetch/decode. Mirrors `_activeProbe`'s lifetime.
-  private _activeSignal: AbortSignal | null = null;
 
   // Chunk prefetcher (optional, for registering array bounds to suppress 404s)
   private prefetcher: ChunkPrefetcher | null = null;
@@ -171,11 +167,22 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
     this.zarrLocation = zarrLocation;
     this.node = node;
     this.rangeLoader = new RangeLoader(refRegistry || new ArrayRefRegistry());
-    // Forward the per-update abort signal into worker decodes (LUT/quantized/
-    // broadcasted) so a superseded update's decode bails before dispatch.
-    this.rangeLoader.setSignalSource(() => this._activeSignal);
+    // Initial builds have no update signal; their decodes still belong to this loader.
+    this.rangeLoader.setSignalSource(() => this._lifetime.calls.signal ?? this._lifetime.signal);
     this.zarrStore = zarrStore || null;
     this.l0Cache = l0Cache || null;
+    // array_ref targets: opened once per (store, target) and read through L0
+    // with this loader's hooks, exactly like its own attribute arrays.
+    if (l0Cache) {
+      this.rangeLoader.setRefTargetWrapper({
+        wrap: (array, targetPath) =>
+          wrapWithCache(array, l0Cache, targetPath, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          }),
+        epoch: () => l0Cache.generation,
+      });
+    }
     this.prefetcher = prefetcher || null;
     this.sliceCache = sliceCache || null;
     // Geometry-neutral counters: elementsLoaded counts vertices for lines;
@@ -190,6 +197,7 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
       nextQueryId: () => this.nextQueryId++,
       accumulatorMemoryMB: () => this.getAccumulatorStats()?.memoryMB ?? 0,
       emit: (event) => this.emitEvent(event),
+      activeSignal: () => this._lifetime.calls.signal,
     };
   }
 
@@ -203,22 +211,45 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
   }
 
   /**
+   * Initialize metadata once without loading any attribute payload chunks,
+   * under the disposed latch (`LoaderLifetime.ensureInitialized`): a disposed
+   * loader refuses to re-initialize, and an initialization still in flight
+   * when {@link dispose} runs is discarded instead of repopulating the loader.
+   *
+   * `priority` classes the `chunk_bounds` read of an initialization THIS call
+   * starts (B6: a progressive loader warms rung k+1's index at
+   * `'refinement'` while rung k loads; the speculative entry points pass
+   * `'speculative'`). A later call without one raises an in-flight warm to
+   * `demand`.
+   */
+  ensureInitialized(priority?: FetchPriority): Promise<void> {
+    return this._lifetime.ensureInitialized(
+      `Lines loader ${this.node.path}`,
+      (signal) => this.initialize(signal),
+      () => this.dispose(),
+      priority
+    );
+  }
+
+  /**
    * Initialize the loader by loading spatial index and opening arrays
    */
-  async initialize(): Promise<void> {
+  async initialize(signal?: AbortSignal): Promise<void> {
     const attrs = this.node.attrs as unknown as LinesMetadata;
 
     // Load dual spatial index (vertex + segment chunk bounds)
     try {
-      this.chunkIndex = await this.loadDualChunkBounds(attrs);
+      this.chunkIndex = await this.loadDualChunkBounds(attrs, signal);
 
       if (!this.chunkIndex) {
-        log.info(
+        log.verbose(
+          LogEmoji.QUERY,
           Modules.LINES_LOADER,
           `No spatial index for Lines ${this.node.path} - will load all data`
         );
       } else {
-        log.query(
+        log.verbose(
+          LogEmoji.QUERY,
           Modules.LINES_LOADER,
           `Lines index loaded: ${this.chunkIndex.vertexChunkCount} vertex chunks, ${this.chunkIndex.segmentIndex.chunkCount} segment chunks`
         );
@@ -245,20 +276,14 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
       this.registerBounds('segments', segmentsArray);
       // Wrap with L0 cache if enabled (caches decoded chunks to avoid Blosc decompression)
       if (this.l0Cache) {
-        verticesArray = wrapWithCache(
-          verticesArray,
-          this.l0Cache,
-          `${this.node.path}/vertices`,
-          () => this._activeProbe,
-          () => this._activeSignal
-        );
-        segmentsArray = wrapWithCache(
-          segmentsArray,
-          this.l0Cache,
-          `${this.node.path}/segments`,
-          () => this._activeProbe,
-          () => this._activeSignal
-        );
+        verticesArray = wrapWithCache(verticesArray, this.l0Cache, `${this.node.path}/vertices`, {
+          getProbe: () => this._lifetime.calls.probe,
+          getSignal: () => this._lifetime.calls.signal,
+        });
+        segmentsArray = wrapWithCache(segmentsArray, this.l0Cache, `${this.node.path}/segments`, {
+          getProbe: () => this._lifetime.calls.probe,
+          getSignal: () => this._lifetime.calls.signal,
+        });
       }
       this.arrays.vertices = verticesArray;
       this.arrays.segments = segmentsArray;
@@ -276,13 +301,10 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
         let widthsArray = await zarr.open(this.zarrLocation.resolve('widths'), { kind: 'array' });
         this.registerBounds('widths', widthsArray);
         if (this.l0Cache) {
-          widthsArray = wrapWithCache(
-            widthsArray,
-            this.l0Cache,
-            `${this.node.path}/widths`,
-            () => this._activeProbe,
-            () => this._activeSignal
-          );
+          widthsArray = wrapWithCache(widthsArray, this.l0Cache, `${this.node.path}/widths`, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          });
         }
         this.arrays.widths = widthsArray;
       } catch {
@@ -301,13 +323,10 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
         // `LoadedLinesData.colorComponents` (mirrors the points loader).
         this.colorComponents = colorComponentsOf(colorsArray);
         if (this.l0Cache) {
-          colorsArray = wrapWithCache(
-            colorsArray,
-            this.l0Cache,
-            `${this.node.path}/colors`,
-            () => this._activeProbe,
-            () => this._activeSignal
-          );
+          colorsArray = wrapWithCache(colorsArray, this.l0Cache, `${this.node.path}/colors`, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          });
         }
         this.arrays.colors = colorsArray;
       } catch {
@@ -331,8 +350,10 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
             sharpnessArray,
             this.l0Cache,
             `${this.node.path}/sharpnesses`,
-            () => this._activeProbe,
-            () => this._activeSignal
+            {
+              getProbe: () => this._lifetime.calls.probe,
+              getSignal: () => this._lifetime.calls.signal,
+            }
           );
         }
         this.arrays.sharpness = sharpnessArray;
@@ -351,13 +372,10 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
         });
         this.registerBounds('scalars', scalarsArray);
         if (this.l0Cache) {
-          scalarsArray = wrapWithCache(
-            scalarsArray,
-            this.l0Cache,
-            `${this.node.path}/scalars`,
-            () => this._activeProbe,
-            () => this._activeSignal
-          );
+          scalarsArray = wrapWithCache(scalarsArray, this.l0Cache, `${this.node.path}/scalars`, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          });
         }
         this.arrays.scalars = scalarsArray;
       } catch (e: unknown) {
@@ -456,7 +474,7 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
     queryId: string,
     startTime: number
   ): Promise<LoadedLinesData> {
-    await this._onceInit.ensure(() => this.initialize());
+    await this.ensureInitialized();
 
     if (!this.arrays.vertices || !this.arrays.segments) {
       throw new Error('[LinesLoader] Loader not properly initialized');
@@ -513,13 +531,21 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
     if (segmentRanges.length === 0) {
       // No visible segments — return empty dataset; the wrapper caches it
       // (an empty slice is a valid, ~0-byte result that revisits should skip).
-      log.info(Modules.LINES_LOADER, 'No visible segments - returning empty lines data');
+      log.verbose(
+        LogEmoji.INFO,
+        Modules.LINES_LOADER,
+        'No visible segments - returning empty lines data'
+      );
       return createEmptyLinesData(attrs);
     }
 
     // Load segment indices
     if (!this._initialLoadDone) {
-      log.load(Modules.LINES_LOADER, `Loading segments for ${segmentRanges.length} ranges`);
+      log.verbose(
+        LogEmoji.LOAD,
+        Modules.LINES_LOADER,
+        `Loading segments for ${segmentRanges.length} ranges`
+      );
     }
     let segmentData: Uint32Array;
     if (session) {
@@ -563,16 +589,19 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
     const efficiency = sortedIndices.length / indexSpan;
 
     if (!this._initialLoadDone) {
-      log.load(
+      log.verbose(
+        LogEmoji.LOAD,
         Modules.LINES_LOADER,
         `Loading vertices for ${mergedVertexRanges.length} ranges (${sortedIndices.length} unique vertices)`
       );
-      log.info(
+      log.verbose(
+        LogEmoji.INFO,
         Modules.LINES_LOADER,
         `  Vertex index range: [${minIdx} - ${maxIdx}], span=${indexSpan}, efficiency=${(efficiency * 100).toFixed(1)}%`
       );
       if (mergedVertexRanges.length <= 10) {
-        log.info(
+        log.verbose(
+          LogEmoji.INFO,
           Modules.LINES_LOADER,
           `  Ranges: ${mergedVertexRanges.map((r) => `[${r.start}-${r.end})`).join(', ')}`
         );
@@ -585,8 +614,8 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
           .slice(-5)
           .map((r) => `[${r.start}-${r.end})`)
           .join(', ');
-        log.info(Modules.LINES_LOADER, `  First 5 ranges: ${first5}`);
-        log.info(Modules.LINES_LOADER, `  Last 5 ranges: ${last5}`);
+        log.verbose(LogEmoji.INFO, Modules.LINES_LOADER, `  First 5 ranges: ${first5}`);
+        log.verbose(LogEmoji.INFO, Modules.LINES_LOADER, `  Last 5 ranges: ${last5}`);
       }
     }
 
@@ -823,33 +852,26 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
     session?: UpdateSession,
     signal?: AbortSignal
   ): Promise<LoadedLinesData> {
-    return runWithActiveSignal(
-      (s) => (this._activeSignal = s),
-      signal,
-      async () => {
-        const result = await this.loadLines(viewState, session);
-        if (!this._initialLoadDone) {
-          this._initialLoadDone = true;
-          this.rangeLoader.setVerbose(false);
-        }
-        return result;
+    return this._lifetime.calls.runWithSignal(signal, async () => {
+      const result = await this.loadLines(viewState, session);
+      if (!this._initialLoadDone) {
+        this._initialLoadDone = true;
+        this.rangeLoader.setVerbose(false);
       }
-    );
+      return result;
+    });
   }
 
   /**
    * Like {@link updateView} but also reports whether the load was served
-   * entirely from cache (see `runWithResidencyProbe`).
+   * entirely from cache (see `ActiveLoadContext.runWithProbe`).
    */
   async updateViewWithResidency(
     viewState: LinesViewState,
     session?: UpdateSession,
     signal?: AbortSignal
   ): Promise<{ data: LoadedLinesData; allResident: boolean }> {
-    return runWithResidencyProbe(
-      (p) => (this._activeProbe = p),
-      () => this.updateView(viewState, session, signal)
-    );
+    return this._lifetime.calls.runWithProbe(() => this.updateView(viewState, session, signal));
   }
 
   /**
@@ -861,9 +883,14 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
    * widths, colors, sharpness, and scalars are keyed by vertex ranges. Querying both
    * published indexes keeps speculative reads in the same row currency as
    * the demand path instead of treating segment offsets as vertex offsets.
+   * Each distinct chunk those ranges touch is fetched and decoded into L0 via
+   * the proxy's `warmChunk` — no zarr `get()`, so no output selection is
+   * assembled, and the demand load's abort signal / residency probe are not
+   * consulted (see `prefetchRangesIntoCache`).
    */
-  async prefetchChunks(viewState: LinesViewState): Promise<void> {
-    await this._onceInit.ensure(() => this.initialize());
+  async prefetchChunks(viewState: LinesViewState, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
+    await this.ensureInitialized('speculative');
 
     if (!this.arrays.segments) return;
 
@@ -880,15 +907,20 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
     const vertexArrays = this.prefetchVertexArrays();
 
     await Promise.all([
-      prefetchRangesIntoCache([this.arrays.segments], segmentRanges),
-      prefetchRangesIntoCache(vertexArrays, vertexRanges),
+      prefetchRangesIntoCache([this.arrays.segments], segmentRanges, signal),
+      prefetchRangesIntoCache(vertexArrays, vertexRanges, signal),
     ]);
   }
 
-  async prefetchChunkBoundary(current: LinesViewState, predicted: LinesViewState): Promise<void> {
-    await this._onceInit.ensure(() => this.initialize());
+  async prefetchChunkBoundary(
+    current: LinesViewState,
+    predicted: LinesViewState,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (signal?.aborted) return;
+    await this.ensureInitialized('speculative');
     if (!this.chunkIndex || !this.arrays.segments) {
-      await this.prefetchChunks(predicted);
+      await this.prefetchChunks(predicted, signal);
       return;
     }
     const segmentArrays = [this.arrays.segments];
@@ -919,7 +951,7 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
         );
       }
     } catch {
-      await this.prefetchChunks(predicted);
+      await this.prefetchChunks(predicted, signal);
       return;
     }
 
@@ -929,7 +961,7 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
         (left, right) => this.sliceDistance(left, predicted) - this.sliceDistance(right, predicted)
       )
       .slice(0, 2);
-    await Promise.all(nearestViews.map((view) => this.prefetchChunks(view)));
+    await Promise.all(nearestViews.map((view) => this.prefetchChunks(view, signal)));
   }
 
   private prefetchVertexArrays(): zarr.Array<zarr.DataType, zarr.Readable>[] {
@@ -957,8 +989,11 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
    * wrapper here exists for symmetry with the points facade, which
    * follows the same pattern.
    */
-  private async loadDualChunkBounds(attrs: LinesMetadata): Promise<LinesDualChunkIndex | null> {
-    return loadLinesDualChunkIndex(this.zarrLocation, attrs);
+  private async loadDualChunkBounds(
+    attrs: LinesMetadata,
+    signal?: AbortSignal
+  ): Promise<LinesDualChunkIndex | null> {
+    return loadLinesDualChunkIndex(this.zarrLocation, attrs, signal);
   }
 
   private vertexSpatialIndex(attrs: LinesMetadata) {
@@ -1181,9 +1216,9 @@ export class LinesSpatialIndexLoader implements LinesDataLoader {
    * Clean up resources
    */
   dispose(): void {
+    this._lifetime.dispose();
     this.chunkIndex = null;
     this.arrays = {};
-    this._onceInit.reset();
     this.events.clear();
     this.activeQueries.clear();
 

@@ -11,7 +11,12 @@
  * @module data/loaders/spatial-facade
  */
 
-import { restoreLadder, storeLadder, type SliceViewLike } from './progressive/slice-cache-helper';
+import {
+  awaitShadowStore,
+  restoreLadder,
+  storeLadder,
+  type SliceViewLike,
+} from './progressive/slice-cache-helper';
 import {
   computeLoadLatency,
   finishQueryTracking,
@@ -20,7 +25,6 @@ import {
   type QueryMetricsCounters,
 } from './loader-metrics';
 import { isAbortError } from './abort-error';
-import { ResidencyAccumulator } from '../../cache/residency-probe';
 import type { SliceCache } from '../../cache/slice-cache';
 import type { LoaderType, MonitorEvent, QueryInfo } from '../../types/data-monitor-types';
 
@@ -58,6 +62,11 @@ export interface SpatialFacadeCtx {
   accumulatorMemoryMB(): number;
   /** Emit a monitor event through the loader's listener set. */
   emit(event: MonitorEvent): void;
+  /**
+   * The current update's abort signal (the loader's `_lifetime.calls.signal`), so a
+   * wait for an in-flight shadow store stops when the update is superseded.
+   */
+  activeSignal?(): AbortSignal | null;
 }
 
 /**
@@ -85,6 +94,13 @@ export async function loadSliceWithCache<TData extends object>(
   viewState: FacadeViewState,
   loadInternal: (queryId: string, startTime: number) => Promise<TData>
 ): Promise<TData> {
+  // In-flight adoption: a SlicePrefetcher shadow pass may be building this very
+  // slice; wait for its store (bounded, abortable) rather than redo it.
+  const shadowStore =
+    viewState.prefetch === true
+      ? null
+      : awaitShadowStore(ctx.sliceCache, ctx.path, viewState, ctx.activeSignal?.());
+  if (shadowStore) await shadowStore;
   const cached = restoreLadder<TData>(ctx.sliceCache, ctx.path, viewState, 1);
   if (cached) return cached[0];
 
@@ -152,45 +168,4 @@ export function recordLoadMetrics(
       latency: loadTime,
     },
   });
-}
-
-/**
- * Run one demand load with the per-update abort signal PUBLISHED for the
- * L0-proxy chokepoint (via the loader's `setSignal` field setter), cleared in
- * `finally` so a later cache hit / prefetch isn't seen as abortable. The
- * shared body of the three loaders' `updateView`.
- */
-export async function runWithActiveSignal<TData>(
-  setSignal: (signal: AbortSignal | null) => void,
-  signal: AbortSignal | undefined,
-  load: () => Promise<TData>
-): Promise<TData> {
-  setSignal(signal ?? null);
-  try {
-    return await load();
-  } finally {
-    setSignal(null);
-  }
-}
-
-/**
- * Run one demand load with a cache-residency probe attached, reporting
- * whether the load was served entirely from cache. Drives the progressive
- * loader's per-frame decision to keep loading the next LOD level (resident)
- * or stop and let the refinement loop continue after a miss. A load that
- * touches no chunks counts as resident (`allResident: true`). The shared
- * body of the three loaders' `updateViewWithResidency`.
- */
-export async function runWithResidencyProbe<TData>(
-  setProbe: (probe: ResidencyAccumulator | null) => void,
-  load: () => Promise<TData>
-): Promise<{ data: TData; allResident: boolean }> {
-  const probe = new ResidencyAccumulator();
-  setProbe(probe);
-  try {
-    const data = await load();
-    return { data, allResident: probe.allResident };
-  } finally {
-    setProbe(null);
-  }
 }

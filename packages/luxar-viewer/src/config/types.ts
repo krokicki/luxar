@@ -26,6 +26,10 @@ import type { DepthSortConfig } from './sections/depth-sort/types';
 /** Depth-sort configuration type. */
 export type { DepthSortConfig };
 
+import type { LodConfig } from './sections/lod/types';
+/** LOD display-policy configuration type. */
+export type { LodConfig };
+
 import type { DimensionAnimationConfig } from './sections/dimension-animation/types';
 /** Dimension-animation configuration type. */
 export type { DimensionAnimationConfig };
@@ -34,10 +38,9 @@ import type {
   WebGLConfig,
   WebGLContextAttributes,
   WebGLRendererConfig,
-  WebGLRenderTargetConfig,
 } from './sections/webgl/types';
-/** WebGL renderer, context-attributes, and render-target configuration types. */
-export type { WebGLConfig, WebGLContextAttributes, WebGLRendererConfig, WebGLRenderTargetConfig };
+/** WebGL renderer and context-attributes configuration types. */
+export type { WebGLConfig, WebGLContextAttributes, WebGLRendererConfig };
 
 import type { InputConfig } from './sections/input/types';
 /** Input (keyboard/mouse) configuration type. */
@@ -66,9 +69,9 @@ import type {
 /** Rendering-controls configuration and per-scene rendering-settings types. */
 export type { RenderingControlsConfig, RenderingSettings };
 
-import type { DebugConsoleConfig, UIComponentsConfig, UIConfig } from './sections/ui/types';
+import type { DebugConsoleConfig, UIConfig } from './sections/ui/types';
 /** UI, UI-components, and debug-console configuration types. */
-export type { DebugConsoleConfig, UIComponentsConfig, UIConfig };
+export type { DebugConsoleConfig, UIConfig };
 
 import type {
   DataLoadingConfig,
@@ -103,6 +106,7 @@ export interface AppConfig {
   adaptiveDPR: AdaptiveDPRConfig;
   densityGuard: DensityGuardConfig;
   depthSort: DepthSortConfig;
+  lod: LodConfig;
   scene: SceneConfig;
   shader: ShaderConfig;
   ui: UIConfig;

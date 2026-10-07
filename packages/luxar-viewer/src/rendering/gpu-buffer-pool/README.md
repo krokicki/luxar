@@ -2,7 +2,7 @@
 
 > Internal helpers for `rendering/gpu-buffer-pool.ts`: per-geometry-type adapters (Points, Lines, GSplats) that own bucketed buffer reuse, and a byte-budget evictor that disposes pooled buffers across all three type pools once the global byte ceiling is exceeded.
 
-The parent `GPUBufferPool` (`../gpu-buffer-pool.ts`) owns the shared coordination state — `activeBuffers`, `frameCount`, `stats`, eviction policy — and delegates per-type acquire / release / update to one adapter per geometry type. This split keeps each adapter focused on its own attribute layout and update path while eviction sees all three pools uniformly.
+The parent `GPUBufferPool` (`../gpu-buffer-pool.ts`) owns the shared coordination state — `activeBuffers`, `commitCount`, `stats`, eviction policy — and delegates per-type acquire / release / update to one adapter per geometry type. This split keeps each adapter focused on its own attribute layout and update path while eviction sees all three pools uniformly.
 
 ## File Structure
 
@@ -14,26 +14,30 @@ gpu-buffer-pool/
 ├── byte-budget-evictor.ts   # Cross-type eviction loop — evictUntilUnderByteBudget()
 ├── geometry-bytes.ts        # Cached per-geometry byte estimate
 │                              (estimateGeometryBytes, invalidateCachedByteSize)
+├── byte-tracked-maps.ts     # ActiveBufferMap / FreeBucketMap — Map subclasses
+│                              keeping incremental active/pooled byte totals
 ├── capacity.ts              # Buffer-capacity sizing primitive
 │                              (chooseCapacity, __setMinInstanceCapacityForTesting)
-├── points-adapter.ts        # PointsBufferAdapter — acquire/release/update for points
-├── lines-adapter.ts         # LinesBufferAdapter   — acquire/release/update for lines
-└── gsplats-adapter.ts       # GSplatsBufferAdapter — acquire/release/update for gsplats
+├── texture-backed-adapter.ts # TextureBackedAdapter — the shared acquire/grow/adopt/
+│                              allocate/release/dispose lifecycle + PoolAdapterHost
+├── points-adapter.ts        # PointsBufferAdapter  — Points layout hook + update
+├── lines-adapter.ts         # LinesBufferAdapter   — Lines layout hook + update
+└── gsplats-adapter.ts       # GSplatsBufferAdapter — GSplats layout hook + held-draw update
 ```
 
 ## Components
 
 ### Per-type adapters
 
-Each adapter (`PointsBufferAdapter`, `LinesBufferAdapter`, `GSplatsBufferAdapter`) owns:
+The three adapters (`PointsBufferAdapter`, `LinesBufferAdapter`, `GSplatsBufferAdapter`) extend one `TextureBackedAdapter` (`texture-backed-adapter.ts`), which owns the whole pool lifecycle — in-place reuse, grow (with the OOM re-claim and the post-grow reclaim sweep), best-fit adoption, fresh allocation, release and dispose — once. A subclass contributes only a `TextureBackedLayout` (its `type`, its texture-capacity clamp, its `attachStorage`) and its own `updateGeometry`. All three write their ordering through the one `writeInstancedCommitOrdering` (held append / held seeded grow / preserve / repair / identity), fed by the commit layer's shared `planInstancedOrdering` (the scene-loader commit layer). The free buckets live in the base's `buffers`, also exposed as `pointBuffers` / `lineBuffers` / `gsplatBuffers` for the pool's stats and the byte evictor. Each adapter owns:
 
 - A bucketed `Map<number, PooledBuffer[]>` of released-but-reusable geometries, keyed by capacity bucket.
 - All three types attach an RGBA32F **element texture** (3 texels/point via `point-geometry.ts::attachPointStorage`; 6 texels/segment via `line-geometry.ts::attachLineStorage`; 4 texels/splat via `gsplat-geometry.ts::attachSplatStorage`) + an `aSortedIndex` (Uint32) ordering attribute (depth-sorting Phase 1 / §8); the texture is disposed by the geometry's own `dispose` event at every dispose site.
 - `acquireGeometry(nodeId, …)` — first checks `host.activeBuffers` for in-place reuse (matching capacity — the fixed texel layouts make capacity the only criterion for every type), then scans bucketed pools best-fit, then falls back to allocation. **Growth is release + reacquire, never an in-place rebuild**: an undersized active buffer is released to the pool intact and the acquire falls through to best-fit/fresh allocation. Replacing a rendered geometry's attributes would strand the old GPU buffer in the renderer caches (freed only at GC mercy on classic WebGL; pinned permanently by the WebGPU renderer's strong `Info.memoryMap`). Content carry-forward is unnecessary — every commit rewrites all attributes for the full count right after acquire.
-- `releaseGeometry(nodeId)` — moves the buffer into a per-capacity bucket and calls `host.evictUnused()`.
-- `updateGeometry(geometry, data, count, …)` — one fused texel pass (`writePointTexels` / `writeLineTexels` / `writeSplatTexels`, each with a fail-loud pre-store guard) plus an identity `aSortedIndex` fill. Same-count recommits may preserve the prior permutation; Points/Lines appends extend it with an identity suffix, while GSplat appends reset the full ordering so alpha-over never draws an old sorted prefix and a new independently ordered suffix. All recompute `boundingBox` / `boundingSphere`; the lines adapter expands the box by max line width, the gsplats adapter by max Cholesky row-norm × truncation radius.
+- `releaseGeometry(nodeId)` — cancels any in-flight chunked ordering apply, moves the buffer into a per-capacity bucket and calls `host.evictUnused()`. A held append draw is left held (no O(n) repair for a geometry nobody draws); the next commit that writes the geometry resolves it.
+- `updateGeometry(geometry, data, count, …)` — one fused texel pass (`writePointTexels` / `writeLineTexels` / `writeSplatTexels`, each with a fail-loud pre-store guard) plus the commit ordering write (`writeInstancedCommitOrdering`). Same-count recommits may preserve the prior permutation and count changes repair it. An append of any of the three types HOLDS the draw (`instanceCount` stays at the previous population, in its previous order) until the grown population's own ordering flips in — `holdSortedIndexDrawForAppend` in `element-storage.ts`; the depth-sort coordinator releases the hold on every path where that ordering will not arrive. A pool GROW that still extends the drawn population is held the same way, seeded with the previous geometry's drawn permutation (`seedOrdering`). The alternative — the old sorted prefix with a storage-order suffix drawn after it — composites every appended element over the whole prefix regardless of depth, which shows in every order-dependent mode: Points never depth-write in `normal`, Lines only at opacity >= 0.99, and neither does in `volumetric`. An order-independent node's hold is released inside the same commit, and over an identity ordering that release writes and uploads only the appended tail, so additive appends cost what they did. All recompute `boundingBox` / `boundingSphere`; the lines adapter expands the box by max line width, the gsplats adapter by max Cholesky row-norm × truncation radius.
 
-Adapters interact with the parent pool only through the narrow `*AdapterHost` interfaces — they read `activeBuffers`, `frameCount`, `stats`, `typeStats`, call `host.getBucket(count)` and `host.evictUnused()`, and set `host._lastAcquireRebuilt` so the parent knows whether the returned geometry still has its previous attribute bindings.
+Adapters interact with the parent pool only through the narrow `PoolAdapterHost` interface — they read `activeBuffers`, `commitCount`, `stats`, `typeStats`, call `host.getBucket(count)` and `host.evictUnused()`, and set `host._lastAcquireRebuilt` so the parent knows whether the returned geometry still has its previous attribute bindings.
 
 ### Dtype-blind pooling
 
@@ -46,6 +50,14 @@ Points (texel2.x) and lines (texel5.xy) always carry scalar texel slots, written
 ### Capacity sizing
 
 `capacity.ts::chooseCapacity(requested)` is the single sizing primitive every adapter calls on each allocate / grow: it rounds up to `requested × 1.5` (headroom so the next update rarely re-grows) but never below a `DEFAULT_MIN_INSTANCE_CAPACITY` floor of 256 instances. The headroom is **capped at `MAX_CAPACITY_HEADROOM` = 262,144 elements**, so the factor does not scale into hundreds of wasted MiB on a very large node: headroom absorbs a per-slice count wobble of a few thousand elements, not a fixed share of however big the node is, and it is charged against a real per-element cost (a Lines geometry is 96 B/segment of element texture plus 8 B/segment of ordering pair, so an uncapped 1.5× is 52 B of slack per segment). `cosmicflows_laniakea_full` — nine sibling Lines nodes, 11.4M segments, no LOD ladder so all of it is resident — needed 1702 MiB of pool against a 2000 MiB budget and died with "Array buffer allocation failed"; the cap brings it to 1369 MiB. Nodes under 524,288 elements are unaffected and keep the full factor. Living in this leaf module lets the three adapters import it without a cycle against the parent `gpu-buffer-pool.ts` barrel (which re-exports `chooseCapacity` and the `__setMinInstanceCapacityForTesting` test hook). `__setMinInstanceCapacityForTesting(value | null)` lowers the floor so unit tests can exercise the grow paths at small instance counts.
+
+### Incremental byte totals
+
+`GPUBufferPool.getResidentBytes()` (active + pooled bytes — the VRAM figure the LOD registry polls every frame and the byte pass reads on every acquire/release) is O(1): `activeBuffers` is an `ActiveBufferMap` and each adapter's free buckets a `FreeBucketMap` (`byte-tracked-maps.ts`), both `Map` subclasses that keep a running `bytes` total. `ActiveBufferMap` charges on `set` and uncharges on `delete`/`clear`/replacement. `FreeBucketMap` remembers each bucket's charge and RESYNCS it on `set(bucket, array)`/`delete`/`clear`, so an in-place `push`/`splice` on a bucket array is exact once that bucket is re-`set` or deleted; the adapters use its `pushBuffer`/`takeAt`/`removeFirst` helpers, and the byte evictor re-`set`s each bucket after every splice (before the dispose, so a throwing dispose listener cannot desync it). `getStats()` still walks every buffer (it needs per-type and largest-buffer figures, and is a stats poll, not a per-frame query). `gpu-pool-resident-bytes.property.test.ts` checks the incremental totals against a from-scratch walk after each of 10,000 seeded random operations.
+
+### LRU ageing is counted in commits
+
+The pool's clock is `commitCount`, advanced by `beginCommit()`, whose only production caller is the atomic commit (`data/scene-loader/update-view/atomic-commit.ts`, once per non-discarded update pass). Every age in the pool — `lastUsedCommit`, the `evictionCommits` threshold (default 300), the `OVER_LIMIT_GRACE_COMMITS` (60) `mustEvict` grace, the byte evictor's same-commit `graceCommit` — is therefore in **atomic commits, not rendered frames** (#2939). That is the intended policy (buffers are only acquired and released on commits), with two consequences: an orbiting or idle view runs no commit, so pooled buffers do not age and are freed only by the byte budget or `maxPoolSize`; and playback or scrubbing can run 300 commits in a few seconds. There is no idle time-based sweep.
 
 ### Eviction policy
 
@@ -64,8 +76,8 @@ The evictor sees pooled-only buffers — active (in-use) buffers are never candi
 
 ## Shared types — `pool-stats.ts`
 
-- `PooledBuffer` — one pooled geometry plus the metadata the pool needs: `capacity`, `type` (`'points' | 'lines' | 'gsplats'`), `inUse`, `lastUsedFrame`.
-- `TypePoolStats` / `PoolStats` — per-type counters plus aggregate totals. `PoolStats.deferredEvictions` is incremented when the per-call batch cap (`evictBatchSize`) trips, so a long pause + resume that stretches the eviction queue across multiple frames is observable. `PoolStats.byteBudgetEvictions` is the subset of `evictions` charged by the byte-budget pass alone: `evictions` is dominated by routine LRU recycling on any nD scene, so only this counter says the pool shed geometry it could not afford, and only it makes the rendered counts unreproducible (consumed by `core/app/debug/capture-readiness.ts`).
+- `PooledBuffer` — one pooled geometry plus the metadata the pool needs: `capacity`, `type` (`'points' | 'lines' | 'gsplats'`), `inUse`, `lastUsedCommit`.
+- `TypePoolStats` / `PoolStats` — per-type counters plus aggregate totals. `PoolStats.deferredEvictions` is incremented when the per-call batch cap (`evictBatchSize`) trips, so a long pause + resume that stretches the eviction queue across multiple sweeps is observable. `PoolStats.byteBudgetEvictions` is the subset of `evictions` charged by the byte-budget pass alone: `evictions` is dominated by routine LRU recycling on any nD scene, so only this counter says the pool shed geometry it could not afford, and only it makes the rendered counts unreproducible (consumed by `core/app/debug/capture-readiness.ts`).
 - `PooledBufferRef` — minimal `{ bytes, payload? }` shape consumed by the pure `selectBuffersToEvict` selector.
 
 ## Invariants

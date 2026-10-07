@@ -27,6 +27,10 @@
 
 import { test, expect, type Page } from '@playwright/test';
 
+import type { GeometryTypeName } from '../../types/format-contract';
+import type { PrimitiveVariant } from '../helpers/geometry-materials';
+import { PICK_VISIBILITY_RULES } from '../_conformance/pick-visibility-rules';
+
 const HARNESS_URL = '/tsl-harness.html';
 
 type TSLResult = {
@@ -47,19 +51,33 @@ async function bootHarness(page: Page): Promise<string[]> {
   return page.evaluate(() => window.__tslHarness!.listShaders());
 }
 
-async function runGLSL(page: Page, shaderName: string): Promise<number[]> {
-  return page.evaluate((name) => Array.from(window.__tslHarness!.renderGLSL(name)), shaderName);
+async function runGLSL(
+  page: Page,
+  shaderName: string,
+  uniforms?: Record<string, number>
+): Promise<number[]> {
+  return page.evaluate(
+    ([name, overrides]) => Array.from(window.__tslHarness!.renderGLSL(name, overrides)),
+    [shaderName, uniforms] as const
+  );
 }
 
-async function runTSL(page: Page, shaderName: string): Promise<TSLResult> {
-  return page.evaluate(async (name) => {
-    const result = await window.__tslHarness!.renderTSL(name);
-    return {
-      pixels: Array.from(result.pixels),
-      vertexShader: result.vertexShader,
-      fragmentShader: result.fragmentShader,
-    };
-  }, shaderName);
+async function runTSL(
+  page: Page,
+  shaderName: string,
+  uniforms?: Record<string, number>
+): Promise<TSLResult> {
+  return page.evaluate(
+    async ([name, overrides]) => {
+      const result = await window.__tslHarness!.renderTSL(name, { uniforms: overrides });
+      return {
+        pixels: Array.from(result.pixels),
+        vertexShader: result.vertexShader,
+        fragmentShader: result.fragmentShader,
+      };
+    },
+    [shaderName, uniforms] as const
+  );
 }
 
 async function runBloomChain(
@@ -1634,7 +1652,7 @@ test.describe('TSL ↔ GLSL shader parity', () => {
 
     // ABSOLUTE brightness assertion — parity alone is blind to this
     // bug because BOTH backends shared the maxLateralVar > 0.01 gate.
-    // projectedExtent = uFx·sigma·truncate = 3200·0.005·3 = 48 px sits
+    // projectedExtent = focal·sigma·truncate = 3200·0.005·3 = 48 px sits
     // mid-band (32, 64) → coverageFade = 0.5 → red-channel peak ≈ 127.
     // Pre-fix the gate skipped the fade for this sigma and the peak
     // saturated at ~255.
@@ -1707,6 +1725,28 @@ test.describe('TSL ↔ GLSL shader parity', () => {
       diff,
       `GSplat-normal-premult parity: mean abs diff ${diff.toFixed(2)} on 0-255 scale.\nSamples:\n${samples}`
     ).toBeLessThan(3.0);
+  });
+
+  test('gsplat-normal-thinned: the density-guard alpha-over compensation matches its TSL twin', async ({
+    page,
+  }) => {
+    await bootHarness(page);
+
+    const glslPixels = await runGLSL(page, 'gsplat-normal-thinned');
+    const tslResult = await runTSL(page, 'gsplat-normal-thinned');
+    assertBothRendered(glslPixels, tslResult.pixels, 'gsplat-normal-thinned');
+    expect(
+      meanAbsDiffPerCoveredPixel(glslPixels, tslResult.pixels),
+      'gsplat-normal-thinned: per-covered-pixel parity (footprint-invariant)'
+    ).toBeLessThan(2.0);
+    expect(meanAbsDiff(glslPixels, tslResult.pixels)).toBeLessThan(3.0);
+
+    // The compensation actually ran: the thinned splat's centre is more
+    // opaque than the unthinned one's (1 − (1 − c)^4 > c for 0 < c < 1).
+    const plain = await runGLSL(page, 'gsplat-normal-premult');
+    const centre = (px: number[]) => px[(32 * 64 + 32) * 4 + 3];
+    expect(centre(glslPixels)).toBeGreaterThan(centre(plain));
+    expect(centre(tslResult.pixels)).toBeGreaterThan(centre(plain));
   });
 
   test('gsplat-volumetric: LUXAR_VOLUMETRIC emission–absorption matches TSL volumetric branch', async ({
@@ -1830,6 +1870,7 @@ test.describe('TSL ↔ GLSL shader parity', () => {
   // Asserted on BOTH backends, plus the usual cross-backend parity.
   for (const { variant, wantNear } of [
     { variant: 'gsplat-pick-surface', wantNear: true },
+    { variant: 'gsplat-pick-surface-persp', wantNear: true },
     { variant: 'gsplat-pick-surface-off', wantNear: false },
   ] as const) {
     test(`${variant}: ${
@@ -1906,6 +1947,33 @@ test.describe('TSL ↔ GLSL shader parity', () => {
     ).toBeLessThan(2.0);
   });
 
+  // The production TSL quad is a compile-time projection VARIANT chosen per
+  // draw from the drawn camera (projection-variant.ts). Each variant must
+  // render EXACTLY what the runtime-ortho graph renders through the same
+  // camera (it only folds the projection test to a constant), and must agree
+  // with the GLSL twin like its runtime entry does.
+  for (const [variant, runtime] of [
+    ['line-variant-ortho', 'line'],
+    ['line-variant-persp', 'line-crossing'],
+    ['line-pick-variant-ortho', 'line-pick'],
+    ['line-pick-variant-persp', 'line-pick-crossing'],
+  ] as const) {
+    test(`${variant}: the compile-time variant renders exactly its runtime graph`, async ({
+      page,
+    }) => {
+      await bootHarness(page);
+      const glslPixels = await runGLSL(page, variant);
+      const variantPixels = (await runTSL(page, variant)).pixels;
+      const runtimePixels = (await runTSL(page, runtime)).pixels;
+      assertBothRendered(glslPixels, variantPixels, variant);
+      expect(variantPixels, `${variant} == ${runtime} (TSL)`).toEqual(runtimePixels);
+      expect(
+        meanAbsDiffPerCoveredPixel(glslPixels, variantPixels),
+        `${variant}: GLSL parity`
+      ).toBeLessThan(2.0);
+    });
+  }
+
   test('point-pick: tight sprite with nodeId / elementId / brightness output', async ({ page }) => {
     await bootHarness(page);
 
@@ -1927,9 +1995,9 @@ test.describe('TSL ↔ GLSL shader parity', () => {
     ).toBeLessThan(2.0);
   });
 
-  // Behind-camera parity. A perspective camera (uIsOrtho:0) with the point
-  // behind it — the only cases exercising the perspective path and the
-  // behind-camera reject (`uIsOrtho == 0 && mvPosition.z >= 0`); every other
+  // Behind-camera parity. A perspective camera with the point behind it —
+  // the only cases exercising the perspective path and the perspective-only
+  // behind-camera reject (view z >= 0); every other
   // point case is ortho. Each asserts GLSL ↔ TSL produce identical frames and
   // that the frame is uniform (no fragments).
   //
@@ -2072,6 +2140,103 @@ test.describe('TSL ↔ GLSL shader parity', () => {
 
     expect(nonUniformPixelCount(dpr2)).toBeGreaterThan(nonUniformPixelCount(dpr1));
     expect(dprHalf).toEqual(dpr1);
+  });
+
+  test('point-cube-face: a cube-capture face renders a point as its +90° equivalent does', async ({
+    page,
+  }) => {
+    // The scene-captured environment draws the data through CubeCamera faces
+    // (fov −90, a flipped projection). The point size is read from the
+    // projection as |P11|: a signed P11 would make it negative and clamp the
+    // sprite to the 1.5 px floor, so the face would show a speck where the
+    // equivalent camera shows a ~4 px point.
+    await bootHarness(page);
+
+    const face = await runGLSL(page, 'point-cube-face');
+    const equivalent = await runGLSL(page, 'point-cube-face-equivalent');
+    const faceTsl = (await runTSL(page, 'point-cube-face')).pixels;
+    const equivalentTsl = (await runTSL(page, 'point-cube-face-equivalent')).pixels;
+
+    assertBothRendered(face, faceTsl, 'point-cube-face');
+    expect(nonUniformPixelCount(face), 'a real sprite, not the size floor').toBeGreaterThan(9);
+    expect(meanAbsDiffPerCoveredPixel(face, equivalent), 'GLSL face vs equivalent').toBeLessThan(
+      1.0
+    );
+    expect(
+      meanAbsDiffPerCoveredPixel(faceTsl, equivalentTsl),
+      'TSL face vs equivalent'
+    ).toBeLessThan(1.0);
+  });
+
+  test('line-cube-face: a cube-capture face renders a line as its +90° equivalent does', async ({
+    page,
+  }) => {
+    // The line pixel-width scale is resY·|P11| read from the projection; a
+    // signed P11 would negate the width under the CubeCamera's fov −90.
+    await bootHarness(page);
+
+    const face = await runGLSL(page, 'line-cube-face');
+    const equivalent = await runGLSL(page, 'line-cube-face-equivalent');
+    const faceTsl = (await runTSL(page, 'line-cube-face')).pixels;
+    const equivalentTsl = (await runTSL(page, 'line-cube-face-equivalent')).pixels;
+
+    assertBothRendered(face, faceTsl, 'line-cube-face');
+    expect(nonUniformPixelCount(face), 'a real line, not the width floor').toBeGreaterThan(40);
+    expect(meanAbsDiffPerCoveredPixel(face, equivalent), 'GLSL face vs equivalent').toBeLessThan(
+      1.0
+    );
+    expect(
+      meanAbsDiffPerCoveredPixel(faceTsl, equivalentTsl),
+      'TSL face vs equivalent'
+    ).toBeLessThan(1.0);
+  });
+
+  test('gsplat-cube-face: a cube-capture face places a splat where its +90° equivalent does', async ({
+    page,
+  }) => {
+    // The scene-captured environment draws the data through CubeCamera faces
+    // (fov −90, a flipped P). Splat centres and Jacobians now go through P,
+    // so the face and its rolled +90° equivalent render the same image; the
+    // CPU focal length they used before carried no flip and put the splat on
+    // the point-reflected pixel (mirrored splats in reflections).
+    await bootHarness(page);
+
+    const face = await runGLSL(page, 'gsplat-cube-face');
+    const equivalent = await runGLSL(page, 'gsplat-cube-face-equivalent');
+    const faceTsl = (await runTSL(page, 'gsplat-cube-face')).pixels;
+    const equivalentTsl = (await runTSL(page, 'gsplat-cube-face-equivalent')).pixels;
+
+    assertBothRendered(face, faceTsl, 'gsplat-cube-face');
+    expect(nonUniformPixelCount(face), 'a visible splat').toBeGreaterThan(20);
+    expect(meanAbsDiffPerCoveredPixel(face, equivalent), 'GLSL face vs equivalent').toBeLessThan(
+      1.0
+    );
+    expect(
+      meanAbsDiffPerCoveredPixel(faceTsl, equivalentTsl),
+      'TSL face vs equivalent'
+    ).toBeLessThan(1.0);
+  });
+
+  test('line-tiny-ortho: a nanometre-scale ortho line renders as its unit-scale twin', async ({
+    page,
+  }) => {
+    // The same line and frustum shrunk 1e5x: identical under orthographic
+    // projection. The historical CPU scale clamped the frustum height to 1e-4
+    // first, so this line came out 5x narrower than its twin.
+    await bootHarness(page);
+
+    const tiny = await runGLSL(page, 'line-tiny-ortho');
+    const unit = await runGLSL(page, 'line-unit-ortho');
+    const tinyTsl = (await runTSL(page, 'line-tiny-ortho')).pixels;
+    const unitTsl = (await runTSL(page, 'line-unit-ortho')).pixels;
+
+    assertBothRendered(tiny, tinyTsl, 'line-tiny-ortho');
+    expect(nonUniformPixelCount(unit), 'the unit-scale line is drawn').toBeGreaterThan(40);
+    expect(nonUniformPixelCount(tiny), 'as many pixels as its unit-scale twin').toBe(
+      nonUniformPixelCount(unit)
+    );
+    expect(meanAbsDiffPerCoveredPixel(tiny, unit), 'GLSL tiny vs unit').toBeLessThan(1.0);
+    expect(meanAbsDiffPerCoveredPixel(tinyTsl, unitTsl), 'TSL tiny vs unit').toBeLessThan(1.0);
   });
 
   test('point-near-fade: mid-band near fade renders identically across backends (B9c)', async ({
@@ -2431,6 +2596,11 @@ test.describe('TSL ↔ GLSL shader parity', () => {
     'mesh-texture',
     'mesh-none-shading',
     'mesh-pick-texture',
+    // The gamma == 1 and no-GOG fast paths, the mesh peers of the point / line /
+    // gsplat `-gamma-one` / `-no-gog` parity tests. A default mesh (gain 1, offset
+    // 0) renders with the no-GOG build, so it is the common case, not an edge.
+    'mesh-gamma-one',
+    'mesh-no-gog',
   ] as const) {
     test(`${variant}: shaded surface parity across backends`, async ({ page }) => {
       await bootHarness(page);
@@ -2704,6 +2874,26 @@ test.describe('TSL ↔ GLSL shader parity', () => {
     }
   });
 
+  test('mesh near fade: the ortho branch is the identity under an orthographic camera', async ({
+    page,
+  }) => {
+    // `mesh-ortho-near-cull` is `mesh` with the perspective entries' uNearCull (0.8),
+    // which would fade the quad to 0.15625 under perspective. The ortho test is read
+    // from the camera being drawn with (three's isOrthographic / P[3][3]), so under
+    // the ortho default camera the fade must be the identity and the frame must equal
+    // `mesh` exactly — on both backends.
+    await bootHarness(page);
+
+    const plain = await runGLSL(page, 'mesh');
+    const nearCull = await runGLSL(page, 'mesh-ortho-near-cull');
+    const plainTsl = (await runTSL(page, 'mesh')).pixels;
+    const nearCullTsl = (await runTSL(page, 'mesh-ortho-near-cull')).pixels;
+
+    assertBothRendered(nearCull, nearCullTsl, 'mesh-ortho-near-cull');
+    expect(nearCull, 'GLSL: ortho near cull is not a fade').toEqual(plain);
+    expect(nearCullTsl, 'TSL: ortho near cull is not a fade').toEqual(plainTsl);
+  });
+
   test('mesh near fade: parity under perspective, on the visual AND the pick pass', async ({
     page,
   }) => {
@@ -2727,7 +2917,7 @@ test.describe('TSL ↔ GLSL shader parity', () => {
     // against two backends that BOTH ignored the fade.
     //
     // The two visual references are the `*-near-fade-reference` entries: same camera,
-    // same `uNearCull`, `uIsOrtho` flipped to 1 so the fade is the identity. Using the
+    // a `uNearCull` far inside the quad's depth so the fade is the identity. Using the
     // ortho-camera `mesh` / `mesh-additive` entries instead would compare across two
     // framings — the ortho frame is 2.0 wide at z = 0 against the perspective frame's
     // 2·tan(30°) = 1.155 — so pixel (i, j) would be a different point on the quad in
@@ -3139,4 +3329,148 @@ test.describe('TSL ↔ GLSL shader parity', () => {
     expect(thinCovered, 'thin fold: hairline-sized joint only').toBeLessThan(60);
     expect(thinCovered, 'thin fold ≪ wide fold').toBeLessThan(wideCovered / 2);
   });
+});
+
+/**
+ * Draw/pick coverage: the pixel-level half of the draw/pick conformance table
+ * (`tests/_conformance/pick-visibility-rules.ts`; the source-level half is
+ * `tests/unit/rendering/picking/draw-pick-parity.test.ts`).
+ *
+ * Each `(type, variant)` renders ONE fixture through its draw shader and its
+ * pick shader, on both backends, and compares the two coverage masks:
+ *
+ * - pick ⊆ draw: no pick pixel where the draw covers nothing, beyond one pixel
+ *   of rasterisation edge;
+ * - the pick covers at least `minCoverage` of the drawn pixels, so a pick that
+ *   went blank, or shrank far below its declared footprint, fails. The floors
+ *   sit about half-way under what SwiftShader measured (points, lines and
+ *   mesh 1.0, capsule 0.994, gsplats 0.275 — the gsplat pick truncates at
+ *   1.5σ, the table's one deliberate shrink at this fixture's scale);
+ * - with `uDensityDrop` set, the fixture's element (storage index 0, whose
+ *   hash is 0, so any drop removes it) is gone from BOTH frames, for every
+ *   cell the table declares `densityDrop: 'same'`. This is the check the
+ *   capsule line pick that ignored the drop would have failed.
+ */
+const DRAW_PICK_PAIRS: Record<
+  GeometryTypeName,
+  Partial<Record<PrimitiveVariant, { draw: string; pick: string; minCoverage: number }>>
+> = {
+  points: { quad: { draw: 'point', pick: 'point-pick', minCoverage: 0.5 } },
+  lines: {
+    quad: { draw: 'line', pick: 'line-pick', minCoverage: 0.5 },
+    capsule: { draw: 'line-capsule-fat', pick: 'line-capsule-pick-sideon', minCoverage: 0.5 },
+  },
+  gsplats: { quad: { draw: 'gsplat', pick: 'gsplat-pick', minCoverage: 0.15 } },
+  mesh: { triangle: { draw: 'mesh', pick: 'mesh-pick', minCoverage: 0.9 } },
+};
+
+/**
+ * The harness renderers' clear: black, opaque (`alpha: false`). Coverage is
+ * measured against it rather than against a frame's first pixel, because the
+ * mesh fixture's quad covers the corners.
+ */
+const HARNESS_CLEAR = [0, 0, 0, 255] as const;
+
+/** Pixels a frame wrote: anything that is not the clear. */
+function coverageMask(pixels: number[]): Uint8Array {
+  const mask = new Uint8Array(pixels.length / 4);
+  for (let i = 0; i < mask.length; i++) {
+    const o = i * 4;
+    for (let c = 0; c < 4; c++) {
+      if (pixels[o + c] !== HARNESS_CLEAR[c]) mask[i] = 1;
+    }
+  }
+  return mask;
+}
+
+/** Pick pixels outside the (1-px grown) draw, and the share of the draw the pick covers. */
+function pickWithinDraw(draw: number[], pick: number[], size: number) {
+  expect(draw.length, 'draw frame is not size² RGBA').toBe(size * size * 4);
+  expect(pick.length, 'pick frame is not size² RGBA').toBe(size * size * 4);
+  const drawn = coverageMask(draw);
+  const picked = coverageMask(pick);
+  let outside = 0;
+  let drawnCount = 0;
+  let overlap = 0;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = y * size + x;
+      if (drawn[i]) drawnCount++;
+      if (!picked[i]) continue;
+      if (drawn[i]) overlap++;
+      let near = false;
+      for (let dy = -1; dy <= 1 && !near; dy++) {
+        for (let dx = -1; dx <= 1 && !near; dx++) {
+          const xx = x + dx;
+          const yy = y + dy;
+          near = xx >= 0 && yy >= 0 && xx < size && yy < size && drawn[yy * size + xx] === 1;
+        }
+      }
+      if (!near) outside++;
+    }
+  }
+  return { outside, coverage: drawnCount > 0 ? overlap / drawnCount : 0, drawnCount };
+}
+
+const DRAW_PICK_CELLS = (
+  Object.entries(DRAW_PICK_PAIRS) as [GeometryTypeName, (typeof DRAW_PICK_PAIRS)['points']][]
+).flatMap(([type, variants]) =>
+  (
+    Object.entries(variants) as [
+      PrimitiveVariant,
+      { draw: string; pick: string; minCoverage: number },
+    ][]
+  ).map(([variant, pair]) => ({ type, variant, ...pair }))
+);
+
+test.describe('draw/pick coverage: the pick stays inside the draw', () => {
+  test('rejects frames that do not match the declared size', () => {
+    const frame = [0, 0, 0, 255];
+    expect(() => pickWithinDraw([], frame, 1)).toThrow('draw frame is not size² RGBA');
+    expect(() => pickWithinDraw(frame, [], 1)).toThrow('pick frame is not size² RGBA');
+  });
+
+  test('every (type, variant) of the rule table has a draw/pick pair', () => {
+    for (const [type, variants] of Object.entries(PICK_VISIBILITY_RULES)) {
+      for (const variant of Object.keys(variants)) {
+        expect(
+          DRAW_PICK_PAIRS[type as GeometryTypeName][variant as PrimitiveVariant],
+          `${type} ${variant}`
+        ).toBeDefined();
+      }
+    }
+  });
+
+  for (const { type, variant, draw, pick, minCoverage } of DRAW_PICK_CELLS) {
+    for (const backend of ['glsl', 'tsl'] as const) {
+      test(`${type} ${variant} (${backend}): ${pick} lies within ${draw}`, async ({ page }) => {
+        await bootHarness(page);
+        const render = async (name: string, uniforms?: Record<string, number>) =>
+          backend === 'glsl'
+            ? runGLSL(page, name, uniforms)
+            : (await runTSL(page, name, uniforms)).pixels;
+
+        const drawPixels = await render(draw);
+        const pickPixels = await render(pick);
+        assertNeitherFrameEmpty(drawPixels, pickPixels, `${draw} / ${pick}`);
+        const { outside, coverage } = pickWithinDraw(drawPixels, pickPixels, 64);
+        test.info().annotations.push({
+          type: 'coverage',
+          description: `${type} ${variant} ${backend}: outside ${outside}, coverage ${coverage.toFixed(3)}`,
+        });
+        expect(outside, `${pick} reports pixels ${draw} does not draw`).toBe(0);
+        expect(coverage, `${pick} covers too little of ${draw}`).toBeGreaterThanOrEqual(
+          minCoverage
+        );
+
+        if (PICK_VISIBILITY_RULES[type][variant]?.densityDrop !== 'same') return;
+        // Storage index 0 hashes to 0, so any positive drop removes the element.
+        const dropped = { uDensityDrop: 0.5 };
+        const drawDropped = await render(draw, dropped);
+        const pickDropped = await render(pick, dropped);
+        expect(nonUniformPixelCount(drawDropped), `${draw}: a dropped element is drawn`).toBe(0);
+        expect(nonUniformPixelCount(pickDropped), `${pick}: a dropped element is pickable`).toBe(0);
+      });
+    }
+  }
 });

@@ -19,7 +19,9 @@
 import {
   GLSL_SANITIZE_FUNCTIONS,
   GLSL_NEAR_FADE_FUNCTIONS,
+  GLSL_PROJECTION_FUNCTIONS,
   GLSL_SORTED_INDEX,
+  GLSL_DENSITY_ALPHA,
 } from '../_shared/glsl-lib';
 import {
   GLSL_GLASS_PARTITION_GUARD,
@@ -41,6 +43,7 @@ export const POINT_VERTEX_SHADER = /* glsl */ `
 
     ${GLSL_SANITIZE_FUNCTIONS}
     ${GLSL_NEAR_FADE_FUNCTIONS}
+    ${GLSL_PROJECTION_FUNCTIONS}
 
     // Per-vertex (4 corners): -1..1 normalised quad coordinates.
     in vec2 aQuadCorner;
@@ -62,10 +65,8 @@ export const POINT_VERTEX_SHADER = /* glsl */ `
     uniform mediump float uInvGamma;   // Gamma applied to the VALUE, pre-LUT (see note below)
     #endif
 
-    uniform float pointSizeFactor; // Pre-computed: 2.0 * resolution.y / tanHalfFov (or 4.0 * resolution.y / frustumHeight for ortho)
     uniform float maxPointSize;    // Pre-computed: resolution.y * 0.5
     uniform float radiusScale;
-    uniform int uIsOrtho;          // 0 = perspective, 1 = orthographic
     uniform vec2 uResolution;      // Physical framebuffer size in pixels
     uniform float uPixelRatio;     // Physical framebuffer pixels per CSS pixel
     uniform float uNearCull;       // Near-fade start distance (world units)
@@ -162,7 +163,7 @@ export const POINT_VERTEX_SHADER = /* glsl */ `
       // floor here overrode the scene-relative value on tiny-unit
       // scenes (diagonal ~1e-6 put the WHOLE scene inside the fade
       // band and every vertex was rejected).
-      vNearFade = perspectiveNearFade(uIsOrtho, mvPosition.z, max(uNearCull, 1e-20));
+      vNearFade = perspectiveNearFade(luxarIsOrthoProjection(), mvPosition.z, max(uNearCull, 1e-20));
       if (vNearFade < 0.01) {
         gl_Position = vec4(0.0, 0.0, -2.0, 1.0); // off-screen → no fragments
         return;
@@ -181,8 +182,9 @@ export const POINT_VERTEX_SHADER = /* glsl */ `
       // clamp(basePointSize, 1.5 * uPixelRatio, maxPointSize) below bounds the
       // output either way. The old absolute 1e-4 clamped VALID depths
       // on tiny-unit scenes (-z ~ 1e-6), shrinking every sprite ~100×.
-      float invDistance = (uIsOrtho == 1) ? 1.0 : 1.0 / max(-mvPosition.z, 1e-20);
-      float basePointSize = normalizedRadius * pointSizeFactor * invDistance;
+      float invDistance = (luxarIsOrthoProjection() == 1) ? 1.0 : 1.0 / max(-mvPosition.z, 1e-20);
+      float sizeFactor = 2.0 * uResolution.y * luxarProjectionSizeScale();
+      float basePointSize = normalizedRadius * sizeFactor * invDistance;
 
       // The shifted-truncated super-Gaussian falloff (fragment shader)
       // truncates to zero exactly at the sprite edge (rho = 1), so the
@@ -219,11 +221,12 @@ export const POINT_VERTEX_SHADER = /* glsl */ `
  *
  * Computes the shifted-truncated super-Gaussian falloff, GOG color
  * adjustment, and alpha output.
- * The picking system uses a different fragment shader (see picking/point-picking-material.ts).
+ * The picking system uses a different fragment shader (see picking/point/shaders.ts).
  */
 export const POINT_FRAGMENT_SHADER = /* glsl */ `
     precision highp float;
     ${GLSL_GLASS_PARTITION_UNIFORMS}
+    ${GLSL_DENSITY_ALPHA}
 
     uniform float uPixelRatio;
     uniform mediump float uOpacity;
@@ -385,7 +388,9 @@ export const POINT_FRAGMENT_SHADER = /* glsl */ `
       fragColor = vec4(finalColor * alpha, alpha);
       #else
       // Output final color with alpha for AdditiveBlending (SrcAlpha, One)
-      fragColor = vec4(finalColor, alpha);
+      // and for normal's SrcAlpha / OneMinusSrcAlpha, whose alpha carries the
+      // density guard's thinning compensation (identity unless thinned).
+      fragColor = vec4(finalColor, luxarDensityAlpha(alpha));
       #endif
     }
   `;

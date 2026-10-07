@@ -6,12 +6,11 @@
  * Much shorter than the other three, and the reasons are structural rather than
  * "less finished":
  *
- * - **No GPU buffer pool.** The pool exists to recycle the instanced-quad
- *   attribute buffers whose capacity churns as a slice query returns different
- *   element counts. A mesh's vertex buffers are uploaded once per `displayDims`
- *   epoch and never resized, so there is nothing to recycle
- *   (`gpu-buffer-pool/pool-stats.ts` must keep listing exactly the three instanced
- *   types).
+ * - **No pooled mesh buffers.** The pool recycles instanced-quad attribute
+ *   buffers whose capacity churns as slice queries return different counts.
+ *   Mesh buffers are not reused, but their committed bytes are registered for
+ *   the shared resident-byte budget (`pool-stats.ts` still lists the three
+ *   instanced types only).
  * - **No capacity clamp.** Mesh's element ordinal is `gl_VertexID`, not an
  *   element-texture texel, so it is bounded by `MAX_MESH_VERTICES` at the loader's
  *   Stage-1 preflight instead of by texture dimensions here.
@@ -28,8 +27,9 @@
  * @module data/scene-loader/commit/commit-mesh-geometry
  */
 
+import { findObjectByName } from '../../../utils/scene-graph-index';
 import type * as THREE from 'three';
-import { log, Modules } from '../../../utils/log';
+import { log, LogEmoji, Modules } from '../../../utils/log';
 import { updateMeshGeometry } from '../../../rendering/mesh-geometry';
 import { invalidateRenderObjectFor } from './invalidate-render-object';
 import {
@@ -38,7 +38,7 @@ import {
   applyMeshTexture,
   applyMeshVertexAlpha,
 } from '../../../rendering/node-factory/create-mesh-node';
-import { noteDepthSortCommit } from '../../../rendering/depth-sort-coordinator';
+import type { DepthSortCoordinator } from '../../../rendering/depth-sort-coordinator';
 import { computeFaceCentroids } from '../../../rendering/depth-sort-coordinator/triangle-ordering';
 import { stampLadderComplete, stampLoadedViewVersion } from './stamp-view-version';
 import { markFirstCommit } from '../../../profiling/load-timeline';
@@ -46,11 +46,37 @@ import { setCommittedData } from '../../../types/committed-data';
 import { isMeshUserData, type MeshMetadata } from '../../../types/mesh';
 import type { StagedMeshCommit } from '../process/data-processor-mesh';
 import type { UpdateSession } from '../../../profiling/update-profiler';
+import type { GPUBufferPool } from '../../../rendering/gpu-buffer-pool';
 
 /** Host references the commit needs. */
 export interface MeshCommitCtx {
   rootGroup: THREE.Group | null;
   currentVersion: number;
+  gpuBufferPool?: GPUBufferPool | null;
+  /** The host's depth-sort coordinator (see `GeometryCommitHost.depthSort`). */
+  depthSort?: DepthSortCoordinator | null;
+}
+
+function accountMeshGeometry(
+  ctx: MeshCommitCtx,
+  path: string,
+  geometry: THREE.BufferGeometry
+): void {
+  ctx.gpuBufferPool?.registerMeshGeometry(path, geometry);
+}
+
+/** Hand a committed epoch to the host's depth-sort coordinator (see the call site). */
+function noteMeshDepthSortCommit(
+  ctx: MeshCommitCtx,
+  object: THREE.Mesh,
+  projected: StagedMeshCommit['projected']
+): void {
+  ctx.depthSort?.noteCommit(
+    object,
+    () => computeFaceCentroids(projected.position, projected.indices, projected.visibleFaceCount),
+    projected.visibleFaceCount,
+    projected.indices
+  );
 }
 
 /**
@@ -71,7 +97,7 @@ export function commitMeshGeometry(
   const { rootGroup, currentVersion } = ctx;
   if (!rootGroup) return;
 
-  const found = rootGroup.getObjectByName(staged.path);
+  const found = findObjectByName(rootGroup, staged.path);
   // Guarded rather than cast: `getObjectByName` searches by name across the whole
   // subtree, so a path collision or a dataset switch mid-commit can hand back an
   // object of another type. Writing mesh geometry into a points node would corrupt
@@ -118,7 +144,7 @@ export function commitMeshGeometry(
     // the index buffer each time. On a reveal ladder "total" means the REVEALED
     // prefix's total, which grows by a level at a time.
     faceCount: data.faceCount,
-    // Structural probe, the same idiom `stampLadderComplete` and `queue-next.ts`
+    // Structural probe, the same idiom `stampLadderComplete` and `LoaderRegistry.kindsWithMoreLODs`
     // use: only the progressive loader has a level count. Tells the geometry that a
     // changed vertex count is this node's normal behaviour rather than buffers and
     // metadata disagreeing.
@@ -138,6 +164,7 @@ export function commitMeshGeometry(
     capacityVertexCount: nodeAttrs.n_vertices,
     capacityFaceCount: nodeAttrs.n_faces,
   });
+  accountMeshGeometry(ctx, staged.path, object.geometry);
 
   // The epoch's side, which is NOT simply the node's `double_sided`: an odd-parity
   // reflection keeps single-sided (the index post-pass restored winding), while an
@@ -209,12 +236,7 @@ export function commitMeshGeometry(
   // fresh per-epoch copy (`projectMeshTo3D` copies out of its reused scratch), so
   // this retains a reference rather than paying for one, and the coordinator drops
   // it the moment the node stops sorting.
-  noteDepthSortCommit(
-    object,
-    () => computeFaceCentroids(projected.position, projected.indices, projected.visibleFaceCount),
-    projected.visibleFaceCount,
-    projected.indices
-  );
+  noteMeshDepthSortCommit(ctx, object, staged.projected);
 
   stampLoadedViewVersion(object.userData, loadedViewVersion ?? currentVersion);
 
@@ -233,8 +255,11 @@ export function commitMeshGeometry(
   stampLadderComplete(object.userData);
   markFirstCommit('mesh');
 
+  // Verbose, not info: a slice scrub across a region the surface does not
+  // reach commits one of these per tick.
   if (projected.visibleFaceCount === 0) {
-    log.info(
+    log.verbose(
+      LogEmoji.INFO,
       Modules.SCENE_LOADER,
       `No visible triangles for ${staged.path} at this slice — the surface's ` +
         'vertices all fall outside the nD slab'

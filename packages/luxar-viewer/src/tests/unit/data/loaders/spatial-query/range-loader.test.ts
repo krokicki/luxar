@@ -385,6 +385,27 @@ describe('RangeLoader.loadBroadcasted (via loadRanges)', () => {
     expect(Array.from(output)).toEqual([0.5, 0.5, 0.5, 0.5]);
   });
 
+  it("a loader's first load logs its decode detail only under verboseLog", async () => {
+    // A fresh loader (its first load: verbose detail on) — one per partition
+    // part, and a slice step can activate several.
+    const fresh = new RangeLoader(new ArrayRefRegistry(), { workerThreshold: Infinity });
+    setMockData(new Float32Array([0.5]));
+    const consoleLog = vi.spyOn(console, 'log');
+    try {
+      await fresh.loadRanges(
+        mockZarrArray('float32', [1]),
+        { encoding: { name: 'broadcasted', n_elements: 4 } },
+        [{ start: 0, end: 4 }],
+        new Float32Array(4),
+        4,
+        1
+      );
+      expect(consoleLog).not.toHaveBeenCalled();
+    } finally {
+      consoleLog.mockRestore();
+    }
+  });
+
   it('replicates a 3-component vector (e.g. RGB color) to all elements', async () => {
     // Broadcasted color: [1.0, 0.0, 0.5]
     setMockData(new Float32Array([1.0, 0.0, 0.5]));
@@ -441,6 +462,82 @@ describe('RangeLoader.loadBroadcasted (via loadRanges)', () => {
     expect(written).toBe(6);
     // valueAsFloat32[j] ?? valueAsFloat32[0] => all 7.0
     expect(Array.from(output)).toEqual([7, 7, 7, 7, 7, 7]);
+  });
+
+  // The writer records the stored row as `encoding.value`, which arrives with the
+  // consolidated metadata. Reading the row again is a whole request per array per
+  // rung, and an all-zero row (axis-aligned splats' off-diagonal) has no chunk at
+  // all, so that read was a 404.
+  it('takes the row from encoding.value without reading the array', async () => {
+    mockZarrGet.mockRejectedValue(new Error('the row must not be read'));
+    const attrs: ArrayMetadata = {
+      encoding: { name: 'broadcasted', n_elements: 2, value: [0, 0, 0, 0, 0, 0] },
+    };
+    const output = new Float32Array(12).fill(9);
+    const array = mockZarrArray('float32', [1, 6]);
+
+    const written = await loader.loadRanges(array, attrs, [{ start: 0, end: 2 }], output, 2, 6);
+
+    expect(written).toBe(12);
+    expect(Array.from(output)).toEqual(new Array(12).fill(0));
+    expect(mockZarrGet).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['scalar', 0.5],
+    ['short row', [0.5]],
+    ['long row', [0.5, 1, 2, 3]],
+  ] as const)('reads the stored row when encoding.value is a %s', async (_case, value) => {
+    setMockData(new Float32Array([0.25, 0.5, 0.75]));
+    const attrs: ArrayMetadata = {
+      encoding: { name: 'broadcasted', n_elements: 2, value: value as unknown as number[] },
+    };
+    const output = new Float32Array(6);
+
+    const written = await loader.loadRanges(
+      mockZarrArray('float32', [1, 3]),
+      attrs,
+      [{ start: 0, end: 2 }],
+      output,
+      2,
+      3
+    );
+
+    expect(written).toBe(6);
+    expect(mockZarrGet).toHaveBeenCalledOnce();
+    expect(Array.from(output)).toEqual([0.25, 0.5, 0.75, 0.25, 0.5, 0.75]);
+  });
+
+  it.each([
+    ['uint8', new Uint8Array([255, 128, 0])],
+    ['float32', new Float32Array([0.1, 1e-30, 3.4e38])],
+  ] as const)('decodes a %s encoding.value exactly as the row it repeats', async (dtype, row) => {
+    const array = mockZarrArray(dtype, [1, 3]);
+    const ranges: LoadRange[] = [{ start: 0, end: 2 }];
+    setMockData(row);
+    const read = new Float32Array(6);
+    await loader.loadRanges(
+      array,
+      { encoding: { name: 'broadcasted', n_elements: 2 } },
+      ranges,
+      read,
+      2,
+      3
+    );
+    mockZarrGet.mockReset();
+    const fromAttrs = new Float32Array(6);
+    // What the Python writer emits: the stored row's `tolist()`, through JSON.
+    const value = JSON.parse(JSON.stringify(Array.from(row, Number))) as number[];
+    await loader.loadRanges(
+      array,
+      { encoding: { name: 'broadcasted', n_elements: 2, value } },
+      ranges,
+      fromAttrs,
+      2,
+      3
+    );
+    expect(mockZarrGet).not.toHaveBeenCalled();
+    expect(fromAttrs).toEqual(read);
   });
 });
 
@@ -1012,6 +1109,82 @@ describe('RangeLoader.loadRangesResolvingRef', () => {
 
     expect(written).toBe(2);
     expect(Array.from(output)).toEqual([7, 8]);
+  });
+
+  // array_ref targets used to be re-opened (zarr.open) on EVERY update and read
+  // through an UNWRAPPED array, bypassing L0 (17 re-decodes per revisit step
+  // were measured on an array_ref store). The resolved target is now memoised
+  // per (store, target path) and wrapped once through the loader's L0 wrapper.
+  describe('array_ref target memoisation', () => {
+    const refAttrs: ArrayMetadata = {
+      encoding: { name: 'array_ref', target: '/Shared/colors', hash: 'sha-test' },
+    };
+    const placeholder = {} as ReturnType<typeof mockZarrArray>;
+
+    function wireTarget() {
+      const targetArray = { dtype: 'float32', shape: [100, 3], attrs: {} };
+      mockZarrRoot.mockReturnValue({ resolve: () => 'tloc' } as never);
+      mockZarrOpen.mockResolvedValue(targetArray as never);
+      setMockData(new Float32Array([1, 2, 3, 4, 5, 6]));
+      return targetArray;
+    }
+
+    const load = (rangeLoader: RangeLoader, store: object) =>
+      rangeLoader.loadRangesResolvingRef(
+        placeholder,
+        refAttrs,
+        [{ start: 0, end: 2 }],
+        new Float32Array(6),
+        2,
+        3,
+        store as never
+      );
+
+    it('opens the target once across repeated loads on the same store', async () => {
+      wireTarget();
+      const store = {};
+      await load(loader, store);
+      await load(loader, store);
+      expect(mockZarrOpen).toHaveBeenCalledTimes(1);
+    });
+
+    it('wraps the target once and reads through the wrapped (L0) array every time', async () => {
+      const target = wireTarget();
+      const wrapped = { ...target, wrapped: true };
+      const wrap = vi.fn(() => wrapped as never);
+      loader.setRefTargetWrapper({ wrap, epoch: () => 0 });
+      const store = {};
+      await load(loader, store);
+      await load(loader, store);
+      expect(wrap).toHaveBeenCalledTimes(1);
+      expect(wrap).toHaveBeenCalledWith(target, '/Shared/colors');
+      expect(mockZarrGet).toHaveBeenCalledTimes(2);
+      expect(mockZarrGet.mock.calls.every((call) => call[0] === (wrapped as never))).toBe(true);
+    });
+
+    it('re-opens when the store changes or the wrapper epoch moves (L0 cleared)', async () => {
+      wireTarget();
+      let epoch = 0;
+      loader.setRefTargetWrapper({ wrap: (a) => a, epoch: () => epoch });
+      const storeA = {};
+      await load(loader, storeA);
+      await load(loader, {}); // a different dataset/store
+      expect(mockZarrOpen).toHaveBeenCalledTimes(2);
+      epoch = 1; // e.g. DecompressedChunkCache.clear()
+      await load(loader, storeA);
+      expect(mockZarrOpen).toHaveBeenCalledTimes(3);
+      await load(loader, storeA);
+      expect(mockZarrOpen).toHaveBeenCalledTimes(3);
+    });
+
+    it('does not memoise a failed open', async () => {
+      wireTarget();
+      mockZarrOpen.mockRejectedValueOnce(new Error('HTTP 503'));
+      const store = {};
+      await expect(load(loader, store)).rejects.toThrow('HTTP 503');
+      await load(loader, store);
+      expect(mockZarrOpen).toHaveBeenCalledTimes(2);
+    });
   });
 });
 

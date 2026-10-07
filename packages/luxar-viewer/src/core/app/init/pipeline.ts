@@ -1,6 +1,7 @@
 import type * as THREE from 'three';
 import { SceneManager } from '../../../scene/scene-manager';
 import { AnimationController } from '../../../scene/animation/animation-controller';
+import { ViewContextProvider } from '../../../scene/view-context';
 import { PerformanceMonitor } from '../../../ui/performance-monitor';
 import { DebugConsole } from '../../../ui/debug-console';
 import {
@@ -15,33 +16,64 @@ import { RecordingPanel } from '../../../ui/recording-panel';
 import { LayersPanel } from '../../../ui/layers';
 import { ControlRail } from '../../../ui/control-rail';
 import { buildRailItems } from './build-rail-items';
+import type { BookmarksPopoverContext } from '../../../ui/rail-panels/bookmarks-popover';
 import { AudioEngine } from '../../../audio/audio-engine';
 import { resolveTargetNodeCenter } from '../../../scene/scene-manager/camera/camera-setup';
 import { getViewerContainer } from '../../../utils/viewer-container';
 import { DataMonitorManager } from '../../../ui/data-monitor-manager';
 import { SceneLoaderManager, getSceneLoader } from '../../../data/scene-loader-manager';
 import { LODGroupRegistry } from '../../../scene/lod-group-registry';
+import { buildLodRegistryDeps } from './lod-registry-deps';
 import { sceneDimsManager } from '../../../scene/scene-dims-manager';
 import { notifier } from '../../../utils/cross-layer/notifier';
 import { log, Modules } from '../../../utils/log';
 import { config } from '../../../config';
-import { getGpuByteBudget, initializeGpuByteBudget } from '../../../rendering/gpu-byte-budget';
+import { initializeGpuByteBudget } from '../../../rendering/gpu-byte-budget';
 import { getMaxPixelRatio, setHighDPRAllowed } from '../../../rendering/pixel-ratio-cap';
-import {
-  configureDepthSort,
-  setDepthSortEnabled,
-  warmUpDepthSortWorker,
-  evaluateDepthSortPerFrame,
-} from '../../../rendering/depth-sort-coordinator';
 import { materialManager } from '../../../rendering';
 import { createKTX2TextureDecoder } from '../../../rendering/ktx2-texture-decoder';
 import { resolveFactories, type AppFactories } from '../factories';
 import type { LuxarAppOptions } from '../options';
 import type { EventGroup } from '../../../utils/cross-layer/event-group';
 import { wireDensityGuard } from './density-guard-wiring';
-import { buildLoadActivityPredicate } from './load-activity';
-import { wireSceneEnvironment } from './environment-wiring';
+import { buildEnvironmentSettledPredicate, buildLoadActivityPredicate } from './load-activity';
+import { wireEnvironmentToLayers, wireSceneEnvironment } from './environment-wiring';
 import { getInputProfile } from '../../../utils/input-capabilities';
+import { eventBus } from '../../../utils/cross-layer/event-bus';
+import { RenderAudit, canvasReadback } from '../../../scene/animation/render-audit';
+import { retainWorkerPool } from '../../../workers/worker-pool';
+
+/**
+ * Render-on-change wiring for the loop: the kill switch (`?renderAlways` /
+ * `config.animation.renderOnChange`), the camera + drawing-buffer source of
+ * the view signature, and the debug-only `?renderAudit`.
+ */
+function wireRenderOnChange(
+  animationController: AnimationController,
+  sceneManager: SceneManager,
+  options: LuxarAppOptions,
+  events: EventGroup
+): void {
+  animationController.setRenderOnChange(
+    config.animation.renderOnChange && options.renderAlways !== true
+  );
+  // Live getters: the ortho toggle replaces the camera, a context restore the
+  // renderer.
+  animationController.setViewSignatureSource({
+    getCamera: () => sceneManager.camera,
+    getDrawingBuffer: () => sceneManager.renderer.domElement,
+  });
+  if (options.renderAudit === true && options.debug === true) {
+    animationController.setRenderAudit(
+      new RenderAudit(canvasReadback(() => sceneManager.renderer.domElement))
+    );
+    log.info(
+      Modules.ANIMATION,
+      'Render audit on (?renderAudit): every tick renders and is checked'
+    );
+    events.add(() => animationController.setRenderAudit(null));
+  }
+}
 
 /**
  * Everything `LuxarApp.init()` constructs is returned in this result.
@@ -83,10 +115,13 @@ export interface InitPipelineResult {
 export interface InitPipelinePorts {
   options: LuxarAppOptions;
   events: EventGroup;
+  bookmarks?: BookmarksPopoverContext;
   getPanelVisibilityStates: () => Map<string, boolean>;
   restorePanelVisibilityStates: (states: Map<string, boolean>) => void;
   /** Emit a public embedder event (the audio engine's `sound-started` / `sound-ended`). */
   emitEmbedderEvent: (event: 'sound-started' | 'sound-ended', payload: { name: string }) => void;
+  /** Mark the current dataset's cached pick buffer dirty (no-op without picking). */
+  invalidatePickBuffer?: () => void;
 }
 
 /**
@@ -144,6 +179,9 @@ export async function runInitPipeline(
   // reference behind for the orchestrator's error handler.
   const sceneManager = factories.sceneManager();
   partial.sceneManager = sceneManager;
+  // The data-worker pool is page-wide; the app holds it until its dispose
+  // releases it (a LuxarLayer on the page holds it too).
+  retainWorkerPool(sceneManager);
   await sceneManager.init({
     canvas: ports.options.canvas,
     debug: ports.options.debug,
@@ -180,6 +218,7 @@ export async function runInitPipeline(
   animationController.setContextLostPredicate(
     () => gpuDeviceLost || sceneManager.isWebGLContextLost()
   );
+  wireRenderOnChange(animationController, sceneManager, ports.options, ports.events);
   // When the perf readout is shown, kick the loop once so it gets a live
   // reading if the scene had idled — but do NOT force continuous rendering
   // (that would defeat the idle-pause / battery saving). The FPS is live while
@@ -194,10 +233,32 @@ export async function runInitPipeline(
   const debugConsole = new DebugConsole();
   partial.debugConsole = debugConsole;
 
+  // The frame's camera snapshot, shared by the view-dependent per-frame work
+  // (see scene/view-context.ts). The canvas is read live: a collapsed canvas
+  // reports no viewport and the consumers skip the frame.
+  const viewContext = new ViewContextProvider({
+    getCamera: () => sceneManager.camera,
+    getViewportCss: () => {
+      const canvas = sceneManager.renderer.domElement;
+      return { width: canvas.clientWidth, height: canvas.clientHeight };
+    },
+    getDrawingBuffer: () => {
+      const canvas = sceneManager.renderer.domElement;
+      return { width: canvas.width, height: canvas.height };
+    },
+  });
+
   // Set up per-frame callback for dynamic clipping plane updates
   // Uses unique ID so it won't conflict with other per-frame callbacks (e.g., dimension animation)
   animationController.addPerFrameCallback('dynamic-clipping', () => {
-    sceneManager.updateDynamicClippingPlanes();
+    // The first 'view' callback invalidates every frame, even if clipping
+    // throws, so the canvas sizes are re-read once per frame. A camera move or
+    // near/far change rebuilds the snapshot on read regardless (view-context.ts).
+    viewContext.invalidate();
+    const changed = sceneManager.updateDynamicClippingPlanes();
+    // A near/far change is also a projection change the view signature would
+    // catch; returning it keeps the callback's own contract honest.
+    return changed;
   });
 
   // Wire LOD-group selection. The factory closes over the live
@@ -219,83 +280,35 @@ export async function runInitPipeline(
   // app OPTIONS (the standalone bootstrap threads them from the URL params;
   // embedders set them directly — the pipeline never reads window.location)
   // and are captured once at wiring time (a reload re-reads them).
-  const lodCrossFadeEnabled = ports.options.lodFade ?? true;
   const lodEnergyCompEnabled = ports.options.lodEnergyComp ?? true;
-  // Opt-in: force the finest LOD for capture-quality output (?lodFinest).
-  const lodFinestEnabled = ports.options.lodFinest ?? false;
-  // The registry owns the neutral default and validates the live value.
-  const lodBias = ports.options.lodBias;
-  SceneLoaderManager.getInstance().setLODGroupRegistryFactory((owner) => {
-    return new LODGroupRegistry({
-      getCamera: () => sceneManager.camera,
-      getViewportSize: () => {
-        const canvas = sceneManager.renderer.domElement;
-        return {
-          width: canvas.clientWidth || window.innerWidth,
-          height: canvas.clientHeight || window.innerHeight,
-        };
-      },
-      // Return an empty list when scene dimensions aren't initialized
-      // yet rather than the misleading ``[0, 1, 2]`` default — for
-      // 2D scenes the latter projected onto a phantom Z axis. The
-      // registry's existing ``displayDims.length < 2`` early-return
-      // skips evaluation in this state.
-      getDisplayDims: () => sceneDimsManager.getDims()?.displayed ?? [],
-      hasArchiveFault: () => owner.archiveFault !== null,
-      hasNetworkFailureUnder: (path) => owner.hasNetworkFailureUnder(path),
-      requestReprocess: (paths) => owner.requestReprocess(paths),
-      // A view PASS in flight or queued — not a refinement hold, which the
-      // loader parks a resync through (see `LODGroupRegistryOwner`).
-      isUpdateInProgress: () => owner.isLoadPassInProgress(),
-      // Resident-byte budget for loaded LOD geometry = the single,
-      // adaptive GPU-geometry budget shared with the buffer pool (one VRAM
-      // authority). Read dynamically so context-loss backoff applies live.
-      getResidentByteBudget: () => getGpuByteBudget(),
-      // Measured resident VRAM (active + pooled, real capacities) from the
-      // buffer pool — the single accounting truth the registry uses to
-      // decide when to demote cold levels. Read from the OWNING loader
-      // (the factory receives it) so a non-default loader's registry never
-      // consults the default loader's pool; a null pool (pre-construction /
-      // pooling disabled) reads as 0 bytes, so the registry never evicts in
-      // that state.
-      getResidentBytes: () => owner.gpuBufferPool?.getResidentBytes() ?? 0,
-      // Current view-update version. Lets the registry detect when a level's
-      // committed geometry is stale for the current slice/displayDims (a
-      // re-slice reloads geometry in place without flipping readiness) and
-      // display a coarser FRESH level until the re-slice commits — the
-      // slice-aware coarse-while-reloading fallback. Read from the OWNING
-      // loader for the same per-instance reason as getResidentBytes.
-      getViewVersion: () => owner.currentViewVersion,
-      // Keep the on-demand render loop alive while a lazy fine level reloads
-      // (it commits outside the per-slice sweep and can outlast the idle
-      // timeout), so the swap-up to the fresh level fires when it lands.
-      requestRender: () => animationController.startAnimation(),
-      // LOD cross-fade (ON by default; ?noLodFade disables): the registry
-      // blends adjacent LOD levels' opacity across a zoom transition instead of
-      // a hard swap (blendable modes only: additive/luminous/volumetric).
-      // Read once at wiring time.
-      getCrossFadeEnabled: () => lodCrossFadeEnabled,
-      // Streaming brightness compensation (ON by default; ?noLodEnergy disables):
-      // scale a streaming additive/luminous/volumetric leaf's opacity by 1/e(k) so its
-      // partial ladder prefix renders at full-level brightness (no brightening
-      // pop as chunks arrive). Read once at wiring time.
-      getEnergyCompEnabled: () => lodEnergyCompEnabled,
-      // Force-finest capture override (?lodFinest via LuxarAppOptions.lodFinest):
-      // always select the finest level and never coarsen off-screen.
-      getForceFinestLOD: () => lodFinestEnabled,
-      // Area-unit threshold bias (?lodBias via LuxarAppOptions.lodBias).
-      getLodBias: () => lodBias,
-      // Register a fade's clone-on-first-use material so it keeps receiving
-      // per-frame camera-uniform updates (an unregistered gsplat clone would
-      // project with stale camera params).
-      // No cast: `register` takes a plain `THREE.Material` and dispatches on
-      // camera-awareness internally. The `as Parameters<typeof register>[0]` that used
-      // to sit here existed only to satisfy an `& CameraAwareMaterial` requirement the
-      // manager no longer imposes — and being self-referential, it would have silently
-      // accepted anything the parameter type later became.
-      registerMaterial: (material) => materialManager.register(material),
-    });
-  });
+  // The deps object itself is shared with layer mode (lod-registry-deps.ts);
+  // only the live sources differ.
+  SceneLoaderManager.getInstance().setLODGroupRegistryFactory(
+    (owner) =>
+      new LODGroupRegistry(
+        buildLodRegistryDeps(owner, {
+          getCamera: () => sceneManager.camera,
+          getViewportSize: () => viewContext.get().viewportCss ?? { width: 0, height: 0 },
+          getDisplayDims: () => sceneDimsManager.getDims()?.displayed ?? [],
+          registerMaterial: (material) => materialManager.register(material),
+          getViewContext: () => viewContext.get(),
+          // The input handler (and its animation manager) is built later in
+          // this function, hence the lazy read.
+          getPlaybackPeriodMs: () =>
+            partial.inputHandler?.getAnimationManager()?.getPlaybackPeriodMs() ?? null,
+          // Keep the on-demand loop TICKING while a lazy fine level reloads (it
+          // commits outside the per-slice sweep and can outlast the idle
+          // timeout); the swap reports itself through `takeDrawnStateChanged`.
+          requestRender: () => animationController.requestRender('lod'),
+          requestTick: () => animationController.requestTick(),
+          lodFade: ports.options.lodFade,
+          lodEnergyComp: lodEnergyCompEnabled,
+          // Opt-in: force the finest LOD for capture-quality output (?lodFinest).
+          lodFinest: ports.options.lodFinest,
+          lodBias: ports.options.lodBias,
+        })
+      )
+  );
   // Wake the render loop after EVERY geometry commit (forwarded to each
   // SceneLoader). Late commits — progressive-refinement passes, failed-load
   // retries, the online auto-retry — land after the sweep that started
@@ -303,31 +316,44 @@ export async function runInitPipeline(
   // the stale frame until the next user input. startAnimation is
   // idempotent (early-out while animating + idle-timer re-arm), so
   // per-node calls inside an atomic sweep are harmless.
-  SceneLoaderManager.getInstance().setRequestRender(() => animationController.startAnimation());
+  // A commit to a node that is not drawn (an LOD level the registry keeps
+  // hidden — during playback the eager coarse level re-commits every timepoint
+  // under a held fine level — or a hidden layer) cannot change the frame: it
+  // only keeps the loop ticking, so the registry sees it and, if it now shows
+  // that level, its visibility flip requests the redraw.
+  const onCommit = (drawn: boolean | undefined): void => {
+    if (drawn === false) animationController.requestTick();
+    else animationController.requestRender('geometry');
+  };
+  SceneLoaderManager.getInstance().setRequestRender(onCommit);
+  // Belt and braces for the same moment from the node factory (pick-buffer
+  // invalidation): any commit path that reaches it redraws too.
+  ports.events.add(eventBus.on('geometry-committed', ({ drawn }) => onCommit(drawn)));
   SceneLoaderManager.getInstance().setKTX2TextureDecoder(
     createKTX2TextureDecoder(sceneManager.renderer)
   );
-  // Depth-sort coordinator (Phases 2-3): the gsplats commit path has no
-  // camera (SceneLoader deliberately owns no camera state), so the
-  // coordinator gets the live camera + render wake-up here — the same
-  // dependency-inversion as setRequestRender above.
-  setDepthSortEnabled(config.depthSort.enabled && (ports.options.depthSort ?? true));
-  configureDepthSort({
+  // Depth-sort coordinator (Phases 2-3): THIS app's, owned by its scene
+  // manager. The commit path has no camera (SceneLoader deliberately owns no
+  // camera state), so the coordinator gets the live camera + render wake-up
+  // here — the same dependency-inversion as setRequestRender above.
+  const depthSort = sceneManager.depthSort;
+  depthSort.setEnabled(config.depthSort.enabled && (ports.options.depthSort ?? true));
+  depthSort.configure({
     // A live GETTER, not sceneManager.camera captured by value: the
     // ortho-mode toggle replaces the camera object, and sorts must track
     // whichever camera is current (same pattern as the LOD registry's
     // getCamera above).
     getCamera: () => sceneManager.camera,
-    requestRender: () => animationController.startAnimation(),
+    requestRender: () => animationController.requestRender('depthSort'),
     // Blending-mode-switch hook (spec §5.4): switching a gsplat layer TO
     // `normal` clears its noop stamp and forces a reprocess so the next
     // commit registers with the SortWorker.
     requestReprocess: () => {
       void getSceneLoader('default')?.updateView({});
     },
-    // Phase 3: the per-frame scheduler skips dispatching while a view
-    // update is in flight — the pending commit sorts from the
-    // then-current pose anyway (same signal the refinement loop reads).
+    // Gates only the starved-SortWorker init retry (a retry into a busy
+    // loader spends an attempt on a guaranteed miss). Camera re-sorts are
+    // NOT gated on it: this stays true through the whole refinement drain.
     isLoadInProgress: () => getSceneLoader('default')?.isUpdateInProgress() ?? false,
     // Sort round-trips show up as the monitor's 'Depth Sort' line.
     getProfiler: () => SceneLoaderManager.getInstance().getProfiler(),
@@ -343,16 +369,17 @@ export async function runInitPipeline(
   // scene, and the worker's `initialize()` reply has to be dispatched on
   // this very thread — on a multi-million-element scene it misses its
   // deadline there, which used to disable sorting for the whole session.
-  // Honours `setDepthSortEnabled` above (so `?depthSort=0` spawns nothing).
-  warmUpDepthSortWorker();
+  // Honours `setEnabled` above (so `?depthSort=0` spawns nothing).
+  depthSort.warmUp();
   // Camera-motion re-sort scheduler (Phase 3, spec §6) + global cross-node
   // renderOrder assignment. Same per-frame slot pattern as
   // 'lod-group-selector' below; the evaluation early-outs when no
   // order-dependent node exists (with nodes it allocates only the small
   // per-frame order slots — documented in assignGlobalRenderOrder).
-  animationController.addPerFrameCallback('depth-sort-scheduler', () => {
-    evaluateDepthSortPerFrame();
-  });
+  // Returns whether the pass changed a renderOrder or an ordering-buffer slot.
+  animationController.addPerFrameCallback('depth-sort-scheduler', () =>
+    depthSort.evaluatePerFrame()
+  );
   // Projected-density guard walker (config.densityGuard; `?noDensityGuard`):
   // measures elements per drawing-buffer pixel for every committed data mesh
   // once per frame. Consumers read it through getProjectedDensityTracker()
@@ -367,29 +394,44 @@ export async function runInitPipeline(
     capOverride: ports.options.densityCap,
     energyComp: lodEnergyCompEnabled,
     sceneManager,
+    getViewContext: () => viewContext.get(),
     registerMaterial: (material) => materialManager.register(material),
     setRefinementDensityProvider: (provider, caps) =>
       loaderManager.setRefinementDensityProvider(provider, caps),
     getDefaultLoader: () => getSceneLoader('default'),
     getAdaptiveDpr: () => partial.adaptiveDPRManager,
-    requestRender: () => animationController.startAnimation(),
+    requestRender: () => animationController.requestRender('densityGuard'),
+    invalidatePickBuffer: ports.invalidatePickBuffer,
   });
-  animationController.addPerFrameCallback('projected-density', densityWiring.perFrame);
   animationController.addPerFrameCallback('lod-group-selector', () => {
     const loader = getSceneLoader('default');
+    const registry = loader?.lodGroupRegistry;
+    if (!loader || !registry) return false;
     // When a substitutive-LOD group swaps its active level (a camera-move
     // event with no data reload), refresh the monitor's visible-element
     // tally so it reflects the level now rendering rather than staying
     // pinned to the default/coarsest level from the last updateView.
-    if (loader?.lodGroupRegistry?.evaluatePerFrame()) {
-      loader.refreshVisibleCounts();
-      // A level swap changes what is being rendered — learned DPR
-      // bounds (floor/backoff) describe the old level's render cost.
-      // notifyContentChanged is internally coalesced, so per-frame
-      // swap bursts during a zoom don't spam the ledger.
-      partial.adaptiveDPRManager?.notifyContentChanged();
-    }
+    const { levelChanged, cullChanged } = registry.evaluatePerFrame();
+    // A partition part culled or restored changes the tally too.
+    if (levelChanged || cullChanged) loader.refreshVisibleCounts();
+    // A level swap changes what is being rendered — learned DPR bounds
+    // (floor/backoff) describe the old level's render cost.
+    // notifyContentChanged is internally coalesced, so per-frame swap bursts
+    // during a zoom don't spam the ledger. A partition CULL flip is NOT a
+    // content change: it is the same content seen from elsewhere, and it
+    // flips constantly during an orbit, so treating it as one would defeat
+    // adaptive DPR's learning on every partitioned scene.
+    if (levelChanged) partial.adaptiveDPRManager?.notifyContentChanged();
+    // Any level shown or hidden, a cross-fade / energy-compensation opacity
+    // step, a partition part culled: the frame must be redrawn. Taken every
+    // tick so the flag never carries over.
+    const drawnStateChanged = registry.takeDrawnStateChanged();
+    return drawnStateChanged || levelChanged || cullChanged;
   });
+  // AFTER the selector (same phase ⇒ registration order): the guard sets the
+  // keep fraction of what is drawn, so it must see the level revealed this
+  // frame rather than draw it once on a stale keep (#2944 review B).
+  animationController.addPerFrameCallback('projected-density', densityWiring.perFrame);
 
   // Seed the pixel-ratio cap from config BEFORE anything sizes a frame.
   // The renderer boundary (dpr-policy.getActivePixelRatio) reads the cap
@@ -425,21 +467,23 @@ export async function runInitPipeline(
   // learning for those samples. Same predicate the perf probes read as
   // `getPerf().isSettled`, inverted.
   // TRUE while load activity is in flight (the adaptive-DPR manager's sense).
-  const isLoadActive = buildLoadActivityPredicate({
+  const loadActivitySources = {
     getDefaultLoader: () => getSceneLoader('default'),
     isAnyLoadPassInProgress: () => SceneLoaderManager.getInstance().isAnyLoadPassInProgress(),
-  });
+  };
+  const isLoadActive = buildLoadActivityPredicate(loadActivitySources);
   adaptiveDPRManager.setLoadActivityPredicate(isLoadActive);
 
-  // The scene environment's live behaviour (re-capture on commit / slice /
-  // appearance change once SETTLED — the same predicate, inverted) and the
-  // `?bakeEnv` one-shot.
+  // The scene environment's live behaviour (re-capture on commit / slice change
+  // once SETTLED — the same predicate, inverted, that also waits out a LOD level
+  // dissolve; appearance edits are wired once the layers panel exists, below) and
+  // the `?bakeEnv` one-shot.
   wireSceneEnvironment({
     sceneManager,
     animationController,
     events: ports.events,
     options: ports.options,
-    isSettled: () => !isLoadActive(),
+    isSettled: buildEnvironmentSettledPredicate(loadActivitySources, isLoadActive),
   });
 
   // Dataset/layer changes invalidate the learned DPR bounds (the floor
@@ -559,9 +603,10 @@ export async function runInitPipeline(
       // The density guard is app-scoped (it outlives scenes), so its provider
       // is wired here, once per monitor, rather than through the per-scene
       // monitor wiring in data/ — which cannot import scene/ anyway.
-      mgr
-        .getMonitor(monitorId)
-        ?.setDensityProvider({ getDensityStates: () => densityWiring.densityStates() });
+      const monitor = mgr.getMonitor(monitorId);
+      monitor?.setDensityProvider({ getDensityStates: () => densityWiring.densityStates() });
+      // Same for the depth-sort degrade note: the coordinator is app-scoped.
+      monitor?.setDepthSortAvailabilityProvider(() => sceneManager.depthSort.isAvailable());
     }
     return mgr.getMonitor(monitorId) ?? null;
   });
@@ -612,11 +657,20 @@ export async function runInitPipeline(
   // paints a blown-out frame under the translucent overlay, because the
   // capture holds raw-HDR shader flags across its async readback. The
   // loop itself keeps running (per-frame callbacks must follow the
-  // camera); only its render is skipped. Offline-only: the real-time
-  // path records the canvas the loop paints. Keyed on the narrow
-  // render-suppression flag rather than the capture's mutual-exclusion
-  // flag, so a wedged capture teardown can't freeze the viewport.
-  animationController.setRenderSkipPredicate(() => recordingPanel.isLoopRenderSuppressed());
+  // camera); only its render is skipped. A pending pixel readback also
+  // owns the target, even outside offline recording. Skipping here keeps
+  // adaptive DPR from treating draw-free frames as fast frames and
+  // reallocating that target mid-readback. The real-time recording path
+  // still paints the canvas between captures.
+  animationController.setRenderSkipPredicate(
+    () => recordingPanel.isLoopRenderSuppressed() || sceneManager.postProcessing.isCaptureInProgress
+  );
+  // Skipped ticks can let the loop reach its idle timeout during a slow readback.
+  // Repaint once the final capture releases, including a camera or chunk change
+  // that arrived while draws were suppressed.
+  sceneManager.postProcessing.setCaptureReleasedCallback(() =>
+    animationController.startAnimation()
+  );
   // Frame pacing must stay off for the whole of a capture, because both
   // capture families depend on the loop's untouched cadence: the real-time
   // MediaRecorder path records the canvas the loop paints (a paced gap is a
@@ -660,6 +714,9 @@ export async function runInitPipeline(
   const layersPanel = factories.layersPanel(document.body, animationController);
   partial.layersPanel = layersPanel;
   inputHandler.setLayersPanel(layersPanel);
+  // A scene-derived environment re-captures after a Layers-panel appearance edit
+  // (the commit / slice triggers were wired with the environment above).
+  wireEnvironmentToLayers(sceneManager, layersPanel.layerState, ports.events);
 
   // Left activity rail — the always-visible, discoverable entry point to the
   // otherwise keyboard-only panels. Buttons dispatch through the same command
@@ -680,7 +737,7 @@ export async function runInitPipeline(
       sceneDimsManager.addListener(listener);
       return () => sceneDimsManager.removeListener(listener);
     },
-    getSceneGraph: () => getSceneLoader('default')?.sceneGraph ?? null,
+    getSceneNodeIndex: () => getSceneLoader('default')?.sceneNodeIndex ?? null,
     getSceneScale: () => sceneManager.getSceneScale(),
     container: getViewerContainer,
     emit: (event, payload) => ports.emitEmbedderEvent(event, payload),
@@ -723,6 +780,7 @@ export async function runInitPipeline(
     debugConsole,
     recordingPanel,
     audioEngine,
+    bookmarks: ports.bookmarks,
   });
   // Dock the perf readout as the rail's footer; the gauge above toggles it.
   const controlRail = new ControlRail(railItems, performanceMonitor.element);

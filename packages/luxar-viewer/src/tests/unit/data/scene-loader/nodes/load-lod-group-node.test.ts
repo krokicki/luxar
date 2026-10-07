@@ -15,6 +15,7 @@
 
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import * as THREE from 'three';
+import { failedLoadsVersion } from '../../../../../utils/failed-loads-version';
 
 const loadSceneNodesMock = vi.fn();
 
@@ -68,6 +69,7 @@ import { ArchiveFaultError } from '../../../../../cache/chunk-source';
 import { LODGroupRegistry } from '../../../../../scene/lod-group-registry';
 import { log } from '../../../../../utils/log';
 import { makeTestNodeBuildCtx } from '../../../../helpers/make-test-node-build-ctx';
+import { defineBehaviourConformance } from '../../../../_conformance/define-behaviour-conformance';
 import type { NodeBuildCtx } from '../../../../../data/scene-loader/nodes/build-ctx';
 import type { SceneNode } from '../../../../../data/data-loader-types';
 
@@ -248,8 +250,6 @@ function makeCtx(registry?: LODGroupRegistry, overrides: Partial<NodeBuildCtx> =
       registerPointsLoader: vi.fn(),
       registerLinesLoader: vi.fn(),
       registerMeshLoader: vi.fn(),
-      unregisterPointsLoader: vi.fn(),
-      unregisterLinesLoader: vi.fn(),
     } as never,
     lodGroupRegistry: registry,
     nodeFactory,
@@ -622,11 +622,12 @@ describe('loadLodGroupNode — registry registration', () => {
 // ────────────────────────────────────────────────────────────────────────
 
 describe('loadLodGroupNode — lazy level loading', () => {
-  function makeReg(): LODGroupRegistry {
+  function makeReg(now?: () => number): LODGroupRegistry {
     return new LODGroupRegistry({
       getCamera: () => new THREE.Camera(),
       getViewportSize: () => ({ width: 100, height: 100 }),
       getDisplayDims: () => [0, 1, 2],
+      ...(now ? { now } : {}),
     });
   }
 
@@ -697,10 +698,10 @@ describe('loadLodGroupNode — lazy level loading', () => {
   // parent the writer back-fills to display_type='mesh'. (The shorthand
   // `lod.add_mesh(…, partition=…)` writes the same tree but puts
   // `coverage_fraction` on the PARTS, not the wrapper, so it is the explicit
-  // route above that produces the shape this test models.)
-  it.each(['gsplats', 'points', 'lines', 'mesh'] as const)(
-    'defers a non-leaf group child (display_type=%s) and loads its subtree on activation',
-    async (displayType) => {
+  // route above that produces the shape this test models.) The cells are the
+  // geometry-behaviour matrix row `lodGroupChildActivation`.
+  defineBehaviourConformance('lodGroupChildActivation', {
+    async holds(displayType) {
       attachStubChildren();
       const reg = makeReg();
       const ctx = makeCtx(reg);
@@ -741,8 +742,8 @@ describe('loadLodGroupNode — lazy level loading', () => {
       // refinement is only scheduled at update-view tails, so the activation
       // must kick the orchestrator or the branch stalls at chunk-1 per part.
       expect(ctx.kickRefinementIfIdle).toHaveBeenCalledTimes(1);
-    }
-  );
+    },
+  });
 
   it('activating a deferred GROUP child a second time loads nothing (no duplicate subtree)', async () => {
     // `loadChildren` attaches a fresh THREE.Group on every call, so a second
@@ -803,8 +804,10 @@ describe('loadLodGroupNode — lazy level loading', () => {
       expect(groupChild.object.children).toHaveLength(1);
       expect(groupLoads).toBe(1);
 
+      const beforeRetry = failedLoadsVersion();
       expect(reg.retryLazyChildByNodePath('/lod/child_1')).toBe(true);
       await vi.waitFor(() => expect(groupChild.loading).toBe(false));
+      expect(failedLoadsVersion()).toBe(beforeRetry + 2);
       expect(groupLoads).toBe(1);
       expect(groupChild.object.children).toHaveLength(1);
       expect(groupChild.ready).toBe(false);
@@ -997,7 +1000,7 @@ describe('loadLodGroupNode — lazy level loading', () => {
     const deferred = reg.get('/lod')!.children[1];
     deferred.ready = true; // simulate a completed load
     deferred.failed = true; // simulate a stale failure flag from a prior cycle
-    deferred.failedTick = 42;
+    deferred.failedAtMs = 42;
     expect(typeof deferred.release).toBe('function');
 
     deferred.release!();
@@ -1006,7 +1009,7 @@ describe('loadLodGroupNode — lazy level loading', () => {
     expect(deferred.loading).toBe(false);
     expect(deferred.failed).toBe(false);
     // The failure cooldown is also cleared so a reload starts fresh.
-    expect(deferred.failedTick).toBeUndefined();
+    expect(deferred.failedAtMs).toBeUndefined();
   });
 
   it('does not give the eager default level a release thunk', async () => {
@@ -1065,10 +1068,12 @@ describe('loadLodGroupNode — lazy level loading', () => {
     await loadLodGroupNode(node, new THREE.Group(), makeStubLoc(), ctx, loadSceneNodesMock);
 
     const deferred = reg.get('/lod')!.children[1];
+    const beforeFailure = failedLoadsVersion();
     deferred.ensureLoaded!();
     await vi.waitFor(() => expect(deferred.failed).toBe(true));
 
     expect(deferred.permanentlyFailed).toBe(true);
+    expect(failedLoadsVersion()).toBeGreaterThan(beforeFailure);
     expect(deferred.ready).toBe(false);
     expect(deferred.loading).toBe(false);
 
@@ -1144,7 +1149,8 @@ describe('loadLodGroupNode — lazy level loading', () => {
     const warningSpy = vi.spyOn(log, 'warning').mockImplementation(() => {});
 
     try {
-      const reg = makeReg();
+      let t = 0;
+      const reg = makeReg(() => t);
       const ctx = makeCtx(reg);
       const node = makeLodGroupNode(
         [makeChildNode('/lod/child_0', 0), makeGroupChildNode('/lod/child_1', 0.5)],
@@ -1164,7 +1170,11 @@ describe('loadLodGroupNode — lazy level loading', () => {
 
       reg.setSelectorMode('/lod', { lockLevel: 1 });
       reg.evaluatePerFrame();
-      for (let frame = 0; frame < 121; frame++) reg.evaluatePerFrame();
+      // The failure cooldown is wall-clock (2 s), not a frame count.
+      for (let frame = 0; frame < 121; frame++) {
+        t += 1000 / 60;
+        reg.evaluatePerFrame();
+      }
       await vi.waitFor(() => expect(deferred.failed).toBe(true));
       expect(deferred.loading).toBe(false);
 
@@ -1278,7 +1288,7 @@ describe('loadLodGroupNode — lazy points level loading', () => {
     const deferred = reg.get('/lod')!.children[1];
     deferred.ready = true; // simulate a completed load
     deferred.failed = true;
-    deferred.failedTick = 42;
+    deferred.failedAtMs = 42;
     expect(typeof deferred.release).toBe('function');
 
     deferred.release!();
@@ -1286,7 +1296,7 @@ describe('loadLodGroupNode — lazy points level loading', () => {
     expect(deferred.ready).toBe(false);
     expect(deferred.loading).toBe(false);
     expect(deferred.failed).toBe(false);
-    expect(deferred.failedTick).toBeUndefined();
+    expect(deferred.failedAtMs).toBeUndefined();
   });
 
   it('surfaces the progressive points loader hasMoreLODs on the lazy level (composed ladder advances)', async () => {
@@ -1473,14 +1483,14 @@ describe('loadLodGroupNode — lazy lines level loading', () => {
     const ln = reg.get('/lod')!.children[1];
     ln.ready = true; // simulate a completed load
     ln.failed = true; // simulate a stale failure flag from a prior cycle
-    ln.failedTick = 42;
+    ln.failedAtMs = 42;
     expect(typeof ln.release).toBe('function');
     ln.release!();
     expect(vi.mocked(ctx.releaseLazyLines)).toHaveBeenCalledWith('/lod/child_1');
     expect(ln.ready).toBe(false);
     expect(ln.loading).toBe(false);
     expect(ln.failed).toBe(false);
-    expect(ln.failedTick).toBeUndefined();
+    expect(ln.failedAtMs).toBeUndefined();
   });
 
   it('does not register the lines level when the dataset is switched mid-load', async () => {
@@ -1610,13 +1620,10 @@ describe('loadLodGroupNode — lazy lines level loading', () => {
     expect(ctx.registry.registerMeshLoader).not.toHaveBeenCalled();
   });
 
-  it('gives a deferred mesh level a release thunk, even though it has no pooled buffer', async () => {
-    // The asymmetry worth pinning: a mesh is `pooled: false`, so this release
-    // hands nothing back to the evictable pool — which is exactly why it was
-    // originally omitted. It is needed anyway because mesh is `depthSortable`
-    // (#1347): `releaseLazyMesh` drops the demoted level's depth-sort state and
-    // its worker-side centroids. Assert the thunk EXISTS and is wired, so the
-    // "no pooled buffer" reasoning cannot re-delete it.
+  it('gives a deferred mesh level a release thunk that resets its load state', async () => {
+    // A mesh is not pooled, but releaseLazyMesh disposes its committed geometry
+    // and depth-sort state. The thunk must also reset readiness so selection
+    // loads and commits the level again after demotion.
     attachStubChildren();
     const reg = makeReg();
     const ctx = makeCtx(reg);
@@ -1629,14 +1636,14 @@ describe('loadLodGroupNode — lazy lines level loading', () => {
     const ln = reg.get('/lod')!.children[1];
     ln.ready = true; // simulate a completed load
     ln.failed = true; // stale failure flag from a prior cycle
-    ln.failedTick = 42;
+    ln.failedAtMs = 42;
     expect(typeof ln.release).toBe('function');
     ln.release!();
     expect(vi.mocked(ctx.releaseLazyMesh)).toHaveBeenCalledWith('/lod/child_1');
     expect(ln.ready).toBe(false);
     expect(ln.loading).toBe(false);
     expect(ln.failed).toBe(false);
-    expect(ln.failedTick).toBeUndefined();
+    expect(ln.failedAtMs).toBeUndefined();
   });
 
   it('a deferred mesh level with NO ladder reports hasMoreLODs false, not undefined', async () => {

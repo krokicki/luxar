@@ -31,17 +31,28 @@
 import * as THREE from 'three';
 import { uniform, texture } from 'three/tsl';
 import { NodeMaterial } from 'three/webgpu';
-import { pointWebGPUFactory, type PointTSLNodes } from './shader-tsl';
+import {
+  applyPointMaterialState,
+  pointWebGPUFactory,
+  type PointTSLConfig,
+  type PointTSLNodes,
+} from './shader-tsl';
+import { copyRuntimeUniforms, POINT_RUNTIME_UNIFORMS } from '../_shared/runtime-uniforms';
+import { applySharedTSLGraph } from '../_shared/shared-graph-tsl';
 import type { PointMaterialConfig } from './material-glsl';
 import type { CameraAwareMaterial } from '../_shared/camera-aware-material';
 import type { ColormapAwareMaterial } from '../_shared/colormap-aware-material';
 import { clampGamma, isGammaOne, isNoGOG } from '../_shared/uniform-helpers';
-import { computePointSizeFactor, computeMaxPointSize } from '../_shared/camera-uniforms';
+import { computeMaxPointSize } from '../_shared/camera-uniforms';
 import {
   applyColormapTextureToMaterial,
   applyScalarRangeToMaterial,
 } from '../../material-colormap-helpers';
-import { getPlaceholderElementTexture } from '../../element-texture-layout';
+import {
+  getPlaceholderElementTexture,
+  POINT_TEXTURE_LAYOUT,
+  resolveElementTextureWidth,
+} from '../../element-texture-layout';
 import {
   applyBlendingStateToMaterial,
   getPointBlendingState,
@@ -63,12 +74,11 @@ import { computeScalarRangeUniforms } from '../_shared/scalar-range';
  */
 interface PointMaterialTSLNodeTable {
   uPointTex: TSLNode;
-  pointSizeFactor: TSLNode;
   maxPointSize: TSLNode;
   radiusScale: TSLNode;
-  uIsOrtho: TSLNode;
   uSortedIndexSlot: TSLNode;
   uDensityDrop: TSLNode;
+  uDensityAlphaExp: TSLNode;
   uGlassPartition: TSLNode;
   uGlassDepth: TSLNode;
   uNearCull: TSLNode;
@@ -124,9 +134,7 @@ export class PointTSLMaterial
     super();
 
     const gammaValue = clampGamma(materialConfig.gamma);
-    const defaultFov = (60 * Math.PI) / 180;
     const defaultResolutionY = 1080;
-    const defaultTanHalfFov = Math.tan(defaultFov / 2);
 
     this.tslNodes = {
       // Point data texture node. Starts on the shared placeholder; the
@@ -143,12 +151,11 @@ export class PointTSLMaterial
       // otherwise (no rebuild on value changes).
       uAbsorption: uniform(materialConfig.absorption ?? 1.0),
       uHasElementAlpha: uniform(materialConfig.hasElementAlpha ? 1 : 0),
-      pointSizeFactor: uniform((2.0 * defaultResolutionY) / defaultTanHalfFov),
       maxPointSize: uniform(defaultResolutionY * 0.5),
       radiusScale: uniform(materialConfig.radiusScale ?? 1.0),
-      uIsOrtho: uniform(0),
       uSortedIndexSlot: uniform(0),
       uDensityDrop: uniform(0),
+      uDensityAlphaExp: uniform(1),
       // Refraction split: mode 0 outside the split; the shared glass depth texture.
       ...glassPartitionNodes(),
       uNearCull: uniform(0.1),
@@ -172,12 +179,11 @@ export class PointTSLMaterial
       uOffset: proxyIUniform(this.tslNodes.uOffset),
       uAbsorption: proxyIUniform(this.tslNodes.uAbsorption),
       uHasElementAlpha: proxyIUniform(this.tslNodes.uHasElementAlpha),
-      pointSizeFactor: proxyIUniform(this.tslNodes.pointSizeFactor),
       maxPointSize: proxyIUniform(this.tslNodes.maxPointSize),
       radiusScale: proxyIUniform(this.tslNodes.radiusScale),
-      uIsOrtho: proxyIUniform(this.tslNodes.uIsOrtho),
       uSortedIndexSlot: proxyIUniform(this.tslNodes.uSortedIndexSlot),
       uDensityDrop: proxyIUniform(this.tslNodes.uDensityDrop),
+      uDensityAlphaExp: proxyIUniform(this.tslNodes.uDensityAlphaExp),
       uGlassPartition: proxyIUniform(this.tslNodes.uGlassPartition),
       uGlassDepth: proxyIUniform(this.tslNodes.uGlassDepth),
       uNearCull: proxyIUniform(this.tslNodes.uNearCull),
@@ -311,15 +317,25 @@ export class PointTSLMaterial
   private rebuildGraph(): void {
     const useColormap = !!this.defines && 'USE_COLORMAP' in this.defines;
     this.rebuildColormapNodes(useColormap);
-    pointWebGPUFactory(
-      this.tslNodes as PointTSLNodes,
-      {
-        useColormap,
-        gammaOne: !!this.defines && 'LUXAR_GAMMA_ONE' in this.defines,
-        noGOG: !!this.defines && 'LUXAR_NO_GOG' in this.defines,
-        blendingMode: (this.userData.blendingMode as BlendingMode | undefined) ?? 'additive',
-      },
-      this
+    const config: PointTSLConfig = {
+      useColormap,
+      gammaOne: !!this.defines && 'LUXAR_GAMMA_ONE' in this.defines,
+      noGOG: !!this.defines && 'LUXAR_NO_GOG' in this.defines,
+      blendingMode: (this.userData.blendingMode as BlendingMode | undefined) ?? 'additive',
+      elementTextureWidth: resolveElementTextureWidth(
+        POINT_TEXTURE_LAYOUT,
+        this.tslNodes.uPointTex.value as { image?: { width?: number } } | null
+      ),
+    };
+    // ONE graph per configuration, shared by every point material of it
+    // (see shared-graph-tsl.ts): the build cache keys on node ids.
+    applySharedTSLGraph(this, 'point', config, this.tslNodes, (inputs, scratch) => {
+      pointWebGPUFactory(inputs as PointTSLNodes, config, scratch);
+    });
+    applyPointMaterialState(
+      this,
+      config.blendingMode ?? 'additive',
+      (this.tslNodes.uOpacity.value as number | undefined) ?? 1.0
     );
     // Re-apply the explicit constructor overrides over the factory
     // tail's mode-derived blending state — on EVERY rebuild, not just
@@ -339,19 +355,13 @@ export class PointTSLMaterial
    * CameraAwareMaterial. Same body shape as `PointMaterial`: mutate
    * `this.uniforms.X.value`; the writes land directly on the
    * wrapper-owned TSL uniform nodes via the `proxyIUniform` bridges.
+   * The projection terms are read in the graph from
+   * `cameraProjectionMatrix`, so none is pushed.
    */
-  updateCameraParams(
-    fov: number,
-    resolution: THREE.Vector2,
-    isOrtho: boolean = false,
-    nearCull?: number,
-    pixelRatio: number = 1
-  ): void {
-    this.uniforms.uIsOrtho.value = isOrtho ? 1 : 0;
+  updateCameraParams(resolution: THREE.Vector2, nearCull?: number, pixelRatio: number = 1): void {
     if (nearCull !== undefined && this.uniforms.uNearCull) {
       this.uniforms.uNearCull.value = nearCull;
     }
-    this.uniforms.pointSizeFactor.value = computePointSizeFactor(fov, resolution.y, isOrtho);
     this.uniforms.maxPointSize.value = computeMaxPointSize(resolution.y);
     this.uniforms.uPixelRatio.value = pixelRatio;
     (this.uniforms.uResolution.value as THREE.Vector2).copy(resolution);
@@ -594,28 +604,8 @@ export class PointTSLMaterial
     const pointTex = this.uniforms.uPointTex?.value as THREE.DataTexture | null | undefined;
     if (pointTex) cloned.updatePointTexture(pointTex);
 
-    // Copy current uniform values
-    cloned.uniforms.pointSizeFactor.value = this.uniforms.pointSizeFactor.value;
-    cloned.uniforms.maxPointSize.value = this.uniforms.maxPointSize.value;
-    cloned.uniforms.uInvGamma.value = this.uniforms.uInvGamma.value;
-    cloned.uniforms.radiusScale.value = this.uniforms.radiusScale.value;
-    // Camera-state uniforms must ride along too (mirrors
-    // LineTSLMaterial.clone, the reference implementation): a clone
-    // taken in ortho mode otherwise renders the perspective branch with
-    // stale resolution/nearCull until the next global
-    // updateCameraParams broadcast reaches it. Unlike lines, uIsOrtho
-    // is a RUNTIME uniform in the points TSL graph (no ortho graph
-    // variant), so a plain value copy suffices — no rebuild needed.
-    cloned.uniforms.uIsOrtho.value = this.uniforms.uIsOrtho.value;
-    cloned.uniforms.uNearCull.value = this.uniforms.uNearCull.value;
-    cloned.uniforms.uPixelRatio.value = this.uniforms.uPixelRatio.value;
-    (cloned.uniforms.uResolution.value as THREE.Vector2).copy(
-      this.uniforms.uResolution.value as THREE.Vector2
-    );
-    // The active ordering slot must ride along: a clone taken while the
-    // geometry draws from slot 1 would otherwise read the stale buffer
-    // until the coordinator's next per-frame re-assert.
-    cloned.uniforms.uSortedIndexSlot.value = this.uniforms.uSortedIndexSlot.value;
+    // Runtime state a fresh clone would reset (POINT_RUNTIME_UNIFORMS, ../_shared/runtime-uniforms.ts).
+    copyRuntimeUniforms(this, cloned, POINT_RUNTIME_UNIFORMS);
 
     return cloned as this;
   }

@@ -11,6 +11,7 @@ import { OPEN_DATASET_BROWSER_EVENT } from '../../../core/app/interaction/canvas
 
 const jsdomDocument = document;
 const ownershipMocks = vi.hoisted(() => ({ install: vi.fn() }));
+const screenshotMocks = vi.hoisted(() => ({ capture: vi.fn() }));
 
 // NOTE: This test file mocks 9 internal modules (below). It primarily
 // verifies initialization ordering + cross-wiring; component behavior
@@ -62,6 +63,9 @@ vi.mock('../../../ui/error-overlay');
 vi.mock('../../../ui/toast');
 vi.mock('../../../ui/help-overlay');
 vi.mock('../../../ui/layers');
+vi.mock('../../../core/app/embedder/screenshot', () => ({
+  captureScreenshot: screenshotMocks.capture,
+}));
 vi.mock('../../../core/app/interaction/canvas-gesture-ownership', () => ({
   installCanvasGestureOwnership: ownershipMocks.install,
 }));
@@ -147,17 +151,31 @@ import { InputHandler } from '../../../input';
 import { RenderingControls } from '../../../ui/rendering-controls';
 import { sceneDimsManager } from '../../../scene/scene-dims-manager';
 import { DatasetBrowser } from '../../../ui/dataset-browser';
+import { ControlRail } from '../../../ui/control-rail';
 import { cleanupUI as mockCleanupUI } from '../../../ui/ui-cleanup';
-import { clearError as mockClearError } from '../../../ui/error-overlay';
+import {
+  clearError as mockClearError,
+  showError as mockShowError,
+} from '../../../ui/error-overlay';
 import { showToast as mockShowToast } from '../../../ui/toast';
 import { showHelpOverlay } from '../../../ui/help-overlay';
+import { LayersPanel } from '../../../ui/layers';
+
+// The automock does not stub the `layerState` getter, and the init pipeline
+// subscribes the scene environment to the panel's state.
+Object.defineProperty(LayersPanel.prototype, 'layerState', {
+  configurable: true,
+  get: () => ({ onChange: () => () => undefined }),
+});
 
 // Import LuxarApp after all mocks are set up
 import { LuxarApp } from '../../../core/app';
 import { SceneDimsManager } from '../../../scene/scene-dims-manager';
 import { setDocumentTitle } from '../../../core/document-title';
 import { SceneLoaderManager } from '../../../data/scene-loader-manager';
+import { clearNotifierBackend, notifier } from '../../../utils/cross-layer/notifier';
 import type { ZarrWaypoint } from '../../../types/zarr';
+import { OverlayManager } from '../../../ui/overlay-manager';
 
 describe('LuxarApp', () => {
   let app: LuxarApp;
@@ -171,6 +189,7 @@ describe('LuxarApp', () => {
     // Clear all mocks
     vi.clearAllMocks();
     ownershipMocks.install.mockReset();
+    screenshotMocks.capture.mockReset();
 
     // Reset mock implementations
     mockSceneManager = {
@@ -183,7 +202,21 @@ describe('LuxarApp', () => {
       getSceneBakedEnvironment: vi.fn().mockReturnValue(null),
       attachEnvironmentRuntime: vi.fn(),
       environment: null,
+      // The app's depth-sort coordinator rides the scene manager.
+      depthSort: {
+        setEnabled: vi.fn(),
+        configure: vi.fn(),
+        warmUp: vi.fn(),
+        evaluatePerFrame: vi.fn(() => false),
+        isAvailable: vi.fn(() => true),
+        resortForCapture: vi.fn(async () => {}),
+        dispose: vi.fn(),
+      },
       dispose: vi.fn(),
+      // SceneManager is a THREE.EventDispatcher (the app subscribes to its
+      // 'webgpu-device-lost').
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
       renderer: { domElement: {} },
       scene: {},
       // Enough of a camera for captureSnapshot() (the camera-changed
@@ -192,6 +225,8 @@ describe('LuxarApp', () => {
       // The ControlsManager surface the embedder hooks subscribe to.
       controls: {
         setEnabled: vi.fn(),
+        setPointerEnabled: vi.fn(),
+        isPointerEnabled: vi.fn(() => true),
         addEventListener: vi.fn(),
         removeEventListener: vi.fn(),
         getFocusTarget: vi.fn(() => ({ x: 0, y: 0, z: 0 })),
@@ -200,14 +235,23 @@ describe('LuxarApp', () => {
         dispatchEvent: vi.fn(),
         isAutoRotateActive: vi.fn(() => false),
       },
-      postProcessing: {},
+      postProcessing: { setCaptureReleasedCallback: vi.fn() },
       // Embedder-API delegation targets.
       resizeToCanvas: vi.fn(),
       centerCameraOnScene: vi.fn(),
+      // Like production: run the write, then publish ONE controls `change`
+      // (the fake controls fire none on their own). Reads the controls
+      // lazily because a test may swap them out.
+      commitCameraChange: vi.fn((write?: () => void) => {
+        write?.();
+        mockSceneManager.camera.updateMatrixWorld?.();
+        mockSceneManager.controls.dispatchEvent?.({ type: 'change' });
+      }),
     };
 
     mockAnimationController = {
       startAnimation: vi.fn(),
+      prepareFrame: vi.fn(),
       stopAnimation: vi.fn(),
       addPerFrameCallback: vi.fn(),
       removePerFrameCallback: vi.fn(),
@@ -217,6 +261,11 @@ describe('LuxarApp', () => {
       setIdleRestorePredicate: vi.fn(),
       setRenderSkipPredicate: vi.fn(),
       setPacingSuspendPredicate: vi.fn(),
+      setRenderOnChange: vi.fn(),
+      setViewSignatureSource: vi.fn(),
+      setRenderAudit: vi.fn(),
+      requestRender: vi.fn(),
+      requestTick: vi.fn(),
       dispose: vi.fn(),
       isActive: false,
     };
@@ -232,6 +281,7 @@ describe('LuxarApp', () => {
       pushContext: vi.fn(),
       popContext: vi.fn(),
       setEnabled: vi.fn(),
+      isEnabled: vi.fn(() => true),
       setRenderingControls: vi.fn(),
       setScaleBar: vi.fn(),
       setRecordingPanel: vi.fn(),
@@ -655,6 +705,23 @@ describe('LuxarApp', () => {
       await app.init({ canvas: mockCanvas, src: 'http://example.com/data.zarr' });
     });
 
+    it('prepares view state before capturing an embedder screenshot', async () => {
+      const blob = new Blob(['frame'], { type: 'image/png' });
+      const opts = { format: 'png' as const };
+      screenshotMocks.capture.mockResolvedValue(blob);
+
+      await expect(app.screenshot(opts)).resolves.toBe(blob);
+      expect(mockAnimationController.prepareFrame).toHaveBeenCalledOnce();
+      expect(screenshotMocks.capture).toHaveBeenCalledWith(
+        mockSceneManager,
+        expect.anything(),
+        opts
+      );
+      expect(mockAnimationController.prepareFrame.mock.invocationCallOrder[0]).toBeLessThan(
+        screenshotMocks.capture.mock.invocationCallOrder[0]
+      );
+    });
+
     it('should connect rendering controls to animation controller', () => {
       expect(mockRenderingControls.setAnimationController).toHaveBeenCalledWith(
         mockAnimationController
@@ -737,16 +804,41 @@ describe('LuxarApp', () => {
       expect(app.initialized).toBe(false);
     });
 
-    it('propagates loadSceneData errors out of init() so the caller can handle them', async () => {
+    it('keeps the viewer alive when the first dataset fails to load', async () => {
+      // A `?src` typo must not leave a dead page: the error dialog advertises
+      // the dataset browser, so the app (and its browser shortcut) has to
+      // survive the failed load. Subsystem failures still dispose (below).
       mockFetch.mockResolvedValue({ ok: true });
       mockSceneManager.loadSceneData.mockRejectedValue(new Error('Load failed'));
+      const notifyError = vi.spyOn(notifier, 'error').mockImplementation(() => {});
+      const datasetErrors: Array<{ src: string; error: Error }> = [];
+      app.on('dataset-error', (payload) => datasetErrors.push(payload));
 
-      // Contract: init() does NOT swallow loadSceneData failures. The previous
-      // name ("should continue if data loading fails") contradicted the
-      // assertion — the test always asserted the throw.
       await expect(
-        app.init({ canvas: mockCanvas, src: 'http://example.com/data.zarr' })
-      ).rejects.toThrow('Load failed');
+        app.init({ canvas: mockCanvas, src: 'http://example.com/typo.zarr' })
+      ).resolves.toBeUndefined();
+
+      expect(app.initialized).toBe(true);
+      expect(mockSceneManager.dispose).not.toHaveBeenCalled();
+      expect(datasetErrors).toEqual([
+        {
+          src: 'http://example.com/typo.zarr',
+          error: expect.objectContaining({ message: 'Load failed' }),
+        },
+      ]);
+      // The persistent dialog names the failure (the notifier backend adds the
+      // dataset-browser hint), and the browser it points at really opens.
+      expect(notifyError).toHaveBeenCalledWith(expect.stringContaining('Load failed'), {
+        persistent: true,
+      });
+      const openBrowser = mockAddEventListener.mock.calls.find(
+        (call) => call[0] === OPEN_DATASET_BROWSER_EVENT
+      )?.[1] as (() => void) | undefined;
+      openBrowser!();
+      expect(DatasetBrowser).toHaveBeenCalled();
+      // ...and a retry through it can reach a fresh load.
+      mockSceneManager.loadSceneData.mockResolvedValue(undefined);
+      await expect(app.switchDataset('http://example.com/fixed.zarr')).resolves.toBeUndefined();
     });
 
     it('disposes partial state when init() throws so the caller can retry', async () => {
@@ -817,6 +909,38 @@ describe('LuxarApp', () => {
     });
   });
 
+  describe('notifier backend', () => {
+    it('routes the notifier to the viewer UI for a library embed, across dispose → init', async () => {
+      // A library embedder never runs bootstrapStandalone: the app's own init
+      // must give lower layers (toasts, error dialog, spinner) a backend.
+      clearNotifierBackend();
+      await app.init({ canvas: mockCanvas, src: '' });
+
+      notifier.toast('first');
+      notifier.error('archive unavailable', { persistent: true });
+      notifier.error('ordinary failure');
+      expect(mockShowToast).toHaveBeenCalledWith('first', 2000);
+      expect(mockShowError).toHaveBeenNthCalledWith(
+        1,
+        'archive unavailable',
+        expect.any(Function),
+        { datasetBrowser: 'dataset-browser.toggle', help: 'help.toggle' },
+        { autoDismiss: false }
+      );
+      // No options at all: the dialog's own auto-dismiss default applies.
+      expect(mockShowError).toHaveBeenNthCalledWith(2, 'ordinary failure', expect.any(Function), {
+        datasetBrowser: 'dataset-browser.toggle',
+        help: 'help.toggle',
+      });
+
+      // dispose() clears the backend; the next lifetime installs it again.
+      app.dispose();
+      await app.init({ canvas: mockCanvas, src: '' });
+      notifier.toast('second');
+      expect(mockShowToast).toHaveBeenLastCalledWith('second', 2000);
+    });
+  });
+
   describe('dispose', () => {
     beforeEach(async () => {
       mockFetch.mockResolvedValue({ ok: true });
@@ -854,6 +978,14 @@ describe('LuxarApp', () => {
       app.dispose();
 
       expect(mockCleanupUI).toHaveBeenCalled();
+    });
+
+    it("disposes the app's own depth-sort coordinator", () => {
+      // Per app, not module-wide: a LuxarLayer sharing the page keeps its own,
+      // and the shared SortWorker survives until the last coordinator goes.
+      app.dispose();
+
+      expect(mockSceneManager.depthSort.dispose).toHaveBeenCalledTimes(1);
     });
 
     it('gives the page its own title back', () => {
@@ -1018,7 +1150,7 @@ describe('LuxarApp', () => {
     it('still disposes singletons + workerPool when an early component throws', async () => {
       // Pre-existing dispose() wrapped everything in one
       // try/catch, so a throw early in the chain (sceneManager etc.)
-      // skipped DataMonitorManager / SceneLoaderManager / disposeWorkerPool
+      // skipped DataMonitorManager / SceneLoaderManager / releaseWorkerPool
       // / managerRegistry. The safeDispose helper guarantees later
       // teardown runs regardless.
       const sceneLoaderModule = await import('../../../data/scene-loader-manager');
@@ -1027,7 +1159,7 @@ describe('LuxarApp', () => {
 
       const sceneLoaderSpy = vi.spyOn(sceneLoaderModule.SceneLoaderManager, 'disposeInstance');
       const dataMonitorSpy = vi.spyOn(dataMonitorModule.DataMonitorManager, 'disposeInstance');
-      const workerPoolSpy = vi.spyOn(workerPoolModule, 'disposeWorkerPool');
+      const workerPoolSpy = vi.spyOn(workerPoolModule, 'releaseWorkerPool');
 
       // Force an early disposer to throw — animationController is the
       // very first call site inside dispose().
@@ -1050,7 +1182,7 @@ describe('LuxarApp', () => {
 
       const sceneLoaderSpy = vi.spyOn(sceneLoaderModule.SceneLoaderManager, 'disposeInstance');
       const dataMonitorSpy = vi.spyOn(dataMonitorModule.DataMonitorManager, 'disposeInstance');
-      const workerPoolSpy = vi.spyOn(workerPoolModule, 'disposeWorkerPool');
+      const workerPoolSpy = vi.spyOn(workerPoolModule, 'releaseWorkerPool');
 
       // sceneManager sits in the middle of the dispose chain — between
       // the UI/scene panels and the singleton/worker teardown.
@@ -1073,7 +1205,7 @@ describe('LuxarApp', () => {
       const workerPoolModule = await import('../../../workers/worker-pool');
 
       const sceneLoaderSpy = vi.spyOn(sceneLoaderModule.SceneLoaderManager, 'disposeInstance');
-      const workerPoolSpy = vi.spyOn(workerPoolModule, 'disposeWorkerPool');
+      const workerPoolSpy = vi.spyOn(workerPoolModule, 'releaseWorkerPool');
 
       app.dispose();
 
@@ -1142,13 +1274,15 @@ describe('LuxarApp', () => {
       mockAnimationController.startAnimation.mockClear();
       (document as any).hidden = false;
 
-      // Find the visibilitychange handler
-      const visibilityHandler = mockAddEventListener.mock.calls.find(
-        (call) => call[0] === 'visibilitychange'
-      )?.[1];
+      // Fire every visibilitychange handler: the unload handler registers
+      // its own (the L2 index flush on hidden) ahead of the render one, so
+      // picking the first registration would test the wrong listener.
+      const visibilityHandlers = mockAddEventListener.mock.calls
+        .filter((call) => call[0] === 'visibilitychange')
+        .map((call) => call[1]);
 
-      expect(visibilityHandler).toBeDefined();
-      visibilityHandler?.();
+      expect(visibilityHandlers.length).toBeGreaterThan(0);
+      for (const handler of visibilityHandlers) handler();
 
       expect(mockAnimationController.startAnimation).toHaveBeenCalled();
     });
@@ -1158,13 +1292,15 @@ describe('LuxarApp', () => {
       mockAnimationController.stopAnimation.mockClear();
       (document as any).hidden = true;
 
-      // Find the visibilitychange handler
-      const visibilityHandler = mockAddEventListener.mock.calls.find(
-        (call) => call[0] === 'visibilitychange'
-      )?.[1];
+      // Fire every visibilitychange handler: the unload handler registers
+      // its own (the L2 index flush on hidden) ahead of the render one, so
+      // picking the first registration would test the wrong listener.
+      const visibilityHandlers = mockAddEventListener.mock.calls
+        .filter((call) => call[0] === 'visibilitychange')
+        .map((call) => call[1]);
 
-      expect(visibilityHandler).toBeDefined();
-      visibilityHandler?.();
+      expect(visibilityHandlers.length).toBeGreaterThan(0);
+      for (const handler of visibilityHandlers) handler();
 
       // Should stop animation when hidden (saves resources)
       expect(mockAnimationController.stopAnimation).toHaveBeenCalled();
@@ -1229,11 +1365,15 @@ describe('LuxarApp', () => {
 
     it('removes the early browser listener and clears initializing state when init fails', async () => {
       mockFetch.mockResolvedValue({ ok: true });
-      mockSceneManager.loadSceneData.mockRejectedValueOnce(new Error('initial load failed'));
+      // A wiring failure AFTER routing (the embedder hooks subscribe to the
+      // controls' change stream) — a dataset failure no longer fails init().
+      mockSceneManager.controls.addEventListener.mockImplementation((type: string) => {
+        if (type === 'change') throw new Error('initial wiring failed');
+      });
 
       await expect(
         app.init({ canvas: mockCanvas, src: 'http://example.com/data.zarr' })
-      ).rejects.toThrow('initial load failed');
+      ).rejects.toThrow('initial wiring failed');
 
       const browserRegistration = mockAddEventListener.mock.calls.find(
         (call) => call[0] === OPEN_DATASET_BROWSER_EVENT
@@ -1258,16 +1398,98 @@ describe('LuxarApp', () => {
 
       app.dispose();
       expect(() => app.switchDataset('http://example.com/retry.zarr')).toThrow(/before init/);
+      mockAddEventListener.mockClear();
 
       releaseInitialLoad();
       await initPromise;
+
+      // The init that the dispose overtook must not finish wiring a disposed
+      // app: no listeners installed after teardown, still uninitialized, and
+      // the instance can be initialized again.
+      expect(app.initialized).toBe(false);
+      expect(mockAddEventListener.mock.calls.map((call) => call[0])).toEqual([]);
+      await app.init({ canvas: mockCanvas, src: 'http://example.com/data.zarr' });
+      expect(app.initialized).toBe(true);
       app.dispose();
+    });
+
+    it('does not load the dataset when disposed during the routing probe', async () => {
+      // A URL without a `.zarr` suffix is probed for zarr metadata before
+      // routing; a dispose that lands during that probe must win.
+      let releaseProbe!: () => void;
+      mockFetch.mockImplementation(
+        () => new Promise((resolve) => (releaseProbe = () => resolve({ ok: true })))
+      );
+
+      const initPromise = app.init({ canvas: mockCanvas, src: 'http://example.com/data' });
+      await vi.waitFor(() => expect(mockFetch).toHaveBeenCalled());
+
+      app.dispose();
+      releaseProbe();
+      await initPromise;
+
+      expect(mockSceneManager.loadSceneData).not.toHaveBeenCalled();
+      expect(app.initialized).toBe(false);
+    });
+
+    it('releases a scene manager created by an init pipeline overtaken by dispose', async () => {
+      let releaseSceneInit!: () => void;
+      mockSceneManager.init.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (releaseSceneInit = resolve))
+      );
+
+      const initPromise = app.init({ canvas: mockCanvas, src: 'http://example.com/data.zarr' });
+      expect(mockSceneManager.init).toHaveBeenCalledTimes(1);
+      app.dispose();
+      mockAddEventListener.mockClear();
+
+      releaseSceneInit();
+      await initPromise;
+
+      expect(mockSceneManager.dispose).toHaveBeenCalledTimes(1);
+      expect(mockAnimationController.dispose).toHaveBeenCalledTimes(1);
+      expect(mockAddEventListener.mock.calls.map((call) => call[0])).toEqual([
+        'luxar-layers-changed',
+      ]);
+      for (const [event, listener] of mockAddEventListener.mock.calls) {
+        expect(mockRemoveEventListener).toHaveBeenCalledWith(event, listener);
+      }
+      expect(mockSceneManager.loadSceneData).not.toHaveBeenCalled();
+      expect(app.initialized).toBe(false);
+    });
+
+    it('does not route a prior init after dispose and re-init', async () => {
+      const probes = new Map<string, (value: { ok: boolean }) => void>();
+      mockFetch.mockImplementation(
+        (url: string) => new Promise((resolve) => probes.set(url, resolve))
+      );
+
+      const first = app.init({ canvas: mockCanvas, src: 'http://example.com/AAA' });
+      await vi.waitFor(() => expect(probes.has('http://example.com/AAA/.zgroup')).toBe(true));
+      app.dispose();
+      const second = app.init({ canvas: mockCanvas, src: 'http://example.com/BBB' });
+      probes.get('http://example.com/AAA/.zgroup')?.({ ok: true });
+      await vi.waitFor(() => expect(probes.has('http://example.com/BBB/.zgroup')).toBe(true));
+      for (const [url, resolve] of probes) {
+        if (url.includes('BBB')) resolve({ ok: true });
+      }
+      await Promise.all([first, second]);
+
+      expect(mockSceneManager.loadSceneData).toHaveBeenCalledTimes(1);
+      expect(mockSceneManager.loadSceneData.mock.calls[0]?.[0]).toBe('http://example.com/BBB');
+      expect(app.initialized).toBe(true);
     });
 
     it('does not call history.replaceState when updateBrowserUrl is false', async () => {
       const replaceStateSpy = vi.spyOn(window.history, 'replaceState').mockImplementation(() => {});
 
       await app.init({ canvas: mockCanvas, src: '', updateBrowserUrl: false });
+      expect(
+        vi
+          .mocked(ControlRail)
+          .mock.calls.at(-1)?.[0]
+          .some((item) => item.id === 'bookmarks')
+      ).toBe(false);
 
       const browserCall = (DatasetBrowser as any).mock.calls.at(-1);
       expect(browserCall).toBeDefined();
@@ -1299,6 +1521,12 @@ describe('LuxarApp', () => {
       const replaceStateSpy = vi.spyOn(window.history, 'replaceState').mockImplementation(() => {});
 
       await app.init({ canvas: mockCanvas, src: '', updateBrowserUrl: true });
+      expect(
+        vi
+          .mocked(ControlRail)
+          .mock.calls.at(-1)?.[0]
+          .some((item) => item.id === 'bookmarks')
+      ).toBe(true);
 
       const browserCall = (DatasetBrowser as any).mock.calls.at(-1);
       const onSelect = browserCall[0].onDatasetSelect as (url: string) => Promise<void>;
@@ -1525,7 +1753,8 @@ describe('LuxarApp', () => {
         audioEngine,
         layersPanel,
         sceneManager: mockSceneManager,
-        waypointDriver,
+        // The dataset session owns the installed waypoint driver.
+        session: { waypointDriver, dispose: vi.fn() },
       });
 
       (app as unknown as { installAudio(audio: unknown): void }).installAudio(undefined);
@@ -1565,7 +1794,7 @@ describe('LuxarApp', () => {
       expect(mockAnimationController.addPerFrameCallback).toHaveBeenCalledWith(
         'camera-flight',
         expect.any(Function),
-        { continuous: true }
+        { continuous: true, phase: 'camera' }
       );
       expect(mockAnimationController.startAnimation).toHaveBeenCalled();
 
@@ -1594,6 +1823,7 @@ describe('LuxarApp', () => {
         near: 0.1,
         far: 100,
         updateProjectionMatrix: vi.fn(),
+        lookAt: vi.fn(),
       };
       mockSceneManager.getSceneViewerConfig.mockReturnValue({
         waypoints: [
@@ -1638,7 +1868,7 @@ describe('LuxarApp', () => {
         expect(mockAnimationController.addPerFrameCallback).toHaveBeenCalledWith(
           'camera-flight',
           expect.any(Function),
-          { continuous: true }
+          { continuous: true, phase: 'camera' }
         );
 
         const flightsStarted = (): number =>
@@ -1670,6 +1900,7 @@ describe('LuxarApp', () => {
         near: 0.1,
         far: 100,
         updateProjectionMatrix: vi.fn(),
+        lookAt: vi.fn(),
       };
       const dimensions = ['x', 'y', 'z', 'story'].map((name, index) => ({
         name,
@@ -1782,6 +2013,222 @@ describe('LuxarApp', () => {
       expect(state.layers).toEqual([]);
     });
 
+    it('stops the kiosk watchdog on dispose', async () => {
+      // A watchdog left listening after dispose() reloads the page on the next
+      // context loss of a canvas the app no longer owns.
+      const canvas = { addEventListener: vi.fn(), removeEventListener: vi.fn() };
+      mockSceneManager.renderer = { domElement: canvas };
+      await app.init({ canvas: mockCanvas, src: SRC });
+      const internals = app as unknown as {
+        applyKiosk: (config: {
+          ui: { kiosk: { enabled: boolean; watchdog_reload: boolean } };
+        }) => void;
+      };
+      internals.applyKiosk({ ui: { kiosk: { enabled: true, watchdog_reload: true } } });
+      expect(canvas.addEventListener).toHaveBeenCalledWith(
+        'webglcontextlost',
+        expect.any(Function)
+      );
+
+      app.dispose();
+
+      expect(canvas.removeEventListener).toHaveBeenCalledWith(
+        'webglcontextlost',
+        canvas.addEventListener.mock.calls.find((call) => call[0] === 'webglcontextlost')?.[1]
+      );
+    });
+
+    it('keeps input locked when kiosk mode is reapplied in one session', async () => {
+      await app.init({ canvas: mockCanvas, src: SRC });
+      let keyboardEnabled = true;
+      let pointerEnabled = true;
+      mockInputHandler.isEnabled.mockImplementation(() => keyboardEnabled);
+      mockInputHandler.setEnabled.mockImplementation((enabled: boolean) => {
+        keyboardEnabled = enabled;
+      });
+      mockSceneManager.controls.isPointerEnabled.mockImplementation(() => pointerEnabled);
+      mockSceneManager.controls.setPointerEnabled.mockImplementation((enabled: boolean) => {
+        pointerEnabled = enabled;
+      });
+      const internals = app as unknown as {
+        applyKiosk: (config: { ui: { kiosk: { enabled: boolean } } }) => void;
+      };
+      const locked = { ui: { kiosk: { enabled: true } } };
+      internals.applyKiosk(locked);
+      internals.applyKiosk(locked);
+      expect(keyboardEnabled).toBe(false);
+      expect(pointerEnabled).toBe(false);
+      app.dispose();
+      expect(keyboardEnabled).toBe(true);
+      expect(pointerEnabled).toBe(true);
+    });
+
+    it('keeps URL kiosk input locked during a failed dataset switch', async () => {
+      let keyboardEnabled = true;
+      let pointerEnabled = true;
+      mockInputHandler.isEnabled.mockImplementation(() => keyboardEnabled);
+      mockInputHandler.setEnabled.mockImplementation((enabled: boolean) => {
+        keyboardEnabled = enabled;
+      });
+      mockSceneManager.controls.isPointerEnabled.mockImplementation(() => pointerEnabled);
+      mockSceneManager.controls.setPointerEnabled.mockImplementation((enabled: boolean) => {
+        pointerEnabled = enabled;
+      });
+      await app.init({ canvas: mockCanvas, src: SRC, kiosk: true });
+      expect([keyboardEnabled, pointerEnabled]).toEqual([false, false]);
+
+      let rejectLoad!: (reason: Error) => void;
+      mockSceneManager.loadSceneData.mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => (rejectLoad = reject))
+      );
+      const switching = app.switchDataset('http://example.com/next.zarr');
+      await vi.waitFor(() => expect(rejectLoad).toBeDefined());
+      expect([keyboardEnabled, pointerEnabled]).toEqual([false, false]);
+
+      rejectLoad(new Error('network failure'));
+      await expect(switching).rejects.toThrow('network failure');
+      expect([keyboardEnabled, pointerEnabled]).toEqual([false, false]);
+      app.dispose();
+      expect([keyboardEnabled, pointerEnabled]).toEqual([true, true]);
+    });
+
+    it('restores the pre-kiosk input state when leaving kiosk after an embedder write', async () => {
+      let keyboardEnabled = false;
+      let pointerEnabled = true;
+      mockInputHandler.isEnabled.mockImplementation(() => keyboardEnabled);
+      mockInputHandler.setEnabled.mockImplementation((enabled: boolean) => {
+        keyboardEnabled = enabled;
+      });
+      mockSceneManager.controls.isPointerEnabled.mockImplementation(() => pointerEnabled);
+      mockSceneManager.controls.setPointerEnabled.mockImplementation((enabled: boolean) => {
+        pointerEnabled = enabled;
+      });
+      mockSceneManager.getSceneViewerConfig
+        .mockReturnValueOnce({ ui: { kiosk: { enabled: true } } })
+        .mockReturnValueOnce(undefined);
+      await app.init({ canvas: mockCanvas, src: SRC });
+      expect(keyboardEnabled).toBe(false);
+      expect(pointerEnabled).toBe(false);
+
+      app.setInputEnabled(true);
+      expect(keyboardEnabled).toBe(true);
+      await app.switchDataset('http://example.com/next.zarr');
+      expect(keyboardEnabled).toBe(false);
+      expect(pointerEnabled).toBe(true);
+    });
+
+    it('leaves no kiosk watchdog behind a load that finishes after dispose', async () => {
+      const canvas = { addEventListener: vi.fn(), removeEventListener: vi.fn() };
+      mockSceneManager.renderer = { domElement: canvas };
+      await app.init({ canvas: mockCanvas, src: '' });
+      mockSceneManager.getSceneViewerConfig.mockReturnValue({
+        ui: { kiosk: { enabled: true, watchdog_reload: true } },
+      });
+      let releaseLoad!: () => void;
+      mockSceneManager.loadSceneData.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (releaseLoad = resolve))
+      );
+
+      const switching = app.switchDataset('http://example.com/next.zarr');
+      await vi.waitFor(() => expect(mockSceneManager.loadSceneData).toHaveBeenCalledTimes(1));
+      app.dispose();
+      releaseLoad();
+      await switching;
+
+      const additions = canvas.addEventListener.mock.calls.filter(
+        (call) => call[0] === 'webglcontextlost'
+      );
+      const removals = canvas.removeEventListener.mock.calls.filter(
+        (call) => call[0] === 'webglcontextlost'
+      );
+      // The stale load stops before applying its viewer config, so it never
+      // installs one; anything that was installed must have been removed.
+      expect(removals).toEqual(additions);
+    });
+
+    it('a superseded load never writes its viewer config into a newer session', async () => {
+      // dispose() + init() while a switch is still loading: the old load's
+      // config pass must land in ITS (disposed) session, not the new one.
+      await app.init({ canvas: mockCanvas, src: '' });
+      let releaseOld!: () => void;
+      mockSceneManager.loadSceneData.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (releaseOld = resolve))
+      );
+      const oldSwitch = app.switchDataset('http://example.com/old.zarr');
+      await vi.waitFor(() => expect(mockSceneManager.loadSceneData).toHaveBeenCalledTimes(1));
+      app.dispose();
+
+      await app.init({ canvas: mockCanvas, src: SRC });
+      mockSceneManager.getSceneViewerConfig.mockReturnValue({
+        control_panel: { title: 'Old scene', columns: 2 },
+      });
+      releaseOld();
+      await oldSwitch;
+
+      expect(app.getViewerState().controlPanel).toBeNull();
+    });
+
+    it('a load disposed mid-flight runs none of its tail into the next lifetime', async () => {
+      // dispose() + init() while a switch is still in loadSceneData: the old
+      // load must not restart the animation, warm programs, build overlays on
+      // the app, or announce its src to the new lifetime's listeners.
+      await app.init({ canvas: mockCanvas, src: '' });
+      let releaseOld!: () => void;
+      mockSceneManager.loadSceneData.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (releaseOld = resolve))
+      );
+      const oldSwitch = app.switchDataset('http://example.com/old.zarr');
+      await vi.waitFor(() => expect(mockSceneManager.loadSceneData).toHaveBeenCalledTimes(1));
+      app.dispose();
+      await app.init({ canvas: mockCanvas, src: '' });
+      const onLoaded = vi.fn();
+      app.on('dataset-loaded', onLoaded);
+      mockAnimationController.startAnimation.mockClear();
+      mockSceneManager.warmBlendModePrograms.mockClear();
+      mockInputHandler.initDimensionSliders.mockClear();
+
+      releaseOld();
+      await oldSwitch;
+
+      expect(mockInputHandler.initDimensionSliders).not.toHaveBeenCalled();
+      expect(mockAnimationController.startAnimation).not.toHaveBeenCalled();
+      expect(mockSceneManager.warmBlendModePrograms).not.toHaveBeenCalled();
+      expect(onLoaded).not.toHaveBeenCalled();
+    });
+
+    it("an overlay load that outlives its app never replaces the next lifetime's overlays", async () => {
+      // The window inside initOverlays: the stale manager must be disposed,
+      // not assigned over the new lifetime's.
+      const root = {
+        name: 'LuxarScene',
+        children: [],
+        traverse: vi.fn(),
+        userData: { overlayConfigs: [{ type: 'text' }], zarrBaseUrl: 'http://example.com/a.zarr' },
+      };
+      mockSceneManager.scene = { children: [root] };
+      await app.init({ canvas: mockCanvas, src: '' });
+      let releaseOverlays!: () => void;
+      const loadOverlays = vi
+        .spyOn(OverlayManager.prototype, 'loadOverlays')
+        .mockImplementationOnce(() => new Promise<void>((resolve) => (releaseOverlays = resolve)));
+      const oldSwitch = app.switchDataset('http://example.com/old.zarr');
+      await vi.waitFor(() => expect(loadOverlays).toHaveBeenCalledTimes(1));
+      app.dispose();
+      loadOverlays.mockResolvedValue(undefined);
+      await app.init({ canvas: mockCanvas, src: 'http://example.com/new.zarr' });
+      const internals = app as unknown as { overlayManager: OverlayManager | undefined };
+      const current = internals.overlayManager;
+      expect(current).toBeDefined();
+      const staleDispose = vi.spyOn(OverlayManager.prototype, 'dispose');
+
+      releaseOverlays();
+      await oldSwitch;
+
+      expect(internals.overlayManager).toBe(current);
+      expect(staleDispose).toHaveBeenCalledTimes(1);
+      expect(staleDispose.mock.contexts[0]).not.toBe(current);
+    });
+
     it('keeps authored scene overlays visible in kiosk mode', async () => {
       await app.init({ canvas: mockCanvas, src: SRC });
       const hideOverlay = vi.fn();
@@ -1800,6 +2247,24 @@ describe('LuxarApp', () => {
   describe('programmatic embedder API', () => {
     const SRC = 'http://example.com/data.zarr';
 
+    it('re-emits WebGPU device loss as the public webgpu-device-lost event', async () => {
+      // Unrecoverable in this release: an embedder must be able to react
+      // (reload, show its own error) without reaching into the renderer.
+      const listeners: Array<[string, (event: unknown) => void]> = [];
+      mockSceneManager.addEventListener = vi.fn((type: string, fn: (event: unknown) => void) =>
+        listeners.push([type, fn])
+      );
+      mockSceneManager.removeEventListener = vi.fn();
+      await app.init({ canvas: mockCanvas, src: SRC });
+      const onLost = vi.fn();
+      app.on('webgpu-device-lost', onLost);
+
+      const event = { type: 'webgpu-device-lost', reason: 'destroyed', message: 'gone' };
+      for (const [type, fn] of listeners) if (type === 'webgpu-device-lost') fn(event);
+
+      expect(onLost).toHaveBeenCalledExactlyOnceWith({ reason: 'destroyed', message: 'gone' });
+    });
+
     it('emits dataset-loaded when switchDataset succeeds', async () => {
       await app.init({ canvas: mockCanvas, src: SRC });
       const onLoaded = vi.fn();
@@ -1808,6 +2273,40 @@ describe('LuxarApp', () => {
       await app.switchDataset('http://example.com/other.zarr');
 
       expect(onLoaded).toHaveBeenCalledWith({ src: 'http://example.com/other.zarr' });
+    });
+
+    it('writes the switched-to dataset into ?src when the app owns the URL', async () => {
+      // A kiosk / remote-control story switch, then a reload, must reopen the
+      // scene on screen — not the one the page started with. Same contract as
+      // a dataset-browser selection.
+      await app.init({ canvas: mockCanvas, src: SRC, updateBrowserUrl: true });
+      mockReplaceState.mockClear();
+
+      await app.switchDataset('http://example.com/other.zarr');
+
+      expect(mockReplaceState).toHaveBeenCalledTimes(1);
+      expect(mockReplaceState.mock.calls[0][2]).toBe(
+        `/?src=${encodeURIComponent('http://example.com/other.zarr')}`
+      );
+    });
+
+    it('leaves the host URL alone on a switch by default', async () => {
+      await app.init({ canvas: mockCanvas, src: SRC });
+      mockReplaceState.mockClear();
+
+      await app.switchDataset('http://example.com/other.zarr');
+
+      expect(mockReplaceState).not.toHaveBeenCalled();
+    });
+
+    it("does not mutate the embedder's options object on a switch", async () => {
+      const options = { canvas: mockCanvas, src: SRC };
+      await app.init(options);
+
+      await app.switchDataset('http://example.com/other.zarr');
+
+      expect(options.src).toBe(SRC);
+      expect(app.getViewerState().src).toBe('http://example.com/other.zarr');
     });
 
     it('re-titles the browser tab for the dataset being switched to', async () => {
@@ -1988,10 +2487,38 @@ describe('LuxarApp', () => {
       const onDims = vi.fn();
       app.on('dimensions-changed', onDims);
 
-      listener(); // simulate a slice-position change notification
+      listener(true); // simulate a slice-position change notification
 
       expect(onDims).toHaveBeenCalledTimes(1);
       expect(onDims.mock.calls[0][0]).toMatchObject({ ndim: expect.any(Number) });
+    });
+
+    it('emits dimensions-changed only for real slice changes, not refreshes', async () => {
+      const fakeScene = {
+        userData: {
+          sceneDimensions: {
+            dimensions: [
+              { name: 'time', unit: '', range: [0, 3], step: 1, display: false, discrete: true },
+            ],
+          },
+        },
+        children: [],
+        getObjectByName: () => undefined,
+      } as unknown as Parameters<typeof sceneDimsManager.initFromScene>[0];
+      sceneDimsManager.initFromScene(fakeScene);
+      await app.init({ canvas: mockCanvas, src: SRC });
+      const onDims = vi.fn();
+      app.on('dimensions-changed', onDims);
+      const current = sceneDimsManager.getDims()!.currentStep[0];
+
+      app.setDimensionValue(0, current);
+      expect(onDims).not.toHaveBeenCalled();
+
+      app.setDimensionValue(0, current + 1);
+      expect(onDims).toHaveBeenCalledTimes(1);
+
+      sceneDimsManager.setDimensionValue(0, current + 1, { force: true });
+      expect(onDims).toHaveBeenCalledTimes(1);
     });
 
     it('does not emit dimensions-changed after dispose', async () => {
@@ -2002,7 +2529,7 @@ describe('LuxarApp', () => {
       app.on('dimensions-changed', onDims);
 
       app.dispose();
-      listener(); // isInitialized is false → guarded no-op
+      listener(true); // isInitialized is false → guarded no-op
 
       expect(onDims).not.toHaveBeenCalled();
     });

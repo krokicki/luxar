@@ -145,9 +145,17 @@ export class VideoRecordingStrategy implements CaptureStrategy {
           `mode: ${mode})`
       );
 
-      this.animationController.startAnimation();
-      this.animationController.addPerFrameCallback(this.keepAliveCallbackId, () => {}, {
+      // A frame NOW, not at the next animation frame: the capture stream and
+      // the MediaRecorder start below in this same turn, on a canvas the
+      // recording-state resize has just cleared.
+      this.animationController.renderOnce();
+      // `renderEveryFrame`: the MediaRecorder films the canvas this loop
+      // paints, so every tick must draw even when nothing changed — a skipped
+      // tick would be a repeated (or, with an undrawn buffer, blank) frame.
+      // Changes nothing itself; `renderEveryFrame` is what draws each tick.
+      this.animationController.addPerFrameCallback(this.keepAliveCallbackId, () => false, {
         continuous: true,
+        renderEveryFrame: true,
       });
 
       // DOM overlays are not in the WebGL canvas, so capturing it directly
@@ -363,7 +371,7 @@ export class VideoRecordingStrategy implements CaptureStrategy {
     this.animationController.addPerFrameCallback(
       this.turntableCallbackId,
       () => {
-        if (turntableDone) return;
+        if (turntableDone) return false;
         frameCount++;
 
         const elapsed = Date.now() - startTime;
@@ -386,8 +394,12 @@ export class VideoRecordingStrategy implements CaptureStrategy {
           );
           this.abort();
         }
+        // Camera only (the view signature sees the turn); the MediaRecorder's
+        // keep-alive draws every tick regardless.
+        return false;
       },
-      { continuous: true }
+      // `camera`: the turn moves the camera before the view callbacks read it.
+      { continuous: true, phase: 'camera' }
     );
   }
 

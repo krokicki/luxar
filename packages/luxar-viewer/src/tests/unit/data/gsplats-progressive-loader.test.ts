@@ -16,6 +16,8 @@ import type { GSplatsSpatialIndexLoader } from '../../../data/gsplats/gsplats-sp
 import type { GSplatsViewState, LoadedGSplatsData } from '../../../types/gsplats';
 import { CACHE_HIT_THRESHOLD_MS } from '../../../data/loaders/progressive/constants';
 import { SliceCache } from '../../../cache/slice-cache';
+import { getSliceCacheOrigin } from '../../../cache/slice-cache-origin';
+import { beginShadowStore } from '../../../data/loaders/progressive/slice-cache-helper';
 import {
   buildSliceViewSig,
   measureLodBytes,
@@ -123,6 +125,11 @@ function makeSubLoader(
   };
 }
 
+/** Drain queued microtasks (fire-and-forget prefetch chains) under fake timers. */
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
+
 const baseViewState: GSplatsViewState = {
   displayDims: [0, 1, 2],
   slicePosition: [0, 0, 0, 0],
@@ -164,9 +171,9 @@ describe('GSplatsProgressiveLoader', () => {
       const result = await loader.loadGSplats(baseViewState);
       const retained = (
         loader as unknown as {
-          loadedLODs: LoadedGSplatsData[];
+          core: { loadedLODs: LoadedGSplatsData[] };
         }
-      ).loadedLODs;
+      ).core.loadedLODs;
 
       expect(loader.loadedLODCount).toBe(3);
       expect(retained).toEqual([result]);
@@ -262,6 +269,56 @@ describe('GSplatsProgressiveLoader', () => {
       tolerance: [0, 0, 0, 0],
     };
 
+    it('keeps an outgoing foreground prefix when the incoming update is already aborted', async () => {
+      const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
+      const setSpy = vi.spyOn(sc, 'set');
+      const a = makeSubLoader(makeLodData(10));
+      const b = makeSubLoader(makeLodData(5));
+      const c = makeSubLoader(makeLodData(2));
+      b.updateViewWithResidency.mockResolvedValue({ data: makeLodData(5), allResident: false });
+      const l = new GSplatsProgressiveLoader(
+        [a, b, c] as unknown as GSplatsSpatialIndexLoader[],
+        3,
+        '/g',
+        undefined,
+        sc
+      );
+      await l.updateView(viewA);
+      expect(sc.getStats().count).toBe(0);
+
+      const aborted = new AbortController();
+      aborted.abort();
+      await l.updateView(viewB, undefined, aborted.signal);
+      const key = SliceCache.makeKey('/g', buildSliceViewSig(viewA));
+      expect(sc.peek(key)?.ladderDepth).toBe(2);
+      expect(setSpy.mock.calls.find((call) => call[0] === key)?.[2]).toEqual({
+        scan: false,
+        pin: false,
+      });
+      a.updateViewWithResidency.mockClear();
+      await l.updateView(viewA);
+      expect(a.updateViewWithResidency).not.toHaveBeenCalled();
+    });
+
+    it('does not pin an outgoing prefix from an already aborted shadow update', async () => {
+      const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
+      const a = makeSubLoader(makeLodData(10));
+      const b = makeSubLoader(makeLodData(5));
+      b.updateViewWithResidency.mockResolvedValue({ data: makeLodData(5), allResident: false });
+      const l = new GSplatsProgressiveLoader(
+        [a, b, makeSubLoader(makeLodData(2))] as unknown as GSplatsSpatialIndexLoader[],
+        3,
+        '/g',
+        undefined,
+        sc
+      );
+      await l.updateView(viewA);
+      const aborted = new AbortController();
+      aborted.abort();
+      await l.updateView({ ...viewB, prefetch: true }, undefined, aborted.signal);
+      expect(sc.peek(SliceCache.makeKey('/g', buildSliceViewSig(viewA)))).toBeUndefined();
+    });
+
     it('restores a revisited view from the SliceCache without re-streaming sub-LODs', async () => {
       const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
       const a = makeSubLoader(makeLodData(100, 3, { color: 'uint8' }));
@@ -290,6 +347,30 @@ describe('GSplatsProgressiveLoader', () => {
       expect(l.loadedLODCount).toBe(2);
       expect(restored.splatCount).toBe(150);
       expect(sc.getStats().hits).toBeGreaterThanOrEqual(1);
+    });
+
+    it('stamps a restored result with its S-cache origin, and a freshly loaded one never', async () => {
+      // The post-projection stage cache (#2944 B2) keys on this stamp: only
+      // data built from a restored entry ALONE may carry it — a fresh load
+      // aliases the sub-loaders' reused accumulators.
+      const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
+      const l = new GSplatsProgressiveLoader(
+        [
+          makeSubLoader(makeLodData(100, 3, { color: 'uint8' })),
+          makeSubLoader(makeLodData(50, 3, { color: 'uint8' })),
+        ] as unknown as GSplatsSpatialIndexLoader[],
+        2,
+        '/g',
+        undefined,
+        sc
+      );
+      const fresh = await l.loadGSplats(viewA);
+      expect(getSliceCacheOrigin(fresh)).toBeUndefined();
+      await l.loadGSplats(viewB);
+      const restored = await l.loadGSplats(viewA);
+      const origin = getSliceCacheOrigin(restored);
+      expect(origin?.cache).toBe(sc);
+      expect(origin && sc.peek(origin.key)?.payload).toBe(origin?.payload);
     });
 
     it('clones on store so a later accumulator overwrite cannot corrupt a cached slice', async () => {
@@ -447,23 +528,15 @@ describe('GSplatsProgressiveLoader', () => {
     });
 
     it('still prefetches the next level after an empty LOD 0', async () => {
-      // Budget-expiry needs a clock that MOVES: with the real one a 10ms budget
-      // never expires against these instant stubs, and playback now streams
-      // resident levels rather than stopping at level 0 (#2374). Advance on
-      // every read so the deadline is past by level 1's loop-top check.
-      let nowMs = 0;
-      const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => (nowMs += 100));
-      try {
-        // The moving clock exhausts the playback budget after LOD 0. The level
-        // that actually holds this slice's splats is the one still to come, so
-        // skipping prefetch would leave it cold.
-        lodA.updateView.mockResolvedValue(makeLodData(0));
-        await loader.updateView({ ...baseViewState, frameBudgetMs: 10 });
-        expect(loader.loadedLODCount).toBe(1);
-        await vi.waitFor(() => expect(lodB.prefetchChunks).toHaveBeenCalled());
-      } finally {
-        nowSpy.mockRestore();
-      }
+      // A free-navigation refine pass that stops at a cold level 1 must still
+      // warm level 2: an empty LOD 0 says nothing about the later levels, which
+      // may hold this slice's splats. (Playback passes skip the lookahead
+      // altogether — see the A4a block below — so this is a budget-free pass.)
+      lodA.updateView.mockResolvedValue(makeLodData(0));
+      lodB.updateViewWithResidency.mockResolvedValue({ data: makeLodData(50), allResident: false });
+      await loader.updateView(baseViewState);
+      expect(loader.loadedLODCount).toBe(2);
+      await vi.waitFor(() => expect(lodC.prefetchChunks).toHaveBeenCalled());
     });
 
     it('walks EVERY level even when they all come back empty', async () => {
@@ -1166,6 +1239,131 @@ describe('GSplatsProgressiveLoader', () => {
     });
   });
 
+  describe('in-flight shadow adoption (A4b)', () => {
+    // The SlicePrefetcher's shadow pass for key K and the foreground pass for
+    // K did the same work twice (measured: 49% duplicate decodes). The shared
+    // L0 now dedups the decode, but dequant/assembly would still run twice —
+    // so a foreground pass for a key whose shadow store is in flight waits for
+    // it and restores the stored ladder instead.
+    const viewK = { ...baseViewState, slicePosition: [0, 0, 0, 3] };
+
+    function makePair() {
+      const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
+      const shadowLods = [makeLodData(100), makeLodData(50), makeLodData(25)].map((d) =>
+        makeSubLoader(d)
+      );
+      const fgLods = [makeLodData(100), makeLodData(50), makeLodData(25)].map((d) =>
+        makeSubLoader(d)
+      );
+      const shadow = new GSplatsProgressiveLoader(
+        shadowLods as unknown as GSplatsSpatialIndexLoader[],
+        3,
+        '/n',
+        undefined,
+        sc
+      );
+      const foreground = new GSplatsProgressiveLoader(
+        fgLods as unknown as GSplatsSpatialIndexLoader[],
+        3,
+        '/n',
+        undefined,
+        sc
+      );
+      return { sc, shadowLods, fgLods, shadow, foreground };
+    }
+
+    it('a foreground pass for a key whose shadow is in flight triggers no second assembly', async () => {
+      const { sc, shadowLods, fgLods, shadow, foreground } = makePair();
+      let releaseLevel0!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseLevel0 = resolve));
+      const inner = shadowLods[0].updateViewWithResidency.getMockImplementation() as (
+        vs: unknown,
+        s?: unknown
+      ) => Promise<unknown>;
+      shadowLods[0].updateViewWithResidency.mockReturnValueOnce(gate.then(() => inner(viewK)));
+
+      const shadowVs = { ...viewK, frameBudgetMs: 100_000, prefetch: true };
+      const release = beginShadowStore(sc, '/n', shadowVs);
+      const shadowPass = shadow.updateView(shadowVs).finally(release);
+      const fgPass = foreground.updateView({ ...viewK, frameBudgetMs: 100_000 });
+      await Promise.resolve();
+      await Promise.resolve();
+      releaseLevel0();
+      await shadowPass;
+      await fgPass;
+
+      for (const lod of fgLods) expect(lod.updateViewWithResidency).not.toHaveBeenCalled();
+      expect(foreground.loadedLODCount).toBe(3);
+    });
+
+    it('rejects promptly with an AbortError when its own update is superseded while waiting', async () => {
+      const { sc, fgLods, foreground } = makePair();
+      const shadowKeyView = { ...viewK, prefetch: true };
+      const release = beginShadowStore(sc, '/n', shadowKeyView); // never settles here
+      const update = new AbortController();
+      const fgPass = foreground.updateView(
+        { ...viewK, frameBudgetMs: 100_000 },
+        undefined,
+        update.signal
+      );
+      update.abort();
+      await expect(fgPass).rejects.toMatchObject({ name: 'AbortError' });
+      for (const lod of fgLods) expect(lod.updateViewWithResidency).not.toHaveBeenCalled();
+      release();
+    });
+
+    it('does not wait when no shadow store is in flight for the key', async () => {
+      const { fgLods, foreground } = makePair();
+      await foreground.updateView(viewK);
+      expect(fgLods[0].updateViewWithResidency).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('next-rung lookahead on playback / scrub passes (A4a)', () => {
+    // Measured on real playback: the lookahead fetched 310 MB on drosophila
+    // (45% of loop-0 bytes) that no foreground pass ever read, and made up 92%
+    // of later-loop decodes. A pinned or frame-budgeted pass skips it; free
+    // navigation keeps it.
+    beforeEach(() => {
+      // Level 1 is cold, so a refine pass stops with level 2 unloaded.
+      lodB.updateViewWithResidency.mockResolvedValue({ data: makeLodData(50), allResident: false });
+    });
+
+    it('a frame-budgeted (playback) pass does not call lodLoaders[n].prefetchChunks', async () => {
+      let nowMs = 0;
+      const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => (nowMs += 100));
+      try {
+        await loader.updateView({ ...baseViewState, frameBudgetMs: 10 });
+        expect(loader.loadedLODCount).toBeLessThan(3);
+        await flushMicrotasks();
+        for (const lod of [lodA, lodB, lodC]) expect(lod.prefetchChunks).not.toHaveBeenCalled();
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('a pinned (ladderDepth) scrub pass does not call lodLoaders[n].prefetchChunks', async () => {
+      await loader.updateView({ ...baseViewState, ladderDepth: 1 });
+      expect(loader.loadedLODCount).toBe(1);
+      await flushMicrotasks();
+      for (const lod of [lodA, lodB, lodC]) expect(lod.prefetchChunks).not.toHaveBeenCalled();
+    });
+
+    it('a shadow (prefetch) pass does not call lodLoaders[n].prefetchChunks', async () => {
+      await loader.updateView({ ...baseViewState, frameBudgetMs: 100_000, prefetch: true });
+      await flushMicrotasks();
+      for (const lod of [lodA, lodB, lodC]) expect(lod.prefetchChunks).not.toHaveBeenCalled();
+    });
+
+    it('a normal (free-navigation) pass still prefetches the next rung', async () => {
+      await loader.updateView(baseViewState);
+      expect(loader.loadedLODCount).toBe(2);
+      await vi.waitFor(() =>
+        expect(lodC.prefetchChunks).toHaveBeenCalledWith(baseViewState, expect.any(AbortSignal))
+      );
+    });
+  });
+
   describe('prefetch scheduling', () => {
     it('starts the guaranteed next rung without waiting for byte estimation', async () => {
       const lods = Array.from({ length: 8 }, (_, index) =>
@@ -1271,19 +1469,18 @@ describe('GSplatsProgressiveLoader', () => {
       warningSpy.mockRestore();
     });
 
-    it('starts the remaining spatial-index initializers only after the first load returns', async () => {
+    it("warms each rung's index while the rung before it loads", async () => {
       lodB.updateViewWithResidency.mockResolvedValue({
         data: makeLodData(50),
         allResident: false,
       });
 
       await loader.loadGSplats(baseViewState);
-      expect(lodB.ensureInitialized).not.toHaveBeenCalled();
-      expect(lodC.ensureInitialized).not.toHaveBeenCalled();
-
-      await loader.updateView(baseViewState);
-      expect(lodB.ensureInitialized).toHaveBeenCalledTimes(1);
-      expect(lodC.ensureInitialized).toHaveBeenCalledTimes(1);
+      // B6: each rung's index is requested while the rung before it loads —
+      // rung 2's while rung 1 (which stopped the pass cold) was loading.
+      expect(lodB.ensureInitialized).toHaveBeenCalledWith('refinement');
+      expect(lodC.ensureInitialized).toHaveBeenCalledWith('refinement');
+      expect(lodA.ensureInitialized).not.toHaveBeenCalled();
     });
 
     it('logs non-abort metadata warming failures', async () => {
@@ -1307,20 +1504,28 @@ describe('GSplatsProgressiveLoader', () => {
 
     it('does not batch spatial-index metadata during playback', async () => {
       await loader.loadGSplats(baseViewState);
+      const warmedB = lodB.ensureInitialized.mock.calls.length;
+      const warmedC = lodC.ensureInitialized.mock.calls.length;
 
       await loader.updateView({ ...baseViewState, frameBudgetMs: 1_000 });
 
-      expect(lodB.ensureInitialized).not.toHaveBeenCalled();
-      expect(lodC.ensureInitialized).not.toHaveBeenCalled();
+      // Only the first (unbudgeted) load's rung-ahead warms (B6); the
+      // budgeted pass adds none.
+      expect(lodB.ensureInitialized).toHaveBeenCalledTimes(warmedB);
+      expect(lodC.ensureInitialized).toHaveBeenCalledTimes(warmedC);
     });
 
     it('does not batch spatial-index metadata during shadow prefetch', async () => {
       await loader.loadGSplats(baseViewState);
+      const warmedB = lodB.ensureInitialized.mock.calls.length;
+      const warmedC = lodC.ensureInitialized.mock.calls.length;
 
       await loader.updateView({ ...baseViewState, frameBudgetMs: 1_000, prefetch: true });
 
-      expect(lodB.ensureInitialized).not.toHaveBeenCalled();
-      expect(lodC.ensureInitialized).not.toHaveBeenCalled();
+      // Only the first (unbudgeted) load's rung-ahead warms (B6); the
+      // budgeted pass adds none.
+      expect(lodB.ensureInitialized).toHaveBeenCalledTimes(warmedB);
+      expect(lodC.ensureInitialized).toHaveBeenCalledTimes(warmedC);
     });
 
     it('prefetches up to three later rungs once metadata warming has started', async () => {
@@ -1451,7 +1656,7 @@ describe('GSplatsProgressiveLoader', () => {
       logSpy.mockRestore();
     });
 
-    it('keeps playback lookahead at one rung to avoid wasting bytes on abandoned slices', async () => {
+    it('fires NO lookahead rung during playback (measured pure waste on abandoned slices)', async () => {
       const lods = Array.from({ length: 7 }, (_, index) =>
         makeSubLoader(makeLodData(100 - index), {}, 100)
       );
@@ -1474,9 +1679,9 @@ describe('GSplatsProgressiveLoader', () => {
       });
 
       await loader.updateView({ ...baseViewState, frameBudgetMs: 1_000 });
-      await vi.waitFor(() => expect(lods[4].prefetchChunks).toHaveBeenCalledTimes(1));
-      expect(lods[5].prefetchChunks).not.toHaveBeenCalled();
-      expect(lods[6].prefetchChunks).not.toHaveBeenCalled();
+      await flushMicrotasks();
+      expect(lods.every((lod) => lod.prefetchChunks.mock.calls.length === 0)).toBe(true);
+      expect(lods.every((lod) => lod.planPrefetch.mock.calls.length === 0)).toBe(true);
     });
 
     it('aborts in-flight lookahead when the view state changes', async () => {
@@ -1636,6 +1841,25 @@ describe('GSplatsProgressiveLoader', () => {
       const result = await loader.loadGSplats(baseViewState);
 
       expect(loader.getMetrics().memoryUsed).toBe(measureLodBytes([result]));
+    });
+
+    it('getMetrics reports visibleElements from the current ladder, not stale level counters', async () => {
+      // Each level's own counter refreshes only when THAT level queries. A pass
+      // pinned to rung 0 (or a SliceCache restore) leaves the deeper levels'
+      // counters from an earlier slice, which a plain sum would add in.
+      lodA = makeSubLoader(makeLodData(100), { visibleElements: 100 });
+      lodB = makeSubLoader(makeLodData(50), { visibleElements: 50 });
+      lodC = makeSubLoader(makeLodData(25), { visibleElements: 25 });
+      loader = new GSplatsProgressiveLoader(
+        [lodA, lodB, lodC] as unknown as GSplatsSpatialIndexLoader[],
+        3,
+        '/test_gsplats'
+      );
+
+      await loader.updateView({ ...baseViewState, ladderDepth: 1 });
+
+      expect(lodB.updateViewWithResidency).not.toHaveBeenCalled();
+      expect(loader.getMetrics().visibleElements).toBe(100); // rung 0's splats only
     });
 
     it('addEventListener / removeEventListener fan out to every inner loader', () => {
@@ -2085,4 +2309,77 @@ testLadderFoldContract('GSplats', async () => {
       },
     },
   };
+});
+
+describe('GSplatsProgressiveLoader — no pin after the shadow pass is torn down', () => {
+  // A shadow (prefetch) pass's pinned store must not land after its abort or
+  // the loader's dispose: releaseShadows() has already unpinned its keys, so a
+  // late pin would outlive playback and never be released.
+  const shadowView: GSplatsViewState = { ...baseViewState, frameBudgetMs: 100_000, prefetch: true };
+
+  function gatedPair(): {
+    loader: GSplatsProgressiveLoader;
+    sc: SliceCache;
+    release: () => void;
+    entered: Promise<void>;
+  } {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let enter!: () => void;
+    const entered = new Promise<void>((r) => {
+      enter = r;
+    });
+    const first = makeSubLoader(makeLodData(10, 3, { color: 'uint8' }));
+    const last = makeSubLoader(makeLodData(5, 3, { color: 'uint8' }));
+    const data = makeLodData(5, 3, { color: 'uint8' });
+    last.updateViewWithResidency = vi.fn(async () => {
+      enter();
+      await gate; // hold the LAST level in flight
+      return { data, allResident: true };
+    });
+    const sc = new SliceCache({ maxSize: 10 * 1024 * 1024 });
+    const loader = new GSplatsProgressiveLoader(
+      [first, last] as unknown as GSplatsSpatialIndexLoader[],
+      2,
+      '/shadow-teardown',
+      undefined,
+      sc
+    );
+    return { loader, sc, release, entered };
+  }
+
+  function pinnedStores(sc: SliceCache, run: () => Promise<void>): Promise<number> {
+    const setSpy = vi.spyOn(sc, 'set');
+    return run().then(
+      () =>
+        setSpy.mock.calls.filter((call) => (call[2] as { pin?: boolean } | undefined)?.pin).length
+    );
+  }
+
+  it('stores no pin when the last level resolves after the abort', async () => {
+    const { loader, sc, release, entered } = gatedPair();
+    const controller = new AbortController();
+    const pins = await pinnedStores(sc, async () => {
+      const pending = loader.updateView(shadowView, undefined, controller.signal);
+      await entered;
+      controller.abort(); // releaseShadows() aborts the pass (and unpins)
+      release(); // ...but the level was already past its own abort checks
+      await pending;
+    });
+    expect(pins).toBe(0);
+  });
+
+  it('stores no pin when the loader is disposed during the last level', async () => {
+    const { loader, sc, release, entered } = gatedPair();
+    const pins = await pinnedStores(sc, async () => {
+      const pending = loader.updateView(shadowView);
+      await entered;
+      loader.dispose();
+      release();
+      await pending;
+    });
+    expect(pins).toBe(0);
+  });
 });

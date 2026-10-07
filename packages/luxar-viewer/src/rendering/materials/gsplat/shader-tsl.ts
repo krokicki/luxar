@@ -3,9 +3,10 @@
  * GLSL3 shaders in `shader-glsl.ts`.
  *
  * Renders each Gaussian splat as an oriented quad in screen space.
- * Per-vertex `aQuadCorner` (±1) scaled by the 2D covariance eigen-
- * vectors gives an axis-aligned bounding quad of the Gaussian's
- * truncation extent.
+ * Per-vertex `aQuadCorner` (±1) scaled along the 2D covariance eigen-
+ * vectors gives an eigen-aligned bounding rectangle of the Gaussian's
+ * VISIBLE extent: the truncation ellipse, shrunk for dim splats to the
+ * ellipse the visibility discard leaves (`gsplatQuadFootprintTSL`).
  *
  * Per-splat data comes from the RGBA32F splat texture (`uSplatTex`,
  * 4 texels/splat — layout in `rendering/element-texture-layout.ts`),
@@ -40,6 +41,7 @@
 import * as THREE from 'three';
 import {
   Fn,
+  If,
   uniform,
   attribute,
   varying,
@@ -76,12 +78,15 @@ import {
 } from '../_shared/glass-partition-tsl';
 import { resolveElementTextureWidth, SPLAT_TEXTURE_LAYOUT } from '../../element-texture-layout';
 import {
+  isOrthoProjectionTSL,
+  projectionSizeScaleTSL,
   invalidFloatTSL,
   perspectiveNearFadeTSL,
   sanitizeAlpha,
   type TSLNode,
   sortedIndexNode,
   densityDroppedNode,
+  densityThinnedAlphaNode,
 } from '../_shared/tsl-helpers';
 import {
   applyBlendingStateToMaterial,
@@ -99,10 +104,16 @@ import {
   VOLUMETRIC_SERIES_C1,
   VOLUMETRIC_SERIES_C2_DIVISOR,
 } from '../_shared/volumetric';
+import {
+  GSPLAT_COV2D_DILATION_DEFAULT,
+  GSPLAT_FOOTPRINT_PEAK_MARGIN,
+  GSPLAT_FOOTPRINT_PIXEL_MARGIN,
+  GSPLAT_VISIBILITY_FLOOR,
+} from './math';
 
 // Type-erased constructor aliases. TSL's typed `vec2`/`vec3`/`vec4`/`mat3`
 // overloads reject many valid combinations of intermediate `Node<…>`
-// results — e.g. `vec2(uFx.mul(invZ), float(0))` doesn't match any
+// results — e.g. `vec2(halfRes.x.mul(invW), float(0))` does not match any
 // declared overload, even though the runtime accepts it. Re-exporting
 // each as TSLNode-typed sidesteps every overload-mismatch error in
 // this file without affecting the generated GLSL/WGSL.
@@ -111,6 +122,375 @@ const vec3: (a?: TSLNode, b?: TSLNode, c?: TSLNode) => TSLNode = _vec3 as TSLNod
 const vec4: (a?: TSLNode, b?: TSLNode, c?: TSLNode, d?: TSLNode) => TSLNode = _vec4 as TSLNode;
 const mat3: (a?: TSLNode, b?: TSLNode, c?: TSLNode) => TSLNode = _mat3 as TSLNode;
 const ivec2: (a?: TSLNode, b?: TSLNode) => TSLNode = _ivec2 as TSLNode;
+
+/**
+ * TSL twin of `gsplatVisibleMahalSq` (CPU mirror + derivation in `./math`;
+ * GLSL twin `GLSL_GSPLAT_VISIBLE_FOOTPRINT`): the squared Mahalanobis radius
+ * beyond which no fragment can pass the truncation + visibility discards,
+ * or -1 when no fragment of the splat can pass at all. Reached only through
+ * {@link gsplatQuadFootprintTSL} (shared with picking). `.select` evaluates both lanes, so
+ * the quotient is guarded finite and the log's unselected lane is harmless.
+ */
+function gsplatVisibleMahalSqTSL(
+  peakScale: TSLNode,
+  shiftC: TSLNode,
+  truncateSq: TSLNode
+): TSLNode {
+  const scaled: TSLNode = peakScale.mul(GSPLAT_FOOTPRINT_PEAK_MARGIN).toVar();
+  const k: TSLNode = shiftC
+    .add(float(GSPLAT_VISIBILITY_FLOOR).div(max(scaled, float(1e-30))))
+    .toVar();
+  const noneVisible: TSLNode = scaled.lessThanEqual(0.0).or(k.greaterThanEqual(1.0));
+  const inRange: TSLNode = k.greaterThan(0.0).and(k.lessThan(1.0));
+  const radiusSq: TSLNode = inRange.select(min(truncateSq, k.log().mul(-2.0)), truncateSq);
+  return noneVisible.select(float(-1.0), radiusSq);
+}
+
+/**
+ * TSL twin of `gsplatFootprintExtent` (`./math`): the tightened half extent
+ * along one eigen-axis, never above the legacy extent. `visibleMahalSq` is
+ * clamped at 0 so a culled splat's (unused) lane stays NaN-free.
+ */
+function gsplatFootprintExtentTSL(
+  legacyExtent: TSLNode,
+  lambda: TSLNode,
+  visibleMahalSq: TSLNode
+): TSLNode {
+  return min(
+    legacyExtent,
+    sqrt(max(visibleMahalSq, float(0.0)).mul(lambda)).add(GSPLAT_FOOTPRINT_PIXEL_MARGIN)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Covariance projection — ONE set of graph builders for the visual vertex
+// stage (`gsplatWebGPUFactory` below) and the pick factory
+// (`picking/gsplat/pick.tsl.ts`), so the two cannot place, size or cull a
+// splat differently. GLSL twin: `./projection-glsl.ts` (which carries the
+// rationale of every term). They are plain graph builders, not TSL `Fn`s:
+// each emits exactly the statements (and `.toVar()` order) the factories
+// inlined before, so a caller's generated code is unchanged. Call them inside
+// the caller's vertex `Fn` body, where statements emit in trace order.
+// ---------------------------------------------------------------------------
+
+/** Σ_cam = (R·L)(R·L)ᵀ from the packed 3D Cholesky — GLSL twin `gsplatSigmaCam`. */
+export function gsplatSigmaCamTSL(
+  aCholesky01: TSLNode,
+  aCholesky23: TSLNode,
+  aCholesky45: TSLNode
+): TSLNode {
+  // 3D Cholesky as a mat3 (column-major).
+  // Column 0: [L00, L10, L20], Column 1: [0, L11, L21], Column 2: [0, 0, L22].
+  const L00 = aCholesky01.x;
+  const L10 = aCholesky01.y;
+  const L11 = aCholesky23.x;
+  const L20 = aCholesky23.y;
+  const L21 = aCholesky45.x;
+  const L22 = aCholesky45.y;
+  const L3D: TSLNode = mat3(
+    vec3(L00, L10, L20),
+    vec3(float(0.0), L11, L21),
+    vec3(float(0.0), float(0.0), L22)
+  );
+  // Rotate to camera space: L_cam = R · L3D (R = top-left 3×3 of MV).
+  // mat3(mat4) at runtime takes the upper-left 3×3.
+  const R: TSLNode = mat3(modelViewMatrix);
+  const L_cam: TSLNode = R.mul(L3D).toVar();
+  // Sigma_cam = L_cam · L_camᵀ. Explicit row access on the result is needed
+  // for downstream cofactor / variance math.
+  return L_cam.mul(L_cam.transpose()).toVar();
+}
+
+/** Inputs of {@link gsplatCoverageFadeTSL}. */
+export interface GSplatCoverageFadeInputsTSL {
+  readonly sigmaCam: TSLNode;
+  /** `isOrthoProjectionTSL()` as a materialised int (1 = ortho). */
+  readonly isOrthoInt: TSLNode;
+  readonly zDepth: TSLNode;
+  readonly uResolution: TSLNode;
+  /** The DRAW pass's T (the pick factory passes its `uCoverageTruncate`). */
+  readonly truncate: TSLNode;
+  readonly uMaxExtentFactor: TSLNode;
+}
+
+/**
+ * Screen-coverage safety fade — GLSL twin `gsplatCoverageFade`. Also returns
+ * the boolean ortho var it materialises (the callers reuse it downstream).
+ */
+export function gsplatCoverageFadeTSL(inputs: GSplatCoverageFadeInputsTSL): {
+  readonly coverageFade: TSLNode;
+  readonly isOrtho: TSLNode;
+} {
+  const { sigmaCam, uResolution } = inputs;
+  const maxLateralVar: TSLNode = max(
+    sigmaCam.element(int(0)).element(int(0)),
+    max(sigmaCam.element(int(1)).element(int(1)), sigmaCam.element(int(2)).element(int(2)))
+  ).toVar();
+  const isOrtho: TSLNode = inputs.isOrthoInt.equal(int(1)).toVar();
+  // 1e-20 floors are pure div-by-zero/sqrt guards, NOT scale floors (GLSL
+  // twin; expressions match exactly).
+  const projectedExtent: TSLNode = uResolution.y
+    .mul(0.5)
+    .mul(projectionSizeScaleTSL())
+    .mul(sqrt(max(maxLateralVar, float(1e-20))))
+    .mul(inputs.truncate)
+    .div(isOrtho.select(float(1.0), max(inputs.zDepth, float(1e-20))));
+  const maxExtent: TSLNode = max(uResolution.x, uResolution.y).mul(inputs.uMaxExtentFactor);
+  const coverageFade: TSLNode = float(1.0)
+    .sub(smoothstep(maxExtent.mul(0.5), maxExtent, projectedExtent))
+    .toVar();
+  return { coverageFade, isOrtho };
+}
+
+/** The projected (pre-dilation) Σ_2D and the Σ_cam entries it was built from. */
+export interface GSplatProjectedCovarianceTSL extends GSplatSigmaCamTSL {
+  readonly Sigma2D00: TSLNode;
+  readonly Sigma2D10: TSLNode;
+  readonly Sigma2D11: TSLNode;
+}
+
+/**
+ * Σ_2D = J · Σ_cam · Jᵀ with the general projection Jacobian, as three vec2
+ * columns (TSL has no mat3x2): J[k] = res/2 * (P[k].xy / w - clip.xy * P[k].w
+ * / w^2), P = cameraProjectionMatrix — GLSL twin `gsplatProjectedCovariance`.
+ * The Σ_2D entries are materialised UNCONDITIONALLY (they are exactly the
+ * values once first-consumed inside the major-axis branch and read
+ * uninitialised on the near-diagonal path).
+ */
+export function gsplatProjectedCovarianceTSL(inputs: {
+  readonly sigmaCam: TSLNode;
+  readonly centerClip: TSLNode;
+  readonly invW: TSLNode;
+  readonly uResolution: TSLNode;
+}): GSplatProjectedCovarianceTSL {
+  const { sigmaCam, centerClip, invW } = inputs;
+  const P: TSLNode = cameraProjectionMatrix;
+  const halfRes: TSLNode = inputs.uResolution.mul(0.5);
+  const clipTerm: TSLNode = centerClip.xy.mul(invW.mul(invW));
+  const jacobianColumn = (k: number): TSLNode => {
+    const Pk: TSLNode = P.element(int(k));
+    return halfRes.mul(Pk.xy.mul(invW).sub(clipTerm.mul(Pk.w))).toVar();
+  };
+  const J0: TSLNode = jacobianColumn(0);
+  const J1: TSLNode = jacobianColumn(1);
+  const J2: TSLNode = jacobianColumn(2);
+
+  const S00: TSLNode = sigmaCam.element(int(0)).element(int(0));
+  const S01: TSLNode = sigmaCam.element(int(0)).element(int(1));
+  const S02: TSLNode = sigmaCam.element(int(0)).element(int(2));
+  const S10: TSLNode = sigmaCam.element(int(1)).element(int(0));
+  const S11: TSLNode = sigmaCam.element(int(1)).element(int(1));
+  const S12: TSLNode = sigmaCam.element(int(1)).element(int(2));
+  const S20: TSLNode = sigmaCam.element(int(2)).element(int(0));
+  const S21: TSLNode = sigmaCam.element(int(2)).element(int(1));
+  const S22: TSLNode = sigmaCam.element(int(2)).element(int(2));
+  const JS0: TSLNode = J0.mul(S00).add(J1.mul(S01)).add(J2.mul(S02)).toVar();
+  const JS1: TSLNode = J0.mul(S10).add(J1.mul(S11)).add(J2.mul(S12)).toVar();
+  const JS2: TSLNode = J0.mul(S20).add(J1.mul(S21)).add(J2.mul(S22)).toVar();
+  const Sigma2D00: TSLNode = JS0.x.mul(J0.x).add(JS1.x.mul(J1.x)).add(JS2.x.mul(J2.x)).toVar();
+  const Sigma2D10: TSLNode = JS0.x.mul(J0.y).add(JS1.x.mul(J1.y)).add(JS2.x.mul(J2.y)).toVar();
+  const Sigma2D11: TSLNode = JS0.y.mul(J0.y).add(JS1.y.mul(J1.y)).add(JS2.y.mul(J2.y)).toVar();
+  return { S00, S01, S02, S11, S12, S22, Sigma2D00, Sigma2D10, Sigma2D11 };
+}
+
+/**
+ * Eigen-axes of the (dilated) symmetric Σ_2D for the oriented quad — GLSL
+ * twins `gsplatEigenvalues` + `gsplatMajorAxis`. Every shared value is a Var
+ * STATEMENT, emitted unconditionally before any consumer branch.
+ */
+export function gsplatEigenAxesTSL(
+  Sigma2D00: TSLNode,
+  Sigma2D10: TSLNode,
+  Sigma2D11: TSLNode
+): {
+  readonly lambda1: TSLNode;
+  readonly lambda2: TSLNode;
+  readonly majorAxis: TSLNode;
+  readonly minorAxis: TSLNode;
+} {
+  const trace: TSLNode = Sigma2D00.add(Sigma2D11).toVar();
+  const det2: TSLNode = Sigma2D00.mul(Sigma2D11).sub(Sigma2D10.mul(Sigma2D10));
+  const disc: TSLNode = max(trace.mul(trace).sub(det2.mul(4.0)), float(0.0));
+  const sqrtDisc: TSLNode = sqrt(disc).toVar();
+  const lambda1: TSLNode = max(trace.add(sqrtDisc).mul(0.5), float(1e-6)).toVar();
+  const lambda2: TSLNode = max(trace.sub(sqrtDisc).mul(0.5), float(1e-6)).toVar();
+
+  // Eigenvector for major axis. Branch on whether the off-diagonal is
+  // significant; near-diagonal Σ_2D picks an axis based on which variance is
+  // larger.
+  const offDiagSig: TSLNode = abs(Sigma2D10).greaterThan(1e-6);
+  const majorOff: TSLNode = normalize(vec2(lambda1.sub(Sigma2D11), Sigma2D10));
+  const majorDiag: TSLNode = Sigma2D00.greaterThanEqual(Sigma2D11).select(
+    vec2(1.0, 0.0),
+    vec2(0.0, 1.0)
+  );
+  const majorAxis: TSLNode = offDiagSig.select(majorOff, majorDiag).toVar();
+  const minorAxis: TSLNode = vec2(majorAxis.y.negate(), majorAxis.x).toVar();
+  return { lambda1, lambda2, majorAxis, minorAxis };
+}
+
+/**
+ * Quad half extents truncate × √λ, clamped so no splat exceeds
+ * uMaxExtentFactor × viewport — GLSL twin `gsplatClampedExtents`. The
+ * "legacy" extents the visible-footprint tightening shrinks.
+ */
+export function gsplatClampedExtentsTSL(inputs: {
+  readonly truncate: TSLNode;
+  readonly lambda1: TSLNode;
+  readonly lambda2: TSLNode;
+  readonly uResolution: TSLNode;
+  readonly uMaxExtentFactor: TSLNode;
+}): readonly [TSLNode, TSLNode] {
+  const extent1Raw: TSLNode = inputs.truncate.mul(sqrt(inputs.lambda1)).toVar();
+  const extent2Raw: TSLNode = inputs.truncate.mul(sqrt(inputs.lambda2)).toVar();
+  const maxExtentPx: TSLNode = max(inputs.uResolution.x, inputs.uResolution.y).mul(
+    inputs.uMaxExtentFactor
+  );
+  const largestExtent: TSLNode = max(extent1Raw, extent2Raw).toVar();
+  const clampScale: TSLNode = largestExtent
+    .greaterThan(maxExtentPx)
+    .select(maxExtentPx.div(largestExtent), float(1.0))
+    .toVar();
+  return [extent1Raw.mul(clampScale), extent2Raw.mul(clampScale)];
+}
+
+/** The six distinct entries of the symmetric camera-space covariance Σ_cam. */
+export interface GSplatSigmaCamTSL {
+  readonly S00: TSLNode;
+  readonly S01: TSLNode;
+  readonly S02: TSLNode;
+  readonly S11: TSLNode;
+  readonly S12: TSLNode;
+  readonly S22: TSLNode;
+}
+
+/**
+ * The world-unit standard deviation of a splat along the view ray,
+ * `sigmaRay = 1/√(rᵀ Σ⁻¹ r)` — the sum projection's ray-integral scale. ONE
+ * graph for the visual vertex stage (sum-projection variants) and the pick
+ * factory, which must weigh a splat by the amplitude the draw emits. A plain
+ * graph builder (not a TSL `Fn`), so it emits exactly the statements inlined
+ * at the call site. GLSL twin: the `uProjectionMode == 0` block of
+ * shader-glsl.ts (and of picking/gsplat/shaders.ts).
+ */
+export function gsplatRaySigmaTSL(
+  sigma: GSplatSigmaCamTSL,
+  isOrtho: TSLNode,
+  centerCam: TSLNode
+): TSLNode {
+  const { S00, S01, S02, S11, S12, S22 } = sigma;
+  // SCALE-FREE inversion (GLSL twin: shader-glsl.ts): normalize
+  // Σ_cam by its mean diagonal variance s = trace/3 before the
+  // cofactor inverse. det(Σ) is world-units⁶ and under/overflows
+  // float32 on tiny/huge-unit scenes (GPUs flush denormals to
+  // zero), which turned the absolute 1e-12 clamp into garbage
+  // Σ⁻¹. With Σn = Σ/s the determinant and ray quadratic are O(1)
+  // at any scale, so the 1e-12 / 1e-8 floors act as scale-free
+  // condition-number guards; sigmaRay = sqrt(s / quadN) restores
+  // the world-unit result exactly. 1e-30 on s guards an all-zero
+  // covariance only.
+  const sTrace: TSLNode = max(
+    S00.add(S11)
+      .add(S22)
+      .mul(1.0 / 3.0),
+    float(1e-30)
+  ).toVar();
+  const invS: TSLNode = float(1.0).div(sTrace).toVar();
+  const a = S00.mul(invS).toVar();
+  const b = S01.mul(invS).toVar();
+  const c = S02.mul(invS).toVar();
+  const d = S11.mul(invS).toVar();
+  const e = S12.mul(invS).toVar();
+  const f = S22.mul(invS).toVar();
+  const detSigma: TSLNode = a
+    .mul(d.mul(f).sub(e.mul(e)))
+    .sub(b.mul(b.mul(f).sub(c.mul(e))))
+    .add(c.mul(b.mul(e).sub(c.mul(d))));
+  const invDet: TSLNode = float(1.0)
+    .div(max(detSigma, float(1e-12)))
+    .toVar();
+  const i00: TSLNode = d.mul(f).sub(e.mul(e)).mul(invDet).toVar();
+  const i11: TSLNode = a.mul(f).sub(c.mul(c)).mul(invDet).toVar();
+  const i22: TSLNode = a.mul(d).sub(b.mul(b)).mul(invDet).toVar();
+  const i01: TSLNode = b.mul(f).sub(c.mul(e)).negate().mul(invDet).toVar();
+  const i02: TSLNode = b.mul(e).sub(c.mul(d)).mul(invDet).toVar();
+  const i12: TSLNode = a.mul(e).sub(b.mul(c)).negate().mul(invDet).toVar();
+
+  // Ray direction: ortho = (0, 0, -1); perspective = normalize(centerCam).
+  const rayDirOrtho: TSLNode = vec3(0.0, 0.0, -1.0);
+  const rayDirPersp: TSLNode = normalize(centerCam);
+  const rayDir: TSLNode = isOrtho.select(rayDirOrtho, rayDirPersp).toVar();
+  const prx: TSLNode = i00.mul(rayDir.x).add(i01.mul(rayDir.y)).add(i02.mul(rayDir.z));
+  const pry: TSLNode = i01.mul(rayDir.x).add(i11.mul(rayDir.y)).add(i12.mul(rayDir.z));
+  const prz: TSLNode = i02.mul(rayDir.x).add(i12.mul(rayDir.y)).add(i22.mul(rayDir.z));
+  // quad is rᵀ Σn⁻¹ r (normalized space); un-normalize via
+  // sqrt(sTrace) — see the scale-free inversion note above.
+  const quad: TSLNode = max(
+    rayDir.x.mul(prx).add(rayDir.y.mul(pry)).add(rayDir.z.mul(prz)),
+    float(1e-8)
+  );
+  const sigmaRay: TSLNode = sqrt(sTrace).div(sqrt(quad));
+  return sigmaRay;
+}
+
+/** The draw-only factors of {@link gsplatQuadFootprintTSL}'s peak scale. */
+export interface GSplatFootprintDrawFactorsTSL {
+  /** The fragment's alpha factor (optical density under volumetric). */
+  readonly alphaFactor: TSLNode;
+  /** The layer gain `uIntensity`. */
+  readonly gain: TSLNode;
+}
+
+/** Inputs of {@link gsplatQuadFootprintTSL}. */
+export interface GSplatQuadFootprintInputsTSL {
+  /** The splat's `vAmplitude2D`. */
+  readonly amplitude2D: TSLNode;
+  /** The fragment test's factors (picking folds the node opacity into the alpha factor). */
+  readonly drawFactors?: GSplatFootprintDrawFactorsTSL;
+  readonly invOneMinusC: TSLNode;
+  readonly shiftC: TSLNode;
+  readonly truncateSq: TSLNode;
+  /** The legacy (T-sigma, max-extent-clamped) half extents. */
+  readonly legacyExtents: readonly [TSLNode, TSLNode];
+  /** The Σ_2D eigenvalues along the two quad axes. */
+  readonly lambdas: readonly [TSLNode, TSLNode];
+}
+
+/** A splat's tightened quad: its two half extents, and whether it is culled. */
+export interface GSplatQuadFootprintTSL {
+  readonly culled: TSLNode;
+  readonly extent1: TSLNode;
+  readonly extent2: TSLNode;
+}
+
+/**
+ * The visible-footprint quad of one splat — ONE graph for the visual vertex
+ * stage and the pick factory (`picking/gsplat/pick.tsl.ts`), so the two
+ * cannot size a splat to different reach radii. The peak scale is
+ * `gsplatFootprintPeakScale` (`./math`): amplitude2D · 1/(1−C), times the
+ * alpha factor and max(gain, 1) when `drawFactors` is given (both the draw
+ * and the pick stage give them; omitting them is the same function at the
+ * neutral 1, 1 with the no-op multiplies left out of the graph).
+ */
+export function gsplatQuadFootprintTSL(
+  inputs: GSplatQuadFootprintInputsTSL
+): GSplatQuadFootprintTSL {
+  const { amplitude2D, drawFactors, legacyExtents, lambdas } = inputs;
+  const base: TSLNode = amplitude2D.mul(inputs.invOneMinusC);
+  const peakScale: TSLNode = drawFactors
+    ? base.mul(drawFactors.alphaFactor).mul(max(drawFactors.gain, float(1.0)))
+    : base;
+  const visibleMahalSq: TSLNode = gsplatVisibleMahalSqTSL(
+    peakScale,
+    inputs.shiftC,
+    inputs.truncateSq
+  ).toVar();
+  return {
+    culled: visibleMahalSq.lessThan(0.0),
+    extent1: gsplatFootprintExtentTSL(legacyExtents[0], lambdas[0], visibleMahalSq),
+    extent2: gsplatFootprintExtentTSL(legacyExtents[1], lambdas[1], visibleMahalSq),
+  };
+}
 
 export interface GSplatTSLConfig {
   readonly useColormap?: boolean;
@@ -145,6 +525,14 @@ export interface GSplatTSLConfig {
    * to `'additive'` to match the GLSL wrapper class.
    */
   readonly blendingMode?: BlendingMode;
+  /**
+   * The splat texture's width, baked into the vertex addressing as a literal
+   * (see the prologue). Defaults to the width resolved from
+   * `nodes.uSplatTex.value`; a wrapper building a SHARED graph passes it
+   * explicitly so it is part of the graph's configuration key rather than
+   * read off whichever texture a forwarding leaf holds at build time.
+   */
+  readonly elementTextureWidth?: number;
 }
 
 /**
@@ -169,16 +557,18 @@ export interface GSplatTSLNodes {
   readonly uSplatTex: TSLNode;
   readonly uResolution: TSLNode;
   readonly uPixelRatio: TSLNode;
-  readonly uFx: TSLNode;
-  readonly uFy: TSLNode;
   readonly uTruncate: TSLNode;
   readonly uTruncateSq: TSLNode;
   readonly uRayIntegralFactor: TSLNode;
   readonly uProjectionMode: TSLNode;
-  readonly uIsOrtho: TSLNode;
   /** Active ordering buffer: 0 = aSortedIndex, 1 = aSortedIndexB. */
   readonly uSortedIndexSlot: TSLNode;
   readonly uDensityDrop: TSLNode;
+  /**
+   * Alpha-over compensation exponent of a thinned `normal` node (1 = identity;
+   * absent on graphs that never read it, e.g. picking).
+   */
+  readonly uDensityAlphaExp?: TSLNode;
   /** Refraction split (glass-partition-tsl.ts): mode + shared glass depth texture. */
   readonly uGlassPartition: GlassPartitionTSLNodes['uGlassPartition'];
   readonly uGlassDepth: GlassPartitionTSLNodes['uGlassDepth'];
@@ -231,12 +621,9 @@ export function gsplatWebGPUFactory(
   // `node.value` via `proxyIUniform`.
   const uSplatTex = nodes.uSplatTex;
   const uResolution = nodes.uResolution;
-  const uFx = nodes.uFx;
-  const uFy = nodes.uFy;
   const uTruncate = nodes.uTruncate;
   const uRayIntegralFactor = nodes.uRayIntegralFactor;
   const uProjectionMode = nodes.uProjectionMode;
-  const uIsOrtho = nodes.uIsOrtho;
   const uNearCull = nodes.uNearCull;
   const uMaxExtentFactor = nodes.uMaxExtentFactor;
   const uCov2DDilation = nodes.uCov2DDilation;
@@ -257,6 +644,9 @@ export function gsplatWebGPUFactory(
   const uTruncateSq = nodes.uTruncateSq;
   const uLabelColorMode = nodes.uLabelColorMode;
   const uLabelFilterIndex = nodes.uLabelFilterIndex;
+  // Volumetric maps alpha into optical density — read by BOTH the vertex
+  // footprint (below) and the fragment's alpha factor, which must agree.
+  const volumetricGraph = isVolumetricMode(config.blendingMode ?? 'additive');
 
   // ---- Vertex computation ----
   //
@@ -299,10 +689,11 @@ export function gsplatWebGPUFactory(
     // Safe because the width is a per-layout session constant, capped
     // at 4096 on every device (element-texture-layout.ts).
     const splatTexW: TSLNode = int(
-      resolveElementTextureWidth(
-        SPLAT_TEXTURE_LAYOUT,
-        (nodes.uSplatTex as unknown as { value?: { image?: { width?: number } } }).value ?? null
-      )
+      config.elementTextureWidth ??
+        resolveElementTextureWidth(
+          SPLAT_TEXTURE_LAYOUT,
+          (nodes.uSplatTex as unknown as { value?: { image?: { width?: number } } }).value ?? null
+        )
     ).toVar();
     const texelX: TSLNode = splatBase.mod(splatTexW).toVar();
     const texelY: TSLNode = splatBase.div(splatTexW).toVar();
@@ -323,30 +714,17 @@ export function gsplatWebGPUFactory(
     // Centre in camera space.
     const centerCam4: TSLNode = modelViewMatrix.mul(vec4(aCenter, 1.0)).toVar();
     const centerCam: TSLNode = vec3(centerCam4).toVar();
+    // Clip-space centre through the projection this draw uses (GLSL twin:
+    // shader-glsl.ts). The screen centre, the Jacobian, the coverage extent
+    // and the ortho branch are all read from it and from P.
+    const centerClip: TSLNode = cameraProjectionMatrix.mul(centerCam4).toVar();
+    const isOrthoInt: TSLNode = isOrthoProjectionTSL().toVar();
+    const invW: TSLNode = float(1.0).div(centerClip.w).toVar();
 
     const zDepth: TSLNode = centerCam.z.negate().toVar();
 
-    // 3D Cholesky as a mat3 (column-major).
-    // Column 0: [L00, L10, L20], Column 1: [0, L11, L21], Column 2: [0, 0, L22].
-    const L00 = aCholesky01.x;
-    const L10 = aCholesky01.y;
-    const L11 = aCholesky23.x;
-    const L20 = aCholesky23.y;
-    const L21 = aCholesky45.x;
-    const L22 = aCholesky45.y;
-    const L3D: TSLNode = mat3(
-      vec3(L00, L10, L20),
-      vec3(float(0.0), L11, L21),
-      vec3(float(0.0), float(0.0), L22)
-    );
-
-    // Rotate to camera space: L_cam = R · L3D (R = top-left 3×3 of MV).
-    // mat3(mat4) at runtime takes the upper-left 3×3.
-    const R: TSLNode = mat3(modelViewMatrix);
-    const L_cam: TSLNode = R.mul(L3D).toVar();
-    // Sigma_cam = L_cam · L_camᵀ. We need explicit row access on the
-    // result for downstream cofactor / variance math.
-    const SigmaCam: TSLNode = L_cam.mul(L_cam.transpose()).toVar();
+    // Camera-space covariance (GLSL twin: gsplatSigmaCam).
+    const SigmaCam: TSLNode = gsplatSigmaCamTSL(aCholesky01, aCholesky23, aCholesky45);
 
     // Unified near handling (shared perspectiveNearFadeTSL; matches the
     // point + line graphs and the GLSL twin): behind-camera fades to 0
@@ -358,7 +736,7 @@ export function gsplatWebGPUFactory(
     // overrode the scene-relative value on tiny-unit scenes and faded
     // out the whole scene. GLSL twin: shader-glsl.ts.
     const depthFade: TSLNode = perspectiveNearFadeTSL(
-      uIsOrtho,
+      isOrthoInt,
       centerCam.z,
       max(uNearCull, float(1e-20))
     ).toVar();
@@ -372,71 +750,23 @@ export function gsplatWebGPUFactory(
     // applied (hard-edged clamped rectangles on deep zoom). Applies
     // in BOTH projections: ortho projected size is depth-independent
     // (divisor 1).
-    const maxLateralVar: TSLNode = max(
-      SigmaCam.element(int(0)).element(int(0)),
-      max(SigmaCam.element(int(1)).element(int(1)), SigmaCam.element(int(2)).element(int(2)))
-    ).toVar();
-    const isOrtho: TSLNode = int(uIsOrtho).equal(int(1)).toVar();
-    // 1e-20 floors are pure div-by-zero/sqrt guards, NOT scale floors:
-    // maxLateralVar is a WORLD-unit² variance and the old absolute 1e-8
-    // floor inflated valid tiny-unit variances up to 1e-4 world units,
-    // exploding projectedExtent and coverage-culling every splat;
-    // zDepth is bounded below by the scene-relative near fade. GLSL
-    // twin: shader-glsl.ts (expressions match exactly).
-    const projectedExtent: TSLNode = uFx
-      .mul(sqrt(max(maxLateralVar, float(1e-20))))
-      .mul(uTruncate)
-      .div(isOrtho.select(float(1.0), max(zDepth, float(1e-20))));
-    const maxExtent: TSLNode = max(uResolution.x, uResolution.y).mul(uMaxExtentFactor);
-    const coverageFade: TSLNode = float(1.0)
-      .sub(smoothstep(maxExtent.mul(0.5), maxExtent, projectedExtent))
-      .toVar();
+    const { coverageFade, isOrtho } = gsplatCoverageFadeTSL({
+      sigmaCam: SigmaCam,
+      isOrthoInt,
+      zDepth,
+      uResolution,
+      truncate: uTruncate,
+      uMaxExtentFactor,
+    });
     const coverageFadeReject: TSLNode = coverageFade.lessThan(0.01);
 
     const nearFade: TSLNode = min(depthFade, coverageFade).toVar();
 
-    // Projection Jacobian. mat3x2 in GLSL = three vec2 columns; we
-    // represent it as three independent vec2 nodes to sidestep TSL's
-    // missing mat3x2 type. JS0/JS1/JS2 form the matrix M = J·Σ_cam.
-    // 1e-20 = exact-zero guard only (GLSL twin divides unguarded); the
-    // near-fade reject already bounds zDepth at ~uNearCull
-    // (scene-relative) — an absolute 1e-8 floor would distort the
-    // Jacobian on sub-1e-8-unit scenes.
-    const invZ: TSLNode = float(1.0)
-      .div(max(zDepth, float(1e-20)))
-      .toVar();
-    const invZ2: TSLNode = invZ.mul(invZ);
-    // Perspective Jacobian columns.
-    const J0p: TSLNode = vec2(uFx.mul(invZ), float(0.0));
-    const J1p: TSLNode = vec2(float(0.0), uFy.mul(invZ));
-    const J2p: TSLNode = vec2(uFx.mul(centerCam.x).mul(invZ2), uFy.mul(centerCam.y).mul(invZ2));
-    // Orthographic Jacobian (depth-independent).
-    const J0o: TSLNode = vec2(uFx, float(0.0));
-    const J1o: TSLNode = vec2(float(0.0), uFy);
-    const J2o: TSLNode = vec2(float(0.0), float(0.0));
-    const J0: TSLNode = isOrtho.select(J0o, J0p).toVar();
-    const J1: TSLNode = isOrtho.select(J1o, J1p).toVar();
-    const J2: TSLNode = isOrtho.select(J2o, J2p).toVar();
-
-    // Σ_2D = J · Σ_cam · Jᵀ.
-    const S00: TSLNode = SigmaCam.element(int(0)).element(int(0));
-    const S01: TSLNode = SigmaCam.element(int(0)).element(int(1));
-    const S02: TSLNode = SigmaCam.element(int(0)).element(int(2));
-    const S10: TSLNode = SigmaCam.element(int(1)).element(int(0));
-    const S11: TSLNode = SigmaCam.element(int(1)).element(int(1));
-    const S12: TSLNode = SigmaCam.element(int(1)).element(int(2));
-    const S20: TSLNode = SigmaCam.element(int(2)).element(int(0));
-    const S21: TSLNode = SigmaCam.element(int(2)).element(int(1));
-    const S22: TSLNode = SigmaCam.element(int(2)).element(int(2));
-    const JS0: TSLNode = J0.mul(S00).add(J1.mul(S01)).add(J2.mul(S02)).toVar();
-    const JS1: TSLNode = J0.mul(S10).add(J1.mul(S11)).add(J2.mul(S12)).toVar();
-    const JS2: TSLNode = J0.mul(S20).add(J1.mul(S21)).add(J2.mul(S22)).toVar();
-    // Materialized UNCONDITIONALLY — these are exactly the shared
-    // values that used to be first-consumed inside the major-axis
-    // branch and read uninitialized on the near-diagonal path.
-    const Sigma2D00: TSLNode = JS0.x.mul(J0.x).add(JS1.x.mul(J1.x)).add(JS2.x.mul(J2.x)).toVar();
-    const Sigma2D10: TSLNode = JS0.x.mul(J0.y).add(JS1.x.mul(J1.y)).add(JS2.x.mul(J2.y)).toVar();
-    const Sigma2D11: TSLNode = JS0.y.mul(J0.y).add(JS1.y.mul(J1.y)).add(JS2.y.mul(J2.y)).toVar();
+    // Σ_2D = J · Σ_cam · Jᵀ with the general projection Jacobian (GLSL twin:
+    // gsplatProjectedCovariance; reduces to the classic perspective / ortho
+    // Jacobians, projection-math.ts).
+    const { S00, S01, S02, S11, S12, S22, Sigma2D00, Sigma2D10, Sigma2D11 } =
+      gsplatProjectedCovarianceTSL({ sigmaCam: SigmaCam, centerClip, invW, uResolution });
 
     // 2D low-pass dilation (standard 3DGS anti-aliasing) — GLSL twin in
     // shader-glsl.ts. Widen the diagonal so every splat covers ≥ ~1px, so
@@ -498,57 +828,11 @@ export function gsplatWebGPUFactory(
     // where the dilation-compensation emission needs the same gate.)
     let vAmplitude2DVal: TSLNode;
     if (useSumProjection) {
-      // SCALE-FREE inversion (GLSL twin: shader-glsl.ts): normalize
-      // Σ_cam by its mean diagonal variance s = trace/3 before the
-      // cofactor inverse. det(Σ) is world-units⁶ and under/overflows
-      // float32 on tiny/huge-unit scenes (GPUs flush denormals to
-      // zero), which turned the absolute 1e-12 clamp into garbage
-      // Σ⁻¹. With Σn = Σ/s the determinant and ray quadratic are O(1)
-      // at any scale, so the 1e-12 / 1e-8 floors act as scale-free
-      // condition-number guards; sigmaRay = sqrt(s / quadN) restores
-      // the world-unit result exactly. 1e-30 on s guards an all-zero
-      // covariance only.
-      const sTrace: TSLNode = max(
-        S00.add(S11)
-          .add(S22)
-          .mul(1.0 / 3.0),
-        float(1e-30)
-      ).toVar();
-      const invS: TSLNode = float(1.0).div(sTrace).toVar();
-      const a = S00.mul(invS).toVar();
-      const b = S01.mul(invS).toVar();
-      const c = S02.mul(invS).toVar();
-      const d = S11.mul(invS).toVar();
-      const e = S12.mul(invS).toVar();
-      const f = S22.mul(invS).toVar();
-      const detSigma: TSLNode = a
-        .mul(d.mul(f).sub(e.mul(e)))
-        .sub(b.mul(b.mul(f).sub(c.mul(e))))
-        .add(c.mul(b.mul(e).sub(c.mul(d))));
-      const invDet: TSLNode = float(1.0)
-        .div(max(detSigma, float(1e-12)))
-        .toVar();
-      const i00: TSLNode = d.mul(f).sub(e.mul(e)).mul(invDet).toVar();
-      const i11: TSLNode = a.mul(f).sub(c.mul(c)).mul(invDet).toVar();
-      const i22: TSLNode = a.mul(d).sub(b.mul(b)).mul(invDet).toVar();
-      const i01: TSLNode = b.mul(f).sub(c.mul(e)).negate().mul(invDet).toVar();
-      const i02: TSLNode = b.mul(e).sub(c.mul(d)).mul(invDet).toVar();
-      const i12: TSLNode = a.mul(e).sub(b.mul(c)).negate().mul(invDet).toVar();
-
-      // Ray direction: ortho = (0, 0, -1); perspective = normalize(centerCam).
-      const rayDirOrtho: TSLNode = vec3(0.0, 0.0, -1.0);
-      const rayDirPersp: TSLNode = normalize(centerCam);
-      const rayDir: TSLNode = isOrtho.select(rayDirOrtho, rayDirPersp).toVar();
-      const prx: TSLNode = i00.mul(rayDir.x).add(i01.mul(rayDir.y)).add(i02.mul(rayDir.z));
-      const pry: TSLNode = i01.mul(rayDir.x).add(i11.mul(rayDir.y)).add(i12.mul(rayDir.z));
-      const prz: TSLNode = i02.mul(rayDir.x).add(i12.mul(rayDir.y)).add(i22.mul(rayDir.z));
-      // quad is rᵀ Σn⁻¹ r (normalized space); un-normalize via
-      // sqrt(sTrace) — see the scale-free inversion note above.
-      const quad: TSLNode = max(
-        rayDir.x.mul(prx).add(rayDir.y.mul(pry)).add(rayDir.z.mul(prz)),
-        float(1e-8)
+      const sigmaRay: TSLNode = gsplatRaySigmaTSL(
+        { S00, S01, S02, S11, S12, S22 },
+        isOrtho,
+        centerCam
       );
-      const sigmaRay: TSLNode = sqrt(sTrace).div(sqrt(quad));
       const rayIntegrationBoost: TSLNode = sigmaRay.mul(uRayIntegralFactor);
       // dilationCompensation keeps the screen-integrated light invariant under
       // the 2D low-pass (derivation at its definition). Sum projection only —
@@ -557,55 +841,61 @@ export function gsplatWebGPUFactory(
       vAmplitude2DVal = aAmplitude
         .mul(rayIntegrationBoost)
         .mul(nearFade)
-        .mul(dilationCompensation!);
+        .mul(dilationCompensation!)
+        .toVar();
     } else {
-      vAmplitude2DVal = aAmplitude.mul(nearFade);
+      vAmplitude2DVal = aAmplitude.mul(nearFade).toVar();
     }
 
-    // Eigendecomposition of Σ_2D (symmetric 2×2). Every shared value
-    // is a Var STATEMENT here — emitted unconditionally, before any
-    // consumer branch (the whole point of the Fn rewrite).
-    const trace: TSLNode = Sigma2D00.add(Sigma2D11).toVar();
-    const det2: TSLNode = Sigma2D00.mul(Sigma2D11).sub(Sigma2D10.mul(Sigma2D10));
-    const disc: TSLNode = max(trace.mul(trace).sub(det2.mul(4.0)), float(0.0));
-    const sqrtDisc: TSLNode = sqrt(disc).toVar();
-    const lambda1: TSLNode = max(trace.add(sqrtDisc).mul(0.5), float(1e-6)).toVar();
-    const lambda2: TSLNode = max(trace.sub(sqrtDisc).mul(0.5), float(1e-6)).toVar();
-
-    // Eigenvector for major axis. Branch on whether the off-diagonal is
-    // significant; near-diagonal Σ_2D picks an axis based on which
-    // variance is larger.
-    const offDiagSig: TSLNode = abs(Sigma2D10).greaterThan(1e-6);
-    const majorOff: TSLNode = normalize(vec2(lambda1.sub(Sigma2D11), Sigma2D10));
-    const majorDiag: TSLNode = Sigma2D00.greaterThanEqual(Sigma2D11).select(
-      vec2(1.0, 0.0),
-      vec2(0.0, 1.0)
+    // Eigen-axes of Σ_2D and the max-extent-clamped quad half extents (shared
+    // graph builders; GLSL twins gsplatEigenvalues / gsplatMajorAxis /
+    // gsplatClampedExtents).
+    const { lambda1, lambda2, majorAxis, minorAxis } = gsplatEigenAxesTSL(
+      Sigma2D00,
+      Sigma2D10,
+      Sigma2D11
     );
-    const majorAxis: TSLNode = offDiagSig.select(majorOff, majorDiag).toVar();
-    const minorAxis: TSLNode = vec2(majorAxis.y.negate(), majorAxis.x).toVar();
+    const [extent1Legacy, extent2Legacy] = gsplatClampedExtentsTSL({
+      truncate: uTruncate,
+      lambda1,
+      lambda2,
+      uResolution,
+      uMaxExtentFactor,
+    });
 
-    // Quad extents and clamp.
-    const extent1Raw: TSLNode = uTruncate.mul(sqrt(lambda1)).toVar();
-    const extent2Raw: TSLNode = uTruncate.mul(sqrt(lambda2)).toVar();
-    const maxExtentPx: TSLNode = max(uResolution.x, uResolution.y).mul(uMaxExtentFactor);
-    const largestExtent: TSLNode = max(extent1Raw, extent2Raw).toVar();
-    const clampScale: TSLNode = largestExtent
-      .greaterThan(maxExtentPx)
-      .select(maxExtentPx.div(largestExtent), float(1.0))
+    // Visible-footprint tightening (#2944 B10; GLSL twin carries the full
+    // rationale, math.ts the derivation). The peak scale is EXACTLY the
+    // factor the fragment multiplies its falloff by before the visibility
+    // test: vAmplitude2D · 1/(1-C) · alpha factor · max(gain, 1).
+    const splatAlpha: TSLNode = sanitizeAlpha(aAlpha).toVar();
+    const footprintAlpha: TSLNode = volumetricGraph
+      ? mix(
+          float(1.0),
+          min(splatAlpha, float(ALPHA_CLAMP)).oneMinus().log().negate(),
+          uHasElementAlpha
+        )
+      : splatAlpha;
+    const {
+      culled: footprintCulled,
+      extent1,
+      extent2,
+    } = gsplatQuadFootprintTSL({
+      amplitude2D: vAmplitude2DVal,
+      drawFactors: { alphaFactor: footprintAlpha, gain: uIntensity },
+      invOneMinusC: uInvOneMinusC,
+      shiftC: uShiftC,
+      truncateSq: uTruncateSq,
+      legacyExtents: [extent1Legacy, extent2Legacy],
+      lambdas: [lambda1, lambda2],
+    });
+
+    // Screen centre in pixels from the clip-space centre.
+    const vCenterScreenVal: TSLNode = centerClip.xy
+      .mul(invW)
+      .mul(0.5)
+      .add(0.5)
+      .mul(uResolution)
       .toVar();
-    const extent1: TSLNode = extent1Raw.mul(clampScale);
-    const extent2: TSLNode = extent2Raw.mul(clampScale);
-
-    // Project centre to screen pixels.
-    const centerScreenOrtho: TSLNode = vec2(
-      uFx.mul(centerCam.x).add(uResolution.x.mul(0.5)),
-      uFy.mul(centerCam.y).add(uResolution.y.mul(0.5))
-    );
-    const centerScreenPersp: TSLNode = vec2(
-      uFx.mul(centerCam.x).mul(invZ).add(uResolution.x.mul(0.5)),
-      uFy.mul(centerCam.y).mul(invZ).add(uResolution.y.mul(0.5))
-    );
-    const vCenterScreenVal: TSLNode = isOrtho.select(centerScreenOrtho, centerScreenPersp).toVar();
 
     // Expand quad in oriented screen space.
     const quadOffset: TSLNode = majorAxis
@@ -616,7 +906,6 @@ export function gsplatWebGPUFactory(
     const ndcXY: TSLNode = screenPos.div(uResolution).mul(2.0).sub(1.0);
 
     // Clip-space depth from the projection matrix.
-    const centerClip: TSLNode = cameraProjectionMatrix.mul(centerCam4).toVar();
     const ndcZ: TSLNode = centerClip.z.div(centerClip.w);
 
     // Final clipPos — with rejects routing to behind-camera (z = -2).
@@ -640,7 +929,8 @@ export function gsplatWebGPUFactory(
       .or(invalidAmp)
       .or(invalidCov)
       .or(labelRejected)
-      .or(densityDropped);
+      .or(densityDropped)
+      .or(footprintCulled);
 
     // Per-instance colour (LUT or attribute). aAmplitude doubles as
     // the colormap scalar — matches the GLSL `(aAmplitude - uScalarMin)`
@@ -669,7 +959,7 @@ export function gsplatWebGPUFactory(
     // Sanitized like the GLSL twin: NaN/Inf route to the 1.0 opaque
     // identity, finite values clamp to [0, 1] (alpha is load-bearing and
     // feeds optical depth under volumetric).
-    vAlpha.assign(sanitizeAlpha(aAlpha));
+    vAlpha.assign(splatAlpha);
     vAmplitude2D.assign(vAmplitude2DVal);
     vL2D.assign(vL2DVal);
     vCenterScreen.assign(vCenterScreenVal);
@@ -724,7 +1014,6 @@ export function gsplatWebGPUFactory(
     // (GLSL twin; clamp = ALPHA_CLAMP from ../_shared/volumetric and sits INSIDE the
     // expression — mix evaluates both lanes, so the log argument must be
     // NaN-free even when the gate is 0).
-    const volumetricGraph = isVolumetricMode(config.blendingMode ?? 'additive');
     const alphaFactor: TSLNode = volumetricGraph
       ? mix(float(1.0), min(vAlpha, float(ALPHA_CLAMP)).oneMinus().log().negate(), uHasElementAlpha)
       : vAlpha;
@@ -734,7 +1023,9 @@ export function gsplatWebGPUFactory(
     // * color, so a high gain must relax the visibility floor —
     // max(uIntensity, 1) keeps gain <= 1 exactly at the historical
     // threshold. See shader-glsl.ts for the full rationale.
-    Discard(intensity.mul(max(uIntensity, float(1.0))).lessThan(1e-4));
+    // The vertex stage sizes the quad from this exact test
+    // (gsplatVisibleMahalSqTSL) — change both together.
+    Discard(intensity.mul(max(uIntensity, float(1.0))).lessThan(GSPLAT_VISIBILITY_FLOOR));
 
     // GOG. Colormap mode bypasses color GOG — gamma + display-range
     // shaped the scalar VALUE (amplitude) pre-LUT (vertex stage).
@@ -775,8 +1066,24 @@ export function gsplatWebGPUFactory(
       // carries a CLAMPED coverage term for the One/OneMinusSrcAlpha
       // state below. Never via material.premultipliedAlpha — NodeMaterial
       // would auto-inject a second RGB×alpha on this path.
-      const coverage: TSLNode = clamp(intensity.mul(uOpacity), float(0.0), float(1.0));
-      return vec4(finalColor, coverage);
+      const alphaExp = nodes.uDensityAlphaExp;
+      if (!alphaExp) {
+        return vec4(finalColor, clamp(intensity.mul(uOpacity), float(0.0), float(1.0)));
+      }
+      // Density-guard thinning of an alpha-over node (GLSL twin in
+      // shader-glsl.ts): coverage → 1 − (1 − c)^(1/keep), RGB scaled with
+      // it; the identity exponent leaves the untouched pair. ONE guarded
+      // branch rewrites both, so an unthinned node pays a single uniform
+      // test and computes finalColor once.
+      const coverage: TSLNode = clamp(intensity.mul(uOpacity), float(0.0), float(1.0)).toVar();
+      const outAlpha: TSLNode = float(coverage).toVar();
+      const rgb: TSLNode = vec3(finalColor).toVar();
+      const e: TSLNode = float(alphaExp);
+      If(e.greaterThan(1.0), () => {
+        outAlpha.assign(densityThinnedAlphaNode(coverage, e));
+        rgb.assign(rgb.mul(outAlpha.div(max(coverage, 1e-6))));
+      });
+      return vec4(rgb, outAlpha);
     }
     if (volumetric && tau) {
       // 'volumetric': emission–absorption (GLSL LUXAR_VOLUMETRIC twin).
@@ -811,10 +1118,26 @@ export function gsplatWebGPUFactory(
   const material = outMaterial ?? new NodeMaterial();
   material.vertexNode = clipPos;
   material.colorNode = fragmentNode();
-  material.toneMapped = false;
+  applyGSplatMaterialState(
+    material,
+    config.blendingMode ?? 'additive',
+    (nodes.uOpacity.value as number | undefined) ?? 1.0
+  );
+  return material;
+}
 
-  const blendingMode: BlendingMode = config.blendingMode ?? 'additive';
-  const opacityValue = (nodes.uOpacity.value as number | undefined) ?? 1.0;
+/**
+ * The non-graph material state the factory derives from the mode —
+ * `toneMapped` and the blending state. Exported so a wrapper that takes its
+ * graph from a shared build (`shared-graph-tsl.ts`) applies the same state
+ * to its own material.
+ */
+export function applyGSplatMaterialState(
+  material: NodeMaterial,
+  blendingMode: BlendingMode,
+  opacityValue: number
+): void {
+  material.toneMapped = false;
   // 'normal' takes the gsplat-specific premultiplied state (symmetric
   // alpha channel — separate alpha-equation state trips gl.getError()
   // under the WebGPU→WebGL2 bridge); 'volumetric' gets the identical
@@ -825,7 +1148,6 @@ export function gsplatWebGPUFactory(
     ? getGSplatNormalBlendingState()
     : getCompleteBlendingState(blendingMode, opacityValue);
   applyBlendingStateToMaterial(material, blendingState);
-  return material;
 }
 
 /**
@@ -838,6 +1160,10 @@ export function gsplatWebGPUFactory(
 export function buildGSplatTSLNodesFromUniforms(
   uniforms: Record<string, THREE.IUniform>
 ): GSplatTSLNodes {
+  // The shifted-Gaussian constants follow the truncation radius actually in
+  // use, so a caller supplying only uTruncate gets a coherent falloff.
+  const truncate = (uniforms.uTruncate?.value as number) ?? 3.0;
+  const shiftC = Math.exp(-0.5 * truncate * truncate);
   const nodes: GSplatTSLNodes = {
     // Splat data texture — bound from the caller's uniform when
     // present (harness / material paths), else a 4×1 RGBA32F
@@ -850,28 +1176,28 @@ export function buildGSplatTSLNodesFromUniforms(
       (uniforms.uResolution?.value as THREE.Vector2 | undefined) ?? new THREE.Vector2(1, 1)
     ),
     uPixelRatio: uniform((uniforms.uPixelRatio?.value as number) ?? 1),
-    uFx: uniform((uniforms.uFx?.value as number) ?? 1.0),
-    uFy: uniform((uniforms.uFy?.value as number) ?? 1.0),
     // Deliberately NOT `GSPLAT_DEFAULT_TRUNCATION_RADIUS`. This adapter is
     // harness/snapshot only (production materials set the real default in
     // their own constructor), and its values must stay equal to the GLSL twin
     // in `tests/e2e/harnesses/tsl-harness/gsplats.ts` or `tsl-shader-parity`
     // pixel-compares diverge. Note 9.0 is 3.0² — the pair must be changed
     // together, and in the harness too.
-    uTruncate: uniform((uniforms.uTruncate?.value as number) ?? 3.0),
+    uTruncate: uniform(truncate),
     uTruncateSq: uniform((uniforms.uTruncateSq?.value as number) ?? 9.0),
     uRayIntegralFactor: uniform((uniforms.uRayIntegralFactor?.value as number) ?? 1.0),
     uProjectionMode: uniform((uniforms.uProjectionMode?.value as number) ?? 0),
-    uIsOrtho: uniform((uniforms.uIsOrtho?.value as number) ?? 0),
     uSortedIndexSlot: uniform((uniforms.uSortedIndexSlot?.value as number) ?? 0),
     uDensityDrop: uniform((uniforms.uDensityDrop?.value as number) ?? 0),
+    uDensityAlphaExp: uniform((uniforms.uDensityAlphaExp?.value as number) ?? 1),
     ...glassPartitionNodesFromUniforms(uniforms),
-    uNearCull: uniform((uniforms.uNearCull?.value as number) ?? 1e-4),
-    uMaxExtentFactor: uniform((uniforms.uMaxExtentFactor?.value as number) ?? 1.0),
-    // Neutral fallback 0 (no dilation) — matches GLSL's missing-uniform default,
-    // like uMaxExtentFactor's neutral 1.0 above; this adapter is harness/snapshot
-    // only (production materials set the 0.3 default in their own constructor).
-    uCov2DDilation: uniform((uniforms.uCov2DDilation?.value as number) ?? 0),
+    // Production defaults (the GSplatMaterial constructor's), so a caller that
+    // omits one gets the shader production runs; the parity harness states
+    // every value it compares explicitly on both backends.
+    uNearCull: uniform((uniforms.uNearCull?.value as number) ?? 0.1),
+    uMaxExtentFactor: uniform((uniforms.uMaxExtentFactor?.value as number) ?? 0.33),
+    uCov2DDilation: uniform(
+      (uniforms.uCov2DDilation?.value as number) ?? GSPLAT_COV2D_DILATION_DEFAULT
+    ),
     uOpacity: uniform((uniforms.uOpacity?.value as number) ?? 1.0),
     uAbsorption: uniform((uniforms.uAbsorption?.value as number) ?? 1.0),
     uHasElementAlpha: uniform((uniforms.uHasElementAlpha?.value as number) ?? 0),
@@ -880,8 +1206,8 @@ export function buildGSplatTSLNodesFromUniforms(
     uOffset: uniform((uniforms.uOffset?.value as number) ?? 0.0),
     uLabelColorMode: uniform((uniforms.uLabelColorMode?.value as number) ?? 0),
     uLabelFilterIndex: uniform((uniforms.uLabelFilterIndex?.value as number) ?? 0),
-    uShiftC: uniform((uniforms.uShiftC?.value as number) ?? 0.0),
-    uInvOneMinusC: uniform((uniforms.uInvOneMinusC?.value as number) ?? 1.0),
+    uShiftC: uniform((uniforms.uShiftC?.value as number) ?? shiftC),
+    uInvOneMinusC: uniform((uniforms.uInvOneMinusC?.value as number) ?? 1.0 / (1.0 - shiftC)),
   };
   if (uniforms.uColormapTex) {
     return {

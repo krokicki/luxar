@@ -36,12 +36,12 @@ import {
   applyElementTextureWidthDefine,
   SPLAT_TEXTURE_LAYOUT,
 } from '../../element-texture-layout';
+import { copyRuntimeUniforms, GSPLAT_RUNTIME_UNIFORMS } from '../_shared/runtime-uniforms';
 import type { CameraAwareMaterial } from '../_shared/camera-aware-material';
 import { getGlassDepthTexture } from '../_shared/glass-partition';
 import type { BlendingMode } from '../../../types/blending';
 import type { ColormapAwareMaterial } from '../_shared/colormap-aware-material';
 import { clampGamma, isGammaOne, isNoGOG } from '../_shared/uniform-helpers';
-import { computeFocalLength } from '../_shared/camera-uniforms';
 import {
   computeRayIntegralFactor,
   clampTruncationRadius,
@@ -124,10 +124,6 @@ export interface GSplatMaterialConfig {
 export interface GSplatMaterialUniforms {
   /** Viewport resolution [width, height] */
   uResolution: { value: THREE.Vector2 };
-  /** Focal length X in pixels */
-  uFx: { value: number };
-  /** Focal length Y in pixels */
-  uFy: { value: number };
   /** Truncation radius in sigmas */
   uTruncate: { value: number };
   /** Opacity multiplier */
@@ -192,8 +188,6 @@ export class GSplatMaterial
         uSplatTex: { value: getPlaceholderElementTexture() },
         uResolution: { value: new THREE.Vector2(1, 1) },
         uPixelRatio: { value: 1 },
-        uFx: { value: 500 }, // Default focal length in pixels
-        uFy: { value: 500 },
         uTruncate: { value: truncate },
         uTruncateSq: { value: truncate * truncate },
         uShiftC: { value: shiftC },
@@ -212,13 +206,15 @@ export class GSplatMaterial
         uInvGamma: { value: 1.0 / gammaValue }, // Pre-computed inverse for performance
         uIntensity: { value: materialConfig.intensity ?? 1.0 },
         uOffset: { value: materialConfig.offset ?? 0.0 },
-        uIsOrtho: { value: 0 }, // 0 = perspective, 1 = orthographic
         // Active ordering buffer: 0 = aSortedIndex, 1 = aSortedIndexB.
         // Flipped by the depth-sort coordinator once the inactive buffer
         // holds a whole permutation (runtime uniform: never a define — a
         // flip must not recompile the program).
         uSortedIndexSlot: { value: 0 },
         uDensityDrop: { value: 0 },
+        // Alpha-over compensation of a thinned normal node (density guard);
+        // 1 is the identity the fragment stage skips.
+        uDensityAlphaExp: { value: 1 },
         // Refraction split (glass-partition.ts): mode 0 outside the split; the ONE
         // shared depth texture the split renders the refracting glass into.
         uGlassPartition: { value: 0 },
@@ -278,7 +274,7 @@ export class GSplatMaterial
       // surfaces. THREE's transparent+DoubleSide guard otherwise renders
       // a redundant back-face pass per splat layer (and, under the sorted
       // modes, splits each mesh's draw into two passes independent of the
-      // depth sort). Mirrors the Line/Point materials.
+      // depth sort). Mirrors the Line material.
       forceSinglePass: true,
     });
 
@@ -310,25 +306,15 @@ export class GSplatMaterial
   }
 
   /**
-   * Update camera parameters for perspective projection.
+   * Update the viewport-dependent uniforms. The projection terms (screen
+   * centre, covariance Jacobian, ortho test) are read in shader from the
+   * projection matrix, so none is pushed.
    *
-   * @param fov - Field of view in radians
    * @param resolution - Viewport resolution
    */
-  updateCameraParams(
-    fov: number,
-    resolution: THREE.Vector2,
-    isOrtho: boolean = false,
-    nearCull?: number,
-    pixelRatio: number = 1
-  ): void {
+  updateCameraParams(resolution: THREE.Vector2, nearCull?: number, pixelRatio: number = 1): void {
     this.uniforms.uResolution.value.copy(resolution);
     this.uniforms.uPixelRatio.value = pixelRatio;
-    this.uniforms.uIsOrtho.value = isOrtho ? 1 : 0;
-
-    const fy = computeFocalLength(fov, resolution.y, isOrtho);
-    this.uniforms.uFx.value = fy;
-    this.uniforms.uFy.value = fy;
 
     if (nearCull !== undefined) {
       this.uniforms.uNearCull.value = nearCull;
@@ -547,26 +533,12 @@ export class GSplatMaterial
     // is re-stamped from the texture it actually binds rather than left
     // on the constructor's session-width pre-stamp.
     cloned.updateSplatTexture(this.uniforms.uSplatTex.value as THREE.DataTexture | null);
-    cloned.uniforms.uFx.value = this.uniforms.uFx.value;
-    cloned.uniforms.uFy.value = this.uniforms.uFy.value;
-    cloned.uniforms.uResolution.value.copy(this.uniforms.uResolution.value);
-    cloned.uniforms.uPixelRatio.value = this.uniforms.uPixelRatio.value;
-    // Camera-state uniforms ride along with the derived focal scales
-    // (mirrors LineMaterial.clone / the points clone fix): a clone taken
-    // in ortho mode otherwise renders the perspective branch with a
-    // stale near-cull until the next global camera broadcast.
-    cloned.uniforms.uIsOrtho.value = this.uniforms.uIsOrtho.value;
-    cloned.uniforms.uNearCull.value = this.uniforms.uNearCull.value;
-    cloned.uniforms.uProjectionMode.value = this.uniforms.uProjectionMode.value;
-    cloned.uniforms.uInvGamma.value = this.uniforms.uInvGamma.value;
+    // Runtime state a fresh clone would reset (GSPLAT_RUNTIME_UNIFORMS, ../_shared/runtime-uniforms.ts).
+    copyRuntimeUniforms(this, cloned, GSPLAT_RUNTIME_UNIFORMS);
     cloned.updateLabelStyle(
       this.uniforms.uLabelColorMode.value === 1,
       this.uniforms.uLabelFilterIndex.value
     );
-    // The active ordering slot must ride along: a clone taken while the
-    // geometry draws from slot 1 would otherwise read the stale buffer
-    // until the coordinator's next per-frame re-assert.
-    cloned.uniforms.uSortedIndexSlot.value = this.uniforms.uSortedIndexSlot.value;
 
     return cloned as this;
   }

@@ -12,30 +12,38 @@ folder contains only the loop and the dimension scrubber.
 
 ## Files
 
-| File                             | Role                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `animation-controller.ts`        | `requestAnimationFrame`-driven render loop. Updates `ControlsManager`, runs registered per-frame callbacks, then renders through `PostProcessingManager`. Emits `frame-start` / `frame-end` on the event bus (for the PerformanceMonitor panel), paces pathologically slow frames (see the invariant below), and auto-pauses after `config.animation.idleTimeoutMs` of inactivity unless something continuous is active — a pointer gesture in progress (`ControlsManager.isGestureActive()`) counts as continuous. |
-| `committed-quality.ts`           | Walks visible, non-empty commit stamps and reports the minimum committed energy used by dimension-playback feedback.                                                                                                                                                                                                                                                                                                                                                                                                |
-| `dimension-animation-manager.ts` | Per-dimension FPS-throttled scrubber with `once` / `loop` / `bounce` modes. Mutates `SceneDimsManager` state and awaits `waitForUpdate()` so animation never advances faster than data loading. Extends `THREE.EventDispatcher` — emits `play`, `pause`, `complete`, `directionChange`, `speedChange`, `loopModeChange`, `fpsWarning`.                                                                                                                                                                              |
+| File                             | Role                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `animation-controller.ts`        | The render loop's WORK and idle policy. `tick()` updates `ControlsManager`, runs registered per-frame callbacks, then renders through `PostProcessingManager`, emitting `frame-start` / `frame-end` on the event bus (for the PerformanceMonitor panel). Auto-pauses after `config.animation.idleTimeoutMs` of inactivity unless something continuous is active — a pointer gesture in progress (`ControlsManager.isGestureActive()`) counts as continuous. Frames are scheduled by `RafDriver`. |
+| `committed-quality.ts`           | Walks visible, non-empty commit stamps and reports the minimum committed energy used by dimension-playback feedback.                                                                                                                                                                                                                                                                                                                                                                             |
+| `dimension-animation-manager.ts` | Per-dimension FPS-throttled scrubber with `once` / `loop` / `bounce` modes. Mutates `SceneDimsManager` state and awaits `waitForUpdate()` so animation never advances faster than data loading. Extends `THREE.EventDispatcher` — emits `play`, `pause`, `complete`, `directionChange`, `speedChange`, `loopModeChange`, `fpsWarning`.                                                                                                                                                           |
+| `view-signature.ts`              | The camera half of render-on-change: camera identity, `matrixWorld`, `projectionMatrix` and drawing-buffer size, compared in a preallocated `Float64Array` against the copy taken at the last RENDERED frame (no allocation per tick).                                                                                                                                                                                                                                                           |
+| `render-audit.ts`                | `?renderAudit` (debug only): renders every tick and, on each tick the scheduler would have skipped, compares a 64×64 readback against the last real frame; a difference counts `render.missedDirty` and logs the last render requests.                                                                                                                                                                                                                                                           |
+| `raf-driver.ts`                  | The render loop's SCHEDULING: `requestAnimationFrame`, the running flag, and frame pacing for pathologically slow frames (see the invariant below). Runs its `onFrame` (the controller's `tick()`) once per frame, AFTER arming the next frame, so the loop survives an exception thrown by the frame's work. A different driver (e.g. a WebXR session's own animation loop) can run the same `tick()`.                                                                                          |
 
 ## Public surface
 
 **`AnimationController`**
 
-- `startAnimation()` / `stopAnimation()` — start or pause the rAF loop. `startAnimation` is also the event-handler wired to controls, canvas input, and dimension changes; calling it on every interaction resets the idle timer.
-- `addPerFrameCallback(id, fn, { continuous? })` / `removePerFrameCallback(id)` / `hasPerFrameCallback(id)` — register named callbacks executed after `controls.update()` but before `postProcessing.render()`. `continuous: true` keeps the loop alive past the idle timeout (used by dimension animation and turntable recording); the default `false` is on-demand (e.g. dynamic clipping, scale bar).
+- `startAnimation()` / `stopAnimation()` — arm the next rAF frame or pause the loop. `startAnimation` does not render inline; it is also the event-handler wired to controls, canvas input, and dimension changes, and calling it on every interaction resets the idle timer. Every call also marks the next tick dirty, so each wake gets at least one rendered frame (`render.byReason.wake`).
+- `renderOnce()` — synchronously run one frame when the loop is stopped; when it is already running, mark the next tick dirty so the next scheduled frame paints it, and reset the idle timer.
+- `prepareFrame()` — run controls and per-frame callbacks without drawing, so an independent capture can use current view state. A callback that changed drawn state marks the loop's next tick dirty, so the canvas catches up too.
+- `requestRender(detail)` — something the next frame draws changed outside the loop (a geometry commit, a sort result, an environment landing): mark the next tick dirty and wake the loop (`render.byReason.event`; `detail` names the source in the render audit's log). `requestTick()` — keep the loop ticking (controls, callbacks, idle timer) WITHOUT asking for a render: for a subsystem that polls per frame for asynchronous work (a lazy LOD level loading), whose landing requests the render itself.
+- `setRenderOnChange(enabled)` / `isRenderOnChange` — see **Render on change** below. `setViewSignatureSource({ getCamera, getDrawingBuffer })` wires the camera half of the dirty check; `setRenderAudit(audit)` the debug audit.
+- `addPerFrameCallback(id, fn, { continuous?, phase?, renderEveryFrame? })` / `removePerFrameCallback(id)` / `hasPerFrameCallback(id)` — register named callbacks executed after `controls.update()` but before `postProcessing.render()`. Callbacks run by `phase` — `camera` (callbacks that move the camera: a flight, the recording turntable, the offline capture's orbit step) → `view` (the default: clipping, depth sort, density, LOD, dimension playback) → `pre-render` (the scene-captured environment) → `ui` (scale bar, Layers LOD status) — and in registration order within a phase. A camera writer therefore moves the camera before anything reads it, however late it registered: before phases, a flight (registered when it starts, after the init-time view callbacks) rendered every frame with the previous frame's near/far. `continuous: true` keeps the loop alive past the idle timeout (used by dimension animation and turntable recording); the default `false` is on-demand (e.g. dynamic clipping, scale bar). `renderEveryFrame: true` makes every tick RENDER while the callback is registered — only for a consumer of the canvas itself (the real-time recording's keep-alive), never for a state change. The callback's return value is the render-on-change contract: `true` when it changed what the next render draws, `false` when it did not. The return is required (`PerFrameCallback = () => boolean`), so a callback that forgets to say fails to compile instead of leaving a stale frame. Each callback runs isolated: one that throws is logged once per id (not once per frame) and the other callbacks and the render still run; `frame-end` always pairs `frame-start`, even when the frame's work throws.
 - A **pointer gesture in progress** also keeps the loop alive: `shouldContinueAnimating()` reads `ControlsManager.isGestureActive()`, true between the active controls' `start` and `end`. The controls only accumulate rotate/pan/zoom deltas on input; `update()` — a per-frame call — is what applies them. Before this, a button or finger held still for `idleTimeoutMs` paused the loop and the drag that followed moved nothing (mouse: press, hold 2 s, drag; the same with a finger).
-- `setAdaptiveDPRManager(manager)` — opt-in DPR feedback: the loop calls `recordFrame(now)` on each frame that does GPU work of its own, so the manager can downshift pixel ratio under load. Skipped while the context is lost or another owner drives the pipeline (see `setRenderSkipPredicate` below) — a frame that draws nothing is not a fast frame.
+- `setAdaptiveDPRManager(manager)` — opt-in DPR feedback: at the start of each tick the loop calls `recordFrame(tickStart)` when the PREVIOUS tick rendered (the interval between two tick starts measures the earlier tick), so the manager can downshift pixel ratio under load. Skipped after a tick that drew nothing — a skipped (unchanged) tick, or one while the context is lost or another owner drives the pipeline (see `setRenderSkipPredicate` below): a frame that draws nothing is not a fast frame. The first render after skipped ticks calls `notifyStreamBreak(tickStart)` instead, which re-bases the frame-interval clock without a sample and without clearing anything (unlike `notifyPaused`). Under `?renderAlways` every tick records, as it always did.
 - `setContextLostPredicate(predicate)` — injected by `SceneManager` to suppress GPU work while the WebGL context is lost; controls and callbacks still tick so input stays responsive.
-- `setRenderSkipPredicate(predicate)` — injected by `core/app/init/pipeline`, keyed on `RecordingPanel.isLoopRenderSuppressed()`: an offline capture renders its own pipeline pass per frame, so the loop's render is discarded work. Same shape as the context-lost guard — controls and callbacks still tick, but adaptive-DPR frames are not recorded (a frame that draws nothing is not a fast frame). Offline-only; the real-time recording path records the canvas the loop paints. Narrower than the capture's own mutual-exclusion flag: it is dropped before the capture teardown awaits its driver abort, so a wedged abort cannot freeze the viewport. It gates the idle-restore frame below as well — both of the controller's render call sites, since the claim is that nobody but the pipeline's current owner may draw.
+- `setRenderSkipPredicate(predicate)` — injected by `core/app/init/pipeline`, true while an offline recording owns the pipeline or a pixel readback is pending. The loop's render would compete with the capture and can keep a dense SwiftShader scene busy for minutes. Controls and callbacks still tick, but adaptive-DPR frames are not recorded (a frame that draws nothing is not a fast frame). The real-time recording path paints the canvas between captures. The offline flag is dropped before teardown awaits driver abort, so a wedged abort cannot freeze the viewport. It gates the idle-restore frame below as well — both of the controller's render call sites.
 - `setIdleRestorePredicate(predicate)` — consulted before the idle-pause native-DPR restore; returning false keeps the current DPR (recording resolution stays locked for a whole capture).
-- `setPacingSuspendPredicate(predicate)` — injected by `core/app/init/pipeline`, keyed on the BROAD `RecordingPanel.isCurrentlyRecording()` (`session.isAnyCaptureActive()`, i.e. `session.isRecording` — the flag both the real-time MediaRecorder path and the offline capture set for the whole of their run). While it returns true, frame pacing is off and every frame re-arms rAF back-to-back: the real-time path records the canvas this loop paints, so a paced gap is a dropped frame in the video, and the offline capture drives its own `await requestAnimationFrame` cadence with one-shot per-frame orbit callbacks registered here, so a paced frame could miss its window and drop the orbit step. A plain screenshot does not set the flag and does not need it — it reads the canvas after its own awaited frame rather than depending on the loop's cadence. Deliberately wider than the `isLoopRenderSuppressed()` flag behind `setRenderSkipPredicate`. A predicate that THROWS is treated as "not suspended": `scheduleNextFrame()` is the loop's only re-arm point, so a throw escaping it would freeze the viewer unrecoverably.
+- `setPacingSuspendPredicate(predicate)` — injected by `core/app/init/pipeline`, keyed on the BROAD `RecordingPanel.isCurrentlyRecording()` (`session.isAnyCaptureActive()`, i.e. `session.isRecording` — the flag both the real-time MediaRecorder path and the offline capture set for the whole of their run). While it returns true, frame pacing is off and every frame re-arms rAF back-to-back: the real-time path records the canvas this loop paints, so a paced gap is a dropped frame in the video, and the offline capture drives its own `await requestAnimationFrame` cadence with one-shot per-frame orbit callbacks registered here, so a paced frame could miss its window and drop the orbit step. A plain screenshot does not set the flag and does not need it — it reads the canvas after its own awaited frame rather than depending on the loop's cadence. Deliberately wider than the `isLoopRenderSuppressed()` flag behind `setRenderSkipPredicate`. A predicate that THROWS is treated as "not suspended": `RafDriver.scheduleNextFrame()` is the loop's only re-arm point, so a throw escaping it would freeze the viewer unrecoverably.
+- `tick()` — one frame of work (controls, per-frame callbacks, the render guard and render, `frame-start` / `frame-end`). Called by the driver each frame; public so another driver can run frames. It neither checks nor starts the loop.
 - `get isActive` — true while the loop is running.
 - `dispose()` — stops the loop and clears all per-frame callbacks. Not reusable after dispose.
 
 **`DimensionAnimationManager`**
 
-- `play(dimIndex, options?)` / `pause(dimIndex)` / `togglePlay(dimIndex, options?)` / `stop(dimIndex)` — control playback for one dimension. `stop` also removes the state entry; `pause` keeps it. `play` lazily calls `ensureRegistered()`, which installs the `'dimension-animation'` callback on the shared `AnimationController` with `continuous: true` and starts the loop.
+- `play(dimIndex, options?)` / `pause(dimIndex)` / `togglePlay(dimIndex, options?)` / `stop(dimIndex)` — control playback for one dimension. `stop` also removes the state entry; `pause` keeps it. `play` lazily calls `ensureRegistered()`, which installs the `'dimension-animation'` callback on the shared `AnimationController` with `continuous: true` and starts the loop. Once the last playing dimension pauses (or stops), `pause` removes that callback again, so the loop can idle (#2944 A1); the next `play` re-arms it.
 - `setTargetFPS(dimIndex, fps)` / `increaseSpeed(dimIndex)` / `decreaseSpeed(dimIndex)` — set or step through the FPS presets (`config.dimensionAnimation.presets.fps`, default `[1, 2, 5, 10, 15, 30, 60]`); values clamp to `[customMin, customMax]`. The speed-step helpers jump to the next/previous preset and fall back to ±10 % multiplicative steps when already past the top/bottom preset.
 - `setLoopMode(dimIndex, mode)` — `'once' | 'loop' | 'bounce'`. `setTargetFPS` and `setLoopMode` create a paused state entry if none exists, so the UI can pre-configure a dimension before the user hits play.
 - `isAnimating(dimIndex)` / `getState(dimIndex)` — query playback flag and the full `DimensionAnimationState` (target/actual FPS, frame counters, direction).
@@ -44,6 +52,50 @@ folder contains only the loop and the dimension scrubber.
 `PlayOptions` (`targetFPS?`, `loopMode?`, `direction?`) is exported for
 callers that build the options object dynamically; defaults come from
 `config.dimensionAnimation.defaults`.
+
+## Render on change
+
+`config.animation.renderOnChange` (default `true`; `?renderAlways` turns it
+off for a session, `LuxarAppOptions.renderAlways` for an embedder). The loop
+keeps TICKING exactly as before — controls, per-frame callbacks, the idle
+timer and its idle-restore frame — but a tick RENDERS only when something
+changed since the last rendered frame. Measured before: one 4 px drag
+rendered 181 frames over 3 s (every rAF through the 2 s idle tail), and 10 fps
+hidden-dimension playback 360 frames for 54 data commits. A tick renders when,
+in this precedence (each render lands in exactly one `render.byReason.*`):
+
+| Reason        | Trigger                                                                                                                       |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `wake`        | `startAnimation()` since the last render (every input / state handler that wakes the loop)                                    |
+| `event`       | `requestRender(detail)` since the last render (geometry commit, sort result, resize via the scene manager's `change`, …)      |
+| `once`        | `renderOnce()` (draws now on a stopped loop; marks the next tick on a running one)                                            |
+| `cb:<id>`     | a per-frame callback returned `true`                                                                                          |
+| `camera`      | the view signature differs: camera object, `matrixWorld`, `projectionMatrix`, drawing-buffer size                             |
+| `continuous`  | every tick must draw: cinematic detector noise (`needsContinuousAnimation()`), a `renderEveryFrame` callback, `?renderAlways` |
+| `idleRestore` | the idle pause's ceiling-DPR frame (unchanged)                                                                                |
+| `audit`       | `?renderAudit` rendering a tick the scheduler would have skipped                                                              |
+
+The dirty flag is cleared just BEFORE the render, so a request made during it
+(an `onAfterRender` hook, a sort landing) dirties the next tick. A tick blocked
+by context loss or an offline capture keeps whatever was dirty. Skipped ticks
+count `render.skippedTicks`; `frame-end` carries `{ rendered }` so the
+performance readout and the renderer-info sampler count only drawn frames.
+
+The pixels of a rendered frame are identical to the always-render loop's for
+the same state — the change only skips re-drawing an unchanged state. Anything
+that mutates drawn state must therefore say so: return `true` from its
+per-frame callback, or call `requestRender` / `startAnimation` from its event.
+`?debug&renderAudit` verifies it (see `render-audit.ts` and the
+`render-on-change-audit.spec.ts` E2E).
+
+The converse holds too: a geometry commit to a node that is not drawn (it or
+an ancestor hidden — an LOD level the registry keeps off screen, a hidden
+layer) calls `requestTick()`, not `requestRender` (`SceneLoader.setRequestRender`
+and `geometry-committed` carry `drawn`). The loop still wakes, so the LOD
+registry sees the commit; if it then shows that level, its visibility flip is
+the redraw. During LOD timelapse playback the eager coarse level re-commits
+every timepoint under the held fine level, and redrawing for it cost a second,
+unchanged render per tick.
 
 ## Invariants
 
@@ -59,8 +111,8 @@ callers that build the options object dynamically; defaults come from
   decide whether idle timeout fires.
 - **No GPU work while context is lost — or while another owner drives
   the pipeline.** When either injected predicate (`isContextLost`,
-  `shouldSkipRender`) returns true, the loop emits `frame-end` and
-  returns before `postProcessing.render()`. Controls and per-frame
+  `shouldSkipRender`) returns true, the loop emits `frame-end`
+  (`rendered: false`) and returns before `postProcessing.render()`. Controls and per-frame
   callbacks still execute, so UI input is unaffected during the loss
   window, and the depth-sort scheduler and LOD selector keep following
   the camera through an offline capture.
@@ -116,8 +168,8 @@ callers that build the options object dynamically; defaults come from
     `config/sections/animation/data.ts`.
   - Frames are DELAYED, never skipped, and both readouts get the REAL
     clock: each frame still emits exactly one `frame-start` / `frame-end`
-    pair, and still calls `recordFrame(performance.now())` whenever it does
-    GPU work of its own (that call keeps its pre-existing context-lost /
+    pair, and still calls `recordFrame(performance.now())` for a rendered
+    predecessor (that call keeps its pre-existing context-lost /
     render-skip gate, per `setAdaptiveDPRManager` above). The achieved frame rate
     really is lower, so neither the FPS readout nor adaptive DPR is told
     otherwise (no virtual pacing clock to drift against
@@ -138,13 +190,24 @@ callers that build the options object dynamically; defaults come from
   energy is below the display threshold. Logging is warning-level while frames
   are still filling (or quality is unknown), informational when enough content
   is visible and only cadence slipped. It never throttles or stops animation.
-- **Boundary semantics.** `handleBoundary` clamps to `[min, max]`,
-  not past them — `once` clamps and stops, `loop` wraps to the
-  opposite end, `bounce` clamps and flips `state.direction`. The
-  discrete-vs-continuous distinction lives in `calculateNextValue`:
-  discrete dims advance by `metadata.step`, continuous dims by
-  `range / continuousTraverseSeconds` scaled to the current target
-  FPS.
+- **Cadence is schedule-based.** Ticks fall due on a fixed grid
+  (`state.nextDue += period`), and the frame within half a vsync (an EWMA of
+  rAF deltas) of the due time takes the tick, so a 10 or 30 fps target is met
+  on a 60 Hz display rather than drifting by up to a vsync per tick. A playhead
+  more than a period late (a data stall) resyncs from now instead of bursting
+  catch-up ticks.
+- **Boundary semantics** (`advance-value.ts`). The range ends are frames to
+  show: in `loop` and `once` a step that reaches or overshoots `max` (forward)
+  or `min` (backward) lands ON it, and only the next step, taken from the
+  endpoint, wraps (`loop`) or completes (`once`). `bounce` clamps and flips the
+  direction on arrival; a bounce started ON the endpoint it moves toward steps
+  away from it on the first tick instead of holding it for a second period. A
+  tick whose value does not change the playhead (a single-timepoint dim) does
+  not count as a step for the frame callback's redraw report. On a discrete dim whose `max` is off its grid, the last
+  grid point is the endpoint. Discrete dims advance by `metadata.step` (or the
+  step override), continuous dims by `range / continuousTraverseSeconds`
+  scaled to the current target FPS. `peekNextValue` runs the same function, so
+  the t+1 prefetch predicts the endpoint frame too.
 
 ## Events
 
@@ -175,7 +238,8 @@ animation-controller importing UI code.
   `DimensionAnimationManager` mutates via `setDimensionValue` and
   observes via `addListener` / `waitForUpdate`.
 - `../../rendering/adaptive-dpr-manager.ts` — receives
-  `recordFrame(now)` calls each frame when wired through
+  `recordFrame(now)` for each rendered frame and `notifyStreamBreak(now)`
+  when rendering resumes after skipped ticks, when wired through
   `setAdaptiveDPRManager`.
 - `../../config/sections/animation` and
   `../../config/sections/dimension-animation` — idle timeout, pacing

@@ -13,6 +13,7 @@
  * to mid-flight viewState mutation by a concurrent updateView.
  */
 
+import type * as THREE from 'three';
 import type { LoaderRegistry } from '../loaders/loader-registry';
 import type { LoaderFactoryDeps } from '../loaders/loader-factory';
 import type { NodeFactory } from '../../../rendering/node-factory';
@@ -45,6 +46,16 @@ export interface LineWorkingSetGate {
   acquire(node: LineWorkingSetNode): Promise<() => void>;
 }
 
+/**
+ * Told about every data leaf a scene loader attaches to the scene, with the
+ * graph it belongs to. See {@link NodeBuildCtx.onLeafMaterialized}.
+ */
+export type LeafMaterializedListener = (
+  sceneGraph: SceneNode,
+  path: string,
+  object: THREE.Object3D
+) => void;
+
 export interface NodeBuildCtx {
   /** Shared loader bookkeeping (registration + failure recording). */
   registry: LoaderRegistry;
@@ -71,6 +82,31 @@ export interface NodeBuildCtx {
    */
   viewState: ViewState;
   /**
+   * The orchestrator's LIVE view state (not the snapshot above). The partition
+   * loader gates its parts on the current hidden-dim slice with it (B4); a
+   * nested partition can be loaded long after this ctx was built (a deferred
+   * part's activation), when `viewState` is stale. Optional: absent ⇒ the
+   * snapshot is used.
+   */
+  getSliceView?(): ViewState;
+  /**
+   * `true` ⇒ each leaf attaches its placeholder and registers its loader but
+   * does NOT load its first data. Set for a partition part activated by the LOD
+   * registry (B4): the loader pass that activated it sweeps the new loaders
+   * itself, with that pass's directives (playback budget, pinned rungs), and
+   * commits them with the rest of the pass — one commit, no initial-load
+   * lookahead, and nothing loaded for a view the pass is not showing. A
+   * `kind=lod` group clears it for its subtree (its lazy levels load outside
+   * any pass). Absent ⇒ the leaf loads eagerly.
+   */
+  registerOnly?: boolean;
+  /**
+   * Whether `path`'s world `nd_transform` chain (root → node) is non-empty. A
+   * transformed part's bounds do not live in the space of the world slice, so
+   * the partition loader never slice-gates it. Optional: absent ⇒ `false`.
+   */
+  pathHasNdTransform?(path: string): boolean;
+  /**
    * The orchestrator's CURRENT view-update version (live, not the snapshot). A
    * deferred / registry-driven reload captures this at derive-time and stamps
    * the committed geometry with it (see the commit callbacks below) so the LOD
@@ -81,6 +117,15 @@ export interface NodeBuildCtx {
   factoryDeps: LoaderFactoryDeps;
   /** Compose effective rendering attrs along the scene-graph ancestry. */
   applyEffectiveAttrs(node: SceneNode): SceneNode['attrs'];
+  /**
+   * Called by each leaf loader right after it attaches its placeholder — before
+   * any data is loaded into it, so before it can be drawn. The factory styles
+   * that placeholder from AUTHORED attrs; a leaf built after the Layers panel
+   * initialised (a registry-activated partition part, a lazy level) needs the
+   * panel's LIVE layer state instead, and this is where the app hands it over.
+   * Optional: absent ⇒ nobody is listening.
+   */
+  onLeafMaterialized?(path: string, object: THREE.Object3D): void;
   /** Derive the per-node view state (same single source of truth used by retry/update). */
   deriveNodeViewState(
     path: string,
@@ -115,7 +160,8 @@ export interface NodeBuildCtx {
   isDatasetLive(): boolean;
   /**
    * Release a lazily-loaded gsplats level's GPU geometry back to the
-   * evictable buffer pool and unregister its loader. Called when the
+   * evictable buffer pool (its loader is never registered: lazy levels stay
+   * out of the sweep, and the lod_group's `ensureLoaded` keeps it). Called when the
    * lod_group selector swaps away from a substitutive level, so resident
    * geometry stays bounded to ≈ the visible set rather than accumulating
    * every level ever shown. The raw chunks remain in the decompressed
@@ -125,7 +171,7 @@ export interface NodeBuildCtx {
 
   /**
    * Release a lazily-loaded points level's GPU geometry back to the evictable
-   * buffer pool and unregister its loader. Peer of :meth:`releaseLazyGSplats`
+   * buffer pool. Peer of :meth:`releaseLazyGSplats`
    * for points lod-group children (the finest level of a points-substitutive
    * ladder). Raw chunks remain in the decompressed cache, so re-selection
    * re-projects cheaply.
@@ -134,21 +180,17 @@ export interface NodeBuildCtx {
 
   /**
    * Release a lazily-loaded lines level's GPU geometry back to the evictable
-   * buffer pool and unregister its loader. Peer of :meth:`releaseLazyPoints` /
+   * buffer pool. Peer of :meth:`releaseLazyPoints` /
    * :meth:`releaseLazyGSplats` for lines lod-group children (the finest level of
    * a lines-substitutive ladder).
    */
   releaseLazyLines(path: string): void;
 
   /**
-   * Demotion hygiene for a lazily-loaded mesh level. Peer of the three above in
-   * WHEN it is called and deliberately not in WHAT it does: a mesh is
-   * `pooled: false` (an indexed `BufferGeometry`, not the instanced-quad stack),
-   * so there is no evictable buffer to hand back and no pool adapter to hand it
-   * to. What it does share is the depth-sort release — mesh is `depthSortable`,
-   * so a demoted level would otherwise keep its coordinator state and its
-   * worker-side centroid copy alive for a level that is no longer drawn, which
-   * is precisely the memory a ladder exists to avoid holding.
+   * Release a lazily-loaded mesh level's committed geometry and restore its
+   * empty placeholder. Mesh buffers are counted in the resident total but are
+   * not pooled. Also release depth-sort state and worker-side centroids so a
+   * demoted level retains neither GPU geometry nor sorting data.
    */
   releaseLazyMesh(path: string): void;
 
@@ -166,7 +208,8 @@ export interface NodeBuildCtx {
     path: string,
     data: LoadedLinesData,
     viewState: LinesViewState,
-    session?: UpdateSession
+    session?: UpdateSession,
+    signal?: AbortSignal
   ): Promise<StagedLinesCommit | null>;
   commitLinesGeometry(
     staged: StagedLinesCommit,
@@ -177,7 +220,8 @@ export interface NodeBuildCtx {
     path: string,
     data: LoadedGSplatsData,
     viewState: GSplatsViewState,
-    session?: UpdateSession
+    session?: UpdateSession,
+    signal?: AbortSignal
   ): Promise<StagedGSplatsCommit | null>;
   commitGSplatsGeometry(
     staged: StagedGSplatsCommit,

@@ -3,8 +3,8 @@
  *
  * Mocks the global materialManager (which is the singleton bridge
  * between scene-manager and the rendering layer) and verifies:
- *  - perspective path sends FOV radians + orthographic=false;
- *  - orthographic path sends frustum height + orthographic=true;
+ *  - perspective path sends orthographic=false (no FOV: shaders read P);
+ *  - orthographic path sends orthographic=true (no frustum height);
  *  - adjustFOV clamps to config min/max and re-runs material update;
  *  - adjustFOV is a no-op on orthographic cameras.
  */
@@ -54,32 +54,22 @@ describe('updateMaterialsForCurrentCamera', () => {
     vi.mocked(materialManager.updateCameraParams).mockClear();
   });
 
-  it('sends FOV (radians) + orthographic=false for perspective camera', () => {
-    const camera = new THREE.PerspectiveCamera(60, 16 / 9, 0.1, 1000);
+  it.each([
+    ['perspective', new THREE.PerspectiveCamera(60, 16 / 9, 0.1, 1000)],
+    ['orthographic', new THREE.OrthographicCamera(-10, 10, 5, -5, 0.1, 1000)],
+  ])('sends the same (buffer, nearCull, pixelRatio) push for a %s camera', (_n, camera) => {
     const ctx = makeCtx({ camera });
 
     updateMaterialsForCurrentCamera(ctx);
 
     expect(materialManager.updateCameraParams).toHaveBeenCalledTimes(1);
-    const [proj, buf, isOrtho] = vi.mocked(materialManager.updateCameraParams).mock.calls[0];
-    // FOV converted to radians (~1.047 for 60deg).
-    expect(proj).toBeCloseTo((60 * Math.PI) / 180, 5);
-    expect(buf).toBeInstanceOf(THREE.Vector2);
-    expect(isOrtho).toBe(false);
-  });
-
-  it('sends frustum height + orthographic=true for orthographic camera', () => {
-    const camera = new THREE.OrthographicCamera(-10, 10, 5, -5, 0.1, 1000);
-    const ctx = makeCtx({ camera });
-
-    updateMaterialsForCurrentCamera(ctx);
-
-    expect(materialManager.updateCameraParams).toHaveBeenCalledTimes(1);
-    const [proj, buf, isOrtho] = vi.mocked(materialManager.updateCameraParams).mock.calls[0];
-    // Frustum height = (top - bottom) / zoom = 10 / 1 = 10.
-    expect(proj).toBe(10);
-    expect(buf).toBeInstanceOf(THREE.Vector2);
-    expect(isOrtho).toBe(true);
+    const args = vi.mocked(materialManager.updateCameraParams).mock.calls[0];
+    // No FOV, frustum height or camera kind: every projection term — the
+    // ortho test included — is read in shader from the projection matrix.
+    expect(args).toHaveLength(3);
+    expect(args[0]).toBeInstanceOf(THREE.Vector2);
+    expect(args[1]).toBe(0.1);
+    expect(args[2]).toBe(2);
   });
 
   it('uses the supplied pre-allocated Vector2 (no allocation)', () => {
@@ -89,7 +79,7 @@ describe('updateMaterialsForCurrentCamera', () => {
 
     updateMaterialsForCurrentCamera(ctx);
 
-    const [, buf] = vi.mocked(materialManager.updateCameraParams).mock.calls[0];
+    const [buf] = vi.mocked(materialManager.updateCameraParams).mock.calls[0];
     expect(buf).toBe(bufferSize); // Same reference, not a fresh allocation.
     expect(bufferSize.x).toBe(800);
     expect(bufferSize.y).toBe(600);
@@ -103,9 +93,7 @@ describe('updateMaterialsForCurrentCamera', () => {
     updateMaterialsForCurrentCamera(ctx);
 
     expect(materialManager.updateCameraParams).toHaveBeenCalledWith(
-      expect.any(Number),
       expect.any(THREE.Vector2),
-      false,
       expect.any(Number),
       2
     );
@@ -146,7 +134,7 @@ describe('updateMaterialsForCurrentCamera', () => {
 
     updateMaterialsForCurrentCamera(ctx);
 
-    const [, , , nearCull] = vi.mocked(materialManager.updateCameraParams).mock.calls[0];
+    const [, nearCull] = vi.mocked(materialManager.updateCameraParams).mock.calls[0];
     expect(nearCull).toBe(0.1);
   });
 
@@ -157,7 +145,7 @@ describe('updateMaterialsForCurrentCamera', () => {
 
     updateMaterialsForCurrentCamera(ctx);
 
-    const [, , , , pixelRatio] = vi.mocked(materialManager.updateCameraParams).mock.calls[0];
+    const [, , pixelRatio] = vi.mocked(materialManager.updateCameraParams).mock.calls[0];
     expect(pixelRatio).toBe(2);
   });
 });

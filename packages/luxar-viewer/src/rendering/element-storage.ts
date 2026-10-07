@@ -50,11 +50,12 @@ const FULL_UPLOAD_ROW_FRACTION = 0.75;
  * Range discipline mirrors {@link collapseSortedIndexRanges}:
  * - Units are FLOAT elements of `image.data` (three's texture-range API is
  *   float-indexed with an implicit RGBA `componentStride` of 4).
- * - Ranges accumulate across commits while a mesh is hidden, and BOTH
- *   WebGPU backends (native + WebGL2-fallback) replay them verbatim and
- *   never clear them — only the classic WebGLRenderer consumes+clears at
- *   flush. So every call collapses the pending set into one contiguous
- *   span and re-splits it (a superset upload is always correct, never
+ * - Ranges accumulate across commits while a mesh is hidden (they are
+ *   consumed only when the texture is actually uploaded: by the classic
+ *   WebGLRenderer at flush, and on both WebGPU backends by
+ *   `./element-texture-row-upload`). So every call collapses the pending
+ *   set into one contiguous span and re-splits it (a superset upload is
+ *   always correct, never
  *   stale; our writers only ever register a `[0, n)` prefix or an append
  *   suffix contiguous with it).
  * - An element is exactly `floatsPerElement` floats and the texture width
@@ -63,9 +64,10 @@ const FULL_UPLOAD_ROW_FRACTION = 0.75;
  *   path uploads every range with `height = 1` and would reject a
  *   row-straddling range with INVALID_VALUE).
  *
- * On the WebGPU backends this still sets `needsUpdate`; they ignore the
- * ranges and re-upload the whole image (correct, just not yet partial —
- * see the Phase-4 spec's Stage 3).
+ * three's WebGPU backends (native + WebGL2-fallback) ignore texture
+ * update ranges; `./element-texture-row-upload` wraps their
+ * `updateTexture` so element textures upload exactly the rows these
+ * ranges cover there too (#2944).
  */
 /**
  * Textures with a FULL-image upload pending (encoded to three as
@@ -73,14 +75,45 @@ const FULL_UPLOAD_ROW_FRACTION = 0.75;
  * invisible to the range fold below — without this set, a later append
  * would register only its own span and silently DOWNGRADE the pending
  * full upload to a partial one, leaving the prefix rendering the
- * previous commit's texels on the classic WebGL backend (found by
- * model-based fuzzing; deterministic repro: full write ≥75% of rows →
- * append before any flush). Cleared by `texture.onUpdate`, which the
- * classic renderer invokes after it actually consumes the upload (the
- * WebGPU backends may never call it — harmless, they full-upload on
- * every needsUpdate anyway).
+ * previous commit's texels (found by model-based fuzzing; deterministic
+ * repro: full write ≥75% of rows → append before any flush). Cleared by
+ * `texture.onUpdate`, which the classic renderer and three's common
+ * `Textures.updateTexture` (both WebGPU backends) invoke after they
+ * actually consume the upload.
  */
 const pendingFullUpload = new WeakSet<THREE.DataTexture>();
+
+/**
+ * Every texture {@link attachElementStorage} allocated. The WebGPU row
+ * upload (`./element-texture-row-upload`) acts ONLY on these — every
+ * write to them registers its dirty span here, which is what makes a
+ * rows-only upload equal to a full one.
+ */
+const elementTextures = new WeakSet<THREE.Texture>();
+
+/** True for a texture allocated by {@link attachElementStorage}. */
+export function isElementTexture(texture: THREE.Texture): texture is THREE.DataTexture {
+  return elementTextures.has(texture);
+}
+
+/** True while a FULL image upload is pending on an element texture. */
+export function hasPendingElementTextureFullUpload(texture: THREE.DataTexture): boolean {
+  return pendingFullUpload.has(texture);
+}
+
+/**
+ * Element textures some renderer has consumed an upload of (its
+ * `onUpdate` fired). Until then the pending ranges cover every texel
+ * ever written since {@link attachElementStorage} zero-filled the
+ * backing store, so a ranged FIRST upload into zero-initialised GPU
+ * storage equals a full one — what the classic renderer already does.
+ */
+const uploadedOnce = new WeakSet<THREE.DataTexture>();
+
+/** True once any renderer has consumed an upload of this element texture. */
+export function hasElementTextureBeenUploaded(texture: THREE.DataTexture): boolean {
+  return uploadedOnce.has(texture);
+}
 
 /**
  * Mark an element texture as needing a FULL image upload (context
@@ -233,13 +266,16 @@ interface ElementStorageUserData {
 // identity and never receive orderings — but that is precisely the
 // population depth sorting exists for.
 //
-// WebGPU: both WebGPU backends ignore attribute update ranges and
-// re-upload the whole buffer on every `needsUpdate`, so SLICING there
-// would turn ONE full upload into `ceil(n / chunk)` full uploads (only
-// the JS memcpy would be bounded). Slicing is therefore feature-gated to
-// the classic WebGL backend via {@link configureSortedIndexChunkedApply}
-// (renderer-setup calls it with `apiSurface === 'webgl2'`); the WebGPU
-// backends write the ordering in ONE slice and flip on the next pump.
+// WebGPU: slicing is feature-gated to the classic WebGL backend via
+// {@link configureSortedIndexChunkedApply} (renderer-setup calls it with
+// `apiSurface === 'webgl2'`), because its back-pressure waits on the
+// attribute's `onUploadCallback`, which neither WebGPU backend fires. The
+// WebGPU backends write the ordering in ONE slice and flip on the next
+// pump. They DO honour attribute `updateRanges` (and clear them after the
+// upload), but three's shared attribute cache re-uploads a
+// `DynamicDrawUsage` attribute on EVERY render regardless of its version,
+// so the pair is `StaticDrawUsage` there ({@link sortedIndexUsage}): it
+// uploads only when a write bumps its version.
 // Double-buffering itself is unconditional — the atomic swap is a
 // correctness property, not a per-backend optimisation.
 // ────────────────────────────────────────────────────────────────────
@@ -267,9 +303,9 @@ export function setSortedIndexChunkElementsForTests(elements: number | null): vo
 /**
  * Session backend gate (renderer-setup, the
  * `configureElementTextureLayout` pattern): `true` on the classic
- * WebGL backend (partial attribute uploads honored), `false` on the
- * WebGPU backends (ranges ignored — chunking would multiply full
- * uploads; see the module note above). Defaults to `true`: classic
+ * WebGL backend, `false` on the WebGPU backends (no `onUploadCallback`
+ * for the slice back-pressure; see the module note above). It also picks
+ * the ordering pair's buffer usage ({@link sortedIndexUsage}). Defaults to `true`: classic
  * WebGL is the production default and headless/unit contexts have no
  * renderer to misbehave.
  */
@@ -278,6 +314,23 @@ let chunkedApplyEnabled = true;
 /** Configure whether large orderings apply chunked (classic WebGL only). */
 export function configureSortedIndexChunkedApply(enabled: boolean): void {
   chunkedApplyEnabled = enabled;
+}
+
+/**
+ * Buffer usage for the ordering pair on the current backend.
+ *
+ * WebGPU (both backends): `StaticDrawUsage`. three's shared attribute cache
+ * (`renderers/common/Attributes.js`) re-uploads a `DynamicDrawUsage`
+ * attribute on every render even when its version is unchanged, which cost
+ * a full `writeBuffer` of both buffers per node per frame (8 B x capacity:
+ * 80 MB/frame at 10M elements, #2944). Every buffer three creates there
+ * carries COPY_DST, so a static attribute still uploads on each version bump.
+ *
+ * Classic WebGL: `DynamicDrawUsage`, unchanged. There usage is only the
+ * `bufferData` hint and uploads already follow the version.
+ */
+export function sortedIndexUsage(): THREE.Usage {
+  return chunkedApplyEnabled ? THREE.DynamicDrawUsage : THREE.StaticDrawUsage;
 }
 
 /** In-flight chunked application state for one geometry. */
@@ -349,6 +402,39 @@ const chunkedDisposeHooked = new WeakSet<THREE.InstancedBufferGeometry>();
 export interface SortedIndexApplyCallbacks {
   onApplied?: () => void;
   onAbandoned?: () => void;
+  /**
+   * Who staged this ordering. Opaque here; the per-owner teardown sweep
+   * ({@link cancelAllSortedIndexOrderingApplies} with an owner) filters on it,
+   * so one depth-sort coordinator's dataset switch or dispose never abandons
+   * another coordinator's streams on the same page.
+   */
+  owner?: object;
+  /**
+   * "Request one more frame", invoked from a slice's upload acknowledgement
+   * so a drained-but-idle stream resumes the instant the mesh is actually
+   * drawn again (issue #715 resume gap: the coordinator deliberately does NOT
+   * request a render on a stall, so a camera coming to rest exactly as a
+   * culled node becomes drawable would otherwise freeze the stream mid-drain).
+   * A consumed slice means the mesh WAS drawn, so this drives the next pump
+   * precisely — no spin while hidden, because a mesh that is never drawn
+   * never fires the acknowledgement. Per ordering rather than module-wide so
+   * it wakes the render loop of the host that owns the mesh.
+   */
+  requestFrame?: () => void;
+  /**
+   * When it returns true, `applyNextSortedIndexChunk` advances past the
+   * #715 upload-acknowledgement back-pressure. The depth-sort coordinator's
+   * offline-capture drain (`resortForCapture`) turns it on for its own
+   * streams: that drain never draws, so the ack that releases the stall can
+   * never fire and a multi-slice stream (>1 slice, e.g. a 3M-element node)
+   * would wedge the drain until its timeout on every captured frame. The
+   * stall exists only to bound the per-DRAWN-frame upload for interactive
+   * smoothness; offline, folding the slices into one upload on the capture's
+   * own render is exactly acceptable, and the range-union discipline keeps
+   * the pending span contiguous and current (a superset upload is correct,
+   * never stale).
+   */
+  bypassBackPressure?: () => boolean;
 }
 
 /**
@@ -373,43 +459,6 @@ export interface SortedIndexApplyCallbacks {
  * texture's `pendingFullUpload` + `texture.onUpdate` acknowledgement.
  */
 const sliceUploadPending = new WeakSet<THREE.InstancedBufferAttribute>();
-
-/**
- * Coordinator-supplied "request one more frame" hook, invoked from a
- * slice's upload acknowledgement so a drained-but-idle stream resumes the
- * instant the mesh is actually drawn again (issue #715 resume gap: the
- * coordinator deliberately does NOT request a render on a stall, so a
- * camera coming to rest exactly as a culled node becomes drawable would
- * otherwise freeze the stream mid-drain). A consumed slice means the mesh
- * WAS drawn, so this drives the next pump precisely — no spin while
- * hidden, because a mesh that is never drawn never fires the callback.
- */
-let requestSliceRender: (() => void) | null = null;
-
-/** Wire (or clear, with `null`) the per-slice render-continuation hook. */
-export function setSortedIndexApplyRequestRender(fn: (() => void) | null): void {
-  requestSliceRender = fn;
-}
-
-/**
- * When true, {@link applyNextSortedIndexChunk} advances past the #715
- * upload-acknowledgement back-pressure. Set by the depth-sort
- * coordinator's offline-capture drain (`resortForCapture`): that drain
- * never draws, so the ack that releases the stall can never fire and a
- * multi-slice stream (>1 slice, e.g. a 3M-element node) would wedge the
- * drain until its timeout on every captured frame. The stall exists only
- * to bound the per-DRAWN-frame upload for interactive smoothness;
- * offline, folding the slices into one upload on the capture's own
- * render is exactly acceptable, and the range-union discipline keeps the
- * pending span contiguous and current (a superset upload is correct,
- * never stale).
- */
-let backPressureBypassed = false;
-
-/** Toggle the offline-capture back-pressure bypass (see above). */
-export function setSortedIndexApplyBackPressureBypassed(bypassed: boolean): void {
-  backPressureBypassed = bypassed;
-}
 
 /** Outcome of one {@link pumpSortedIndexOrderingApply} call. */
 export interface SortedIndexPumpResult {
@@ -508,6 +557,11 @@ function sortedIndexBuffersUsable(geometry: THREE.InstancedBufferGeometry): bool
   return (front.array as Uint32Array).length === (back.array as Uint32Array).length;
 }
 
+/** Whether the streaming ordering's owner has lifted the #715 back-pressure. */
+function isBackPressureBypassed(state: ChunkedOrderingApply): boolean {
+  return state.callbacks?.bypassBackPressure?.() === true;
+}
+
 /**
  * Write the next pending slice into `aSortedIndex` and register ITS
  * update range (not the collapsed `[0, …)` prefix — re-registering the
@@ -557,7 +611,7 @@ function applyNextSortedIndexChunk(
   // stream's first slice always proceed.
   if (
     chunkedApplyEnabled &&
-    !backPressureBypassed &&
+    !isBackPressureBypassed(state) &&
     state.cursor > 0 &&
     sliceUploadPending.has(attr)
   ) {
@@ -566,12 +620,12 @@ function applyNextSortedIndexChunk(
   const arr = attr.array as Uint32Array;
   const start = state.cursor;
   // Backend gate: on WebGL a slice bounds the per-frame memcpy+upload;
-  // the WebGPU backends ignore attribute ranges and re-upload the whole
-  // buffer per flush, so slicing there would multiply ONE upload into
-  // ceil(n / chunk). They write the ordering whole and flip next frame —
-  // still atomic, still one upload.
+  // the WebGPU backends never fire the upload callback the slice
+  // back-pressure waits on, so they write the ordering whole and flip next
+  // frame — still atomic, still one upload.
   const sliceEnd = chunkedApplyEnabled ? start + sortedIndexChunkElements : state.count;
   const end = Math.min(state.count, sliceEnd, arr.length);
+  clearIdentityPrefix(attr);
   arr.set(state.ordering.subarray(start, end), start);
   state.cursor = end;
 
@@ -608,7 +662,7 @@ function applyNextSortedIndexChunk(
       // path), and three's no-range fallback is a FULL `bufferSubData`,
       // so a cleared range can never lose data.
       attr.clearUpdateRanges();
-      if (chunkedApplies.has(geometry)) requestSliceRender?.();
+      chunkedApplies.get(geometry)?.callbacks?.requestFrame?.();
     });
   }
 
@@ -623,6 +677,9 @@ function applyNextSortedIndexChunk(
   // visible mesh can upload the final slice and draw the new slot in that
   // frame. `onAfterRender` is the proof that this actually happened.
   setSortedIndexSlot(geometry, activeSortedIndexSlot(geometry) === 0 ? 1 : 0);
+  // A held append draw becomes the grown population on THIS flip — the first
+  // frame that has an ordering for it.
+  raiseHeldDraw(geometry, state.count);
 
   // The ordering that just finished streaming is now SELECTED for the render
   // about to run, but it is not applied yet: THREE has not consumed this
@@ -742,24 +799,69 @@ export function cancelSortedIndexOrderingApply(geometry: THREE.InstancedBufferGe
 }
 
 /**
- * Abort every in-flight chunked application (dataset-switch teardown /
- * app dispose — the coordinator's `releaseAllDepthSortNodes` /
- * `disposeDepthSort` sweeps).
+ * Abort every in-flight chunked application staged by `owner` (a depth-sort
+ * coordinator's dataset-switch teardown and dispose — its `releaseAllNodes` /
+ * `dispose`), or EVERY one when no owner is given (module-state reset in
+ * tests). Filtering on the owner rather than on the coordinator's current
+ * node list also catches an apply whose geometry no longer belongs to any of
+ * its nodes, without touching another coordinator's streams on the same page.
  *
- * Each abandoned ordering's `onAbandoned` fires (issue #713). The map is
- * snapshotted and cleared BEFORE any hook runs, so a hook can never
- * observe a half-cleared map or re-enter the sweep.
+ * Each abandoned ordering's `onAbandoned` fires (issue #713). The matching
+ * entries are removed BEFORE any hook runs, so a hook can never observe a
+ * half-cleared map or re-enter the sweep.
  */
-export function cancelAllSortedIndexOrderingApplies(): void {
-  const states = [...chunkedApplies.values()];
-  const selected = [...awaitingDrawAcknowledgement.values()];
-  chunkedApplies.clear();
-  awaitingDrawAcknowledgement.clear();
+export function cancelAllSortedIndexOrderingApplies(owner?: object): void {
+  const states = takeOwnedEntries(chunkedApplies, owner, (state) => applyOwner(state));
+  const selected = takeOwnedEntries(awaitingDrawAcknowledgement, owner, (c) => c.owner);
   for (const state of states) {
     state.callbacks?.onAbandoned?.();
     state.pending?.callbacks?.onAbandoned?.();
   }
   for (const callbacks of selected) callbacks.onAbandoned?.();
+}
+
+/** The owner tag of an in-flight apply (streaming or held ordering). */
+function applyOwner(state: ChunkedOrderingApply): object | undefined {
+  return state.callbacks?.owner ?? state.pending?.callbacks?.owner;
+}
+
+/**
+ * Remove and return the values of `map` owned by `owner` (all of them when
+ * `owner` is undefined).
+ */
+function takeOwnedEntries<K, V>(
+  map: Map<K, V>,
+  owner: object | undefined,
+  ownerOf: (value: V) => object | undefined
+): V[] {
+  const taken: V[] = [];
+  for (const [key, value] of map) {
+    if (owner !== undefined && ownerOf(value) !== owner) continue;
+    taken.push(value);
+    map.delete(key);
+  }
+  return taken;
+}
+
+/**
+ * Run the first writes into a FRESH geometry's element storage (just
+ * attached by {@link attachElementStorage}). If they throw — a texel
+ * writer's short-source guard — the geometry is disposed, which frees the
+ * texture its dispose listener owns, and the error is rethrown: the pair
+ * has no owner yet, and every caller keeps its mesh on the OLD geometry
+ * when a build throws. The one rule for the points, lines and gsplats
+ * non-pool builders.
+ */
+export function writeFreshElementStorage(
+  geometry: THREE.InstancedBufferGeometry,
+  write: () => void
+): void {
+  try {
+    write();
+  } catch (err) {
+    geometry.dispose();
+    throw err;
+  }
 }
 
 /**
@@ -793,7 +895,7 @@ export function attachElementStorage(
   // already clamps at acquire time.
   capacity = clampElementCapacity(capacity, layout);
   const sortedIndex = new THREE.InstancedBufferAttribute(new Uint32Array(capacity), 1);
-  sortedIndex.setUsage(THREE.DynamicDrawUsage);
+  sortedIndex.setUsage(sortedIndexUsage());
   geometry.setAttribute('aSortedIndex', sortedIndex);
   // Slot B is a DISTINCT buffer from the very first frame — never an
   // alias onto slot A, and never lazily materialised.
@@ -835,7 +937,7 @@ export function attachElementStorage(
   // gsplat's 68 B/element), which is the honest price of not depending
   // on a cache-invalidation path that does not exist.
   const sortedIndexB = new THREE.InstancedBufferAttribute(new Uint32Array(capacity), 1);
-  sortedIndexB.setUsage(THREE.DynamicDrawUsage);
+  sortedIndexB.setUsage(sortedIndexUsage());
   geometry.setAttribute('aSortedIndexB', sortedIndexB);
 
   const width = getElementTextureWidth(layout);
@@ -851,14 +953,20 @@ export function attachElementStorage(
   texture.minFilter = THREE.NearestFilter;
   texture.generateMipmaps = false;
   texture.flipY = false;
-  // The classic renderer invokes onUpdate after consuming an upload —
-  // the observable "flush happened" signal that ends a pending FULL
-  // upload (see pendingFullUpload). Wired once here; nothing else sets
-  // onUpdate on element textures. (No pending-full mark at attach: a
-  // fresh texture's GPU storage is zero-initialized and only written
-  // texels are ever read, so a ranged first upload is sufficient.)
-  texture.onUpdate = () => pendingFullUpload.delete(texture);
+  // Every renderer (classic, and three's common Textures for both WebGPU
+  // backends) invokes onUpdate after consuming an upload — the observable
+  // "flush happened" signal that ends a pending FULL upload (see
+  // pendingFullUpload) and records the first upload (see uploadedOnce).
+  // Wired once here; nothing else sets onUpdate on element textures. (No
+  // pending-full mark at attach: a fresh texture's GPU storage is
+  // zero-initialized and only written texels are ever read, so a ranged
+  // first upload is sufficient.)
+  texture.onUpdate = () => {
+    pendingFullUpload.delete(texture);
+    uploadedOnce.add(texture);
+  };
   texture.needsUpdate = true;
+  elementTextures.add(texture);
 
   (geometry.userData as ElementStorageUserData).elementTexture = texture;
   geometry.addEventListener('dispose', () => texture.dispose());
@@ -880,11 +988,153 @@ export function elementTexelCapacity(texture: THREE.DataTexture, floatsPerElemen
 }
 
 /**
+ * How many leading entries of an ordering buffer are known to hold the
+ * identity permutation. Order-independent (commutative) nodes write identity
+ * on every commit; without this, each commit rewrote and re-uploaded the whole
+ * prefix (4 B x count, about 6% of a playback commit's upload bytes, #2944)
+ * although the buffer already held it. Every write to an ordering buffer goes
+ * through this module, so each non-identity writer clears the entry.
+ */
+const identityPrefix = new WeakMap<THREE.BufferAttribute, number>();
+
+/** Forget that `attr` holds identity (a permutation is about to be written into it). */
+function clearIdentityPrefix(attr: THREE.BufferAttribute): void {
+  identityPrefix.delete(attr);
+}
+
+/**
+ * Held draws (append and grow commits of every instanced type): geometry -> the element count the draw
+ * is waiting to reach. While an entry exists, `instanceCount` is deliberately
+ * LOWER than the committed population — see
+ * {@link holdSortedIndexDrawForAppend}.
+ */
+const heldDrawTargets = new WeakMap<THREE.InstancedBufferGeometry, number>();
+
+function setInstanceDrawCount(geometry: THREE.InstancedBufferGeometry, count: number): void {
+  geometry.instanceCount = count;
+  // Force THREE to recompute `_maxInstanceCount` (same as the adapters).
+  delete (geometry as unknown as { _maxInstanceCount?: number })._maxInstanceCount;
+}
+
+/**
+ * Raise a held draw to `count` if `count` is exactly the population it waits
+ * for. Called by the two writers that install a COMPLETE ordering in the
+ * active buffer (the slot flip and the live write), so the grown population
+ * becomes visible on the very frame its own permutation does — never earlier.
+ */
+function raiseHeldDraw(geometry: THREE.InstancedBufferGeometry, count: number): void {
+  if (heldDrawTargets.get(geometry) !== count) return;
+  heldDrawTargets.delete(geometry);
+  setInstanceDrawCount(geometry, count);
+}
+
+/**
+ * Start (or continue) a HELD draw for an append commit that grew a node from
+ * `drawnCount` drawn elements to `count` committed ones. Returns the count the
+ * caller must draw now.
+ *
+ * WHY. An append grows the population while the displayed permutation still
+ * covers only the old one, and every fallback for the grown population is
+ * wrong until its sort lands: storage order draws the whole node unsorted
+ * (measured as 75-225 ms per rung above `syncSortMaxElements` on a hosted 1.1M
+ * splat ladder), and the old prefix plus a storage-order suffix is two
+ * independently ordered populations. Holding the draw at the previous
+ * population keeps every frame an EXACT back-to-front draw of SOME population:
+ * the active buffer's `[0, drawnCount)` is untouched, the suffix texels are
+ * uploaded but not yet drawn, and the grown population appears one sort
+ * round-trip later, already ordered (`raiseHeldDraw`).
+ *
+ * The depth-sort coordinator owns the other exit: when no ordering for the
+ * grown population will arrive (commutative mode, depth sort off, a failed or
+ * superseded-without-successor sort) it calls
+ * {@link releaseSortedIndexDrawHold}. A later non-append write (identity or
+ * repair) also ends the hold; its caller sets `instanceCount` itself.
+ *
+ * Declines — full identity over `count`, returning `count` — when nothing is
+ * drawn yet (holding would draw nothing), the drawn count is not below `count`
+ * (not a real growth: THREE's default `instanceCount` is `Infinity`), or the
+ * ordering pair is malformed.
+ */
+export function holdSortedIndexDrawForAppend(
+  geometry: THREE.InstancedBufferGeometry,
+  drawnCount: number,
+  count: number
+): number {
+  // Any in-flight apply describes an older generation of this node.
+  cancelSortedIndexOrderingApply(geometry);
+  const drawn = drawnCount;
+  if (!(drawn > 0) || drawn >= count || !sortedIndexBuffersUsable(geometry)) {
+    writeSortedIndexIdentity(geometry, count);
+    return count;
+  }
+  heldDrawTargets.set(geometry, count);
+  return drawn;
+}
+
+/**
+ * The GROWN-geometry sibling of {@link holdSortedIndexDrawForAppend}: a
+ * commit that extends the previous population but lands in a DIFFERENT
+ * geometry (the pool grew the node's buffers — every rung that doubles a
+ * ladder does). The new geometry's texels are fully written, so its first
+ * `seed.length` elements are the same elements the previous geometry drew
+ * (the commit layer proves this with the prefix lineage), and `seed` — the
+ * previous geometry's drawn permutation of `[0, seed.length)` — is an exact
+ * ordering of them. Writes identity over `count` (normalising slot 0, so the
+ * whole buffer stays a valid permutation), overlays `seed` on the prefix, and
+ * holds the draw there until the grown population's ordering lands.
+ *
+ * Declines exactly like {@link holdSortedIndexDrawForAppend}.
+ */
+export function holdSortedIndexDrawFromSeed(
+  geometry: THREE.InstancedBufferGeometry,
+  seed: Uint32Array,
+  count: number
+): number {
+  writeSortedIndexIdentity(geometry, count);
+  const attr = getActiveSortedIndexAttribute(geometry);
+  const drawn = seed.length;
+  if (!attr || !(drawn > 0) || drawn >= count || !sortedIndexBuffersUsable(geometry)) {
+    return count;
+  }
+  // The identity write above may have been a no-op (the buffer was already
+  // known identity), so the overlay owns its own memo reset and upload range.
+  clearIdentityPrefix(attr);
+  (attr.array as Uint32Array).set(seed, 0);
+  collapseSortedIndexRanges(attr, drawn);
+  heldDrawTargets.set(geometry, count);
+  return drawn;
+}
+
+/** The element count a held draw is waiting for, or `undefined` if none. */
+export function sortedIndexDrawHoldTarget(
+  geometry: THREE.InstancedBufferGeometry
+): number | undefined {
+  return heldDrawTargets.get(geometry);
+}
+
+/**
+ * End a held draw WITHOUT a sorted ordering for the grown population: rebuild
+ * the active ordering over the whole population from the drawn permutation
+ * ({@link repairSortedIndexForCount}: old order first, the appended suffix
+ * after it) and draw everything. The fallback for every path on which no
+ * ordering for the grown population will arrive. No-op when nothing is held.
+ *
+ * @returns true when a hold ended (the drawn population changed), so the
+ *   caller can wake a frame under render-on-change.
+ */
+export function releaseSortedIndexDrawHold(geometry: THREE.InstancedBufferGeometry): boolean {
+  const target = heldDrawTargets.get(geometry);
+  if (target === undefined) return false;
+  repairSortedIndexForCount(geometry, geometry.instanceCount, target);
+  setInstanceDrawCount(geometry, target);
+  return true;
+}
+
+/**
  * Fill `aSortedIndex[0..count)` with identity ordering and register a
  * single collapsed prefix update range. Ranges accumulate across
- * commits while a mesh is not drawn and the WebGPU backends replay
- * them verbatim (no flush-time merge), so every write collapses the
- * pending set to one `[0, max-end)` range.
+ * commits while a mesh is not drawn (no backend merges them at flush),
+ * so every write collapses the pending set to one `[0, max-end)` range.
  *
  * Also re-homes the geometry on SLOT 0, which is what makes the split
  * ownership of the swap safe. The slot lives on the geometry (so it
@@ -898,10 +1148,8 @@ export function elementTexelCapacity(texture: THREE.DataTexture, floatsPerElemen
  * precisely the fresh-start signal, so normalising here means a default
  * uniform is always correct and untracked nodes need no sync at all.
  *
- * The Points and Lines append writers deliberately differ: their adapters
- * call {@link writeSortedIndexIdentityRange} to preserve the live prefix
- * permutation. GSplat appends call this full writer instead, trading that
- * prefix prior for one coherent storage-order fallback over the grown node.
+ * Appends do not call it: they HOLD the draw at the previous population until
+ * the grown one is sorted ({@link holdSortedIndexDrawForAppend}).
  */
 export function writeSortedIndexIdentity(
   geometry: THREE.InstancedBufferGeometry,
@@ -911,6 +1159,8 @@ export function writeSortedIndexIdentity(
   // its remaining slices belong to the OLD element population and
   // would scribble a stale permutation over the identity just written.
   cancelSortedIndexOrderingApply(geometry);
+  // A full write ends any held draw; the caller sets `instanceCount`.
+  heldDrawTargets.delete(geometry);
   // Normalise to slot 0 BEFORE picking the target, so identity always
   // lands in the buffer a default-valued selector uniform reads.
   setSortedIndexSlot(geometry, 0);
@@ -918,38 +1168,12 @@ export function writeSortedIndexIdentity(
   if (!attr) return;
   const arr = attr.array as Uint32Array;
   const n = Math.min(count, arr.length);
-  for (let i = 0; i < n; i++) arr[i] = i;
-  collapseSortedIndexRanges(attr, n);
-}
-
-/**
- * Extend `aSortedIndex` with identity ordering for the appended suffix
- * `[from, count)`, preserving the existing `[0, from)` permutation
- * (depth-sorting Phase 4 Stage 2, the append fast path). Its two owners are
- * `points-adapter.ts` and `lines-adapter.ts`; GSplat appends instead use
- * {@link writeSortedIndexIdentity} so the grown node has one coherent
- * storage-order fallback. The collapse still uploads `[0, count)` —
- * `aSortedIndex` is a tiny 4-byte/instance buffer, so the GPU upload is the
- * same size either way; the expensive element-texture upload is the one
- * Stage 2 restricts to the suffix.
- */
-export function writeSortedIndexIdentityRange(
-  geometry: THREE.InstancedBufferGeometry,
-  from: number,
-  count: number
-): void {
-  // Same supersede rule as writeSortedIndexIdentity: the append commit
-  // invalidates the ordering an in-flight chunked apply was streaming
-  // (the coordinator re-sorts the grown population on a later frame).
-  cancelSortedIndexOrderingApply(geometry);
-  // Identity targets the ACTIVE buffer: it is a complete permutation by
-  // construction, so writing it live is safe and needs no flip.
-  const attr = getActiveSortedIndexAttribute(geometry);
-  if (!attr) return;
-  const arr = attr.array as Uint32Array;
-  const n = Math.min(count, arr.length);
-  for (let i = Math.max(0, from); i < n; i++) arr[i] = i;
-  collapseSortedIndexRanges(attr, n);
+  const known = identityPrefix.get(attr) ?? 0;
+  // Already identity over [0, n): nothing to write, nothing to upload.
+  if (known >= n) return;
+  for (let i = known; i < n; i++) arr[i] = i;
+  identityPrefix.set(attr, n);
+  collapseSortedIndexRanges(attr, n, known);
 }
 
 /**
@@ -965,8 +1189,8 @@ export function writeSortedIndexIdentityRange(
  *
  * It is dead weight when the ordering was computed synchronously inside the
  * commit, because there is no partial state to hide — the permutation is
- * complete before the first write. Writing it live is then safe for exactly
- * the reason {@link writeSortedIndexIdentityRange} gives for the same choice,
+ * complete before the first write. Writing a complete permutation into the
+ * active buffer is safe by construction (the identity writers do the same),
  * and it is what removes the unsorted frame rather than merely improving it.
  *
  * The two rejections mirror `writeSortedIndexOrdering`: a TRUNCATED ordering
@@ -988,8 +1212,10 @@ export function writeSortedIndexOrderingLive(
   // Supersedes any in-flight chunked apply: its remaining slices belong to an
   // older sort of this same population and would land on top of this one.
   cancelSortedIndexOrderingApply(geometry);
+  clearIdentityPrefix(attr);
   arr.set(ordering.subarray(0, count), 0);
   collapseSortedIndexRanges(attr, count);
+  raiseHeldDraw(geometry, count);
   return count;
 }
 
@@ -1058,20 +1284,45 @@ export function repairSortedIndexForCount(
   // population invalidates the ordering an in-flight chunked apply was
   // streaming for the previous one.
   cancelSortedIndexOrderingApply(geometry);
+  // A repaired full population ends any held draw; the caller sets
+  // `instanceCount` (`releaseSortedIndexDrawHold` for the held case).
+  heldDrawTargets.delete(geometry);
   const attr = getActiveSortedIndexAttribute(geometry);
   if (!attr) return;
   const arr = attr.array as Uint32Array;
   const n = Math.min(count, arr.length);
   if (n <= 0) return;
-
-  if (repairSeenScratch.length < n) repairSeenScratch = new Uint8Array(n);
-  const seen = repairSeenScratch;
-  seen.fill(0, 0, n);
-
-  // Pass 1 — keep the surviving prefix in its existing relative order.
   // Read past `n` is deliberate on a shrink: the dropped values are exactly
   // the ones at or above the new count.
   const readEnd = Math.min(Math.max(prevCount, 0), arr.length);
+  const identityKnown = identityPrefix.get(attr) ?? 0;
+  if (identityKnown >= Math.min(readEnd, n)) {
+    // Repairing an identity prefix yields identity (kept in order, missing
+    // values appended ascending), so only the entries past the known prefix
+    // are written and uploaded — the cost of an identity append. Every
+    // order-independent append takes this path: its held draw is released
+    // inside the same commit (`releaseSortedIndexDrawHold`).
+    const from = Math.min(identityKnown, n);
+    for (let i = from; i < n; i++) arr[i] = i;
+    identityPrefix.set(attr, Math.max(identityKnown, n));
+    if (from < n) collapseSortedIndexRanges(attr, n, from);
+    return;
+  }
+  repairPermutationInPlace(arr, readEnd, n);
+  clearIdentityPrefix(attr);
+  collapseSortedIndexRanges(attr, n);
+}
+
+/**
+ * The walk behind {@link repairSortedIndexForCount}: keep `arr[0, readEnd)`'s
+ * values below `n` in their existing relative order, then append whatever is
+ * still missing in ascending order, leaving a permutation of `[0, n)`.
+ */
+function repairPermutationInPlace(arr: Uint32Array, readEnd: number, n: number): void {
+  if (repairSeenScratch.length < n) repairSeenScratch = new Uint8Array(n);
+  const seen = repairSeenScratch;
+  seen.fill(0, 0, n);
+  // Pass 1 — keep the surviving prefix in its existing relative order.
   let write = 0;
   for (let i = 0; i < readEnd && write < n; i++) {
     const v = arr[i];
@@ -1087,8 +1338,6 @@ export function repairSortedIndexForCount(
   for (let v = 0; v < n && write < n; v++) {
     if (seen[v] === 0) arr[write++] = v;
   }
-
-  collapseSortedIndexRanges(attr, n);
 }
 
 /**
@@ -1201,13 +1450,19 @@ export function writeSortedIndexOrdering(
  * fresh entries plus any still-pending ranges (see the identity writer's
  * doc comment for why ranges must never accumulate).
  */
-function collapseSortedIndexRanges(attr: THREE.InstancedBufferAttribute, n: number): void {
+function collapseSortedIndexRanges(
+  attr: THREE.InstancedBufferAttribute,
+  n: number,
+  from = 0
+): void {
+  let rangeStart = from;
   let rangeEnd = n;
   for (const range of attr.updateRanges) {
     const end = range.start + range.count;
+    if (range.start < rangeStart) rangeStart = range.start;
     if (end > rangeEnd) rangeEnd = end;
   }
   attr.clearUpdateRanges();
-  attr.addUpdateRange(0, rangeEnd);
+  attr.addUpdateRange(rangeStart, rangeEnd - rangeStart);
   attr.needsUpdate = true;
 }

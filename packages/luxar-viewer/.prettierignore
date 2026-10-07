@@ -13,6 +13,8 @@ coverage/
 docs/
 
 # Test and Playwright output
+src/tests/unit/data/codecs/golden-chunks/
+src/tests/unit/scene/fixtures/lod-metric-parity.json
 playwright-report/
 test-results/
 test-results-perf/

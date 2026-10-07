@@ -22,6 +22,7 @@ import {
   buildLineTSLNodesFromUniforms,
 } from '../../../../rendering/materials/line/shader-tsl';
 import { LINE_PICK_SOURCE } from '../../../../rendering/picking/line/shaders';
+import { pickVisibilityUniforms } from '../../../../rendering/picking/_shared/visibility-uniforms';
 import {
   linePickWebGPUFactory,
   buildLinePickTSLNodesFromUniforms,
@@ -37,7 +38,13 @@ import {
   getActiveSortedIndexAttribute,
 } from '../../../../rendering/element-storage';
 import type { RegistryEntry } from './types';
-import { buildBehindCamera, buildColormapTexture } from './shared';
+import {
+  buildBehindCamera,
+  buildColormapTexture,
+  buildCubeFaceCamera,
+  buildCubeFaceEquivalentCamera,
+  buildOrthoCamera,
+} from './shared';
 
 /**
  * Single-segment texel source shared by the mesh builder and the
@@ -60,6 +67,8 @@ interface LineFixtureStyle {
   readonly endSharpness?: number;
   readonly startJointCode?: number;
   readonly endJointCode?: number;
+  /** World length of the segment (texel slot); defaults to 1.0. */
+  readonly segmentLength?: number;
 }
 
 function lineTexelSource(
@@ -82,7 +91,7 @@ function lineTexelSource(
     // beta = 2^(6s - 2). 0.5 -> beta=2 (a true Gaussian, the default).
     startSharpness: new Float32Array([style.startSharpness ?? 0.5]),
     endSharpness: new Float32Array([style.endSharpness ?? 0.5]),
-    segmentLengths: new Float32Array([1.0]),
+    segmentLengths: new Float32Array([style.segmentLength ?? 1.0]),
     startJointCode: new Float32Array([style.startJointCode ?? 0]),
     endJointCode: new Float32Array([style.endJointCode ?? 0]),
     startScalars: scalars ? new Float32Array([scalars[0]]) : undefined,
@@ -388,17 +397,13 @@ function buildSortedPermutedLinesMesh(material: THREE.Material): THREE.Object3D 
 
 function buildVisualLineUniforms(
   texture: THREE.DataTexture,
-  isOrtho: boolean,
   nearCull = 0.01
 ): Record<string, THREE.IUniform> {
   return {
     uLineTex: { value: texture },
     uResolution: { value: new THREE.Vector2(64, 64) },
-    uIsOrtho: { value: isOrtho ? 1 : 0 },
     uNearCull: { value: nearCull },
     uMaxLinePixelWidth: { value: 32.0 },
-    uPerspectiveLineScale: { value: isOrtho ? 1.0 : 64.0 },
-    uOrthoLineScale: { value: isOrtho ? 64.0 : 1.0 },
     uOpacity: { value: 1.0 },
     uInvGamma: { value: 1.0 },
     uIntensity: { value: 1.0 },
@@ -408,28 +413,22 @@ function buildVisualLineUniforms(
 
 function buildPickLineUniforms(
   texture: THREE.DataTexture,
-  isOrtho: boolean,
   nearCull = 0.01
 ): Record<string, THREE.IUniform> {
   return {
     uLineTex: { value: texture },
     uResolution: { value: new THREE.Vector2(64, 64) },
-    uIsOrtho: { value: isOrtho ? 1 : 0 },
     uNodeId: { value: 42 },
+    // Synced from the visual material in production; GLSL reads 0 when absent.
+    ...pickVisibilityUniforms(),
     uNearCull: { value: nearCull },
     uMaxLinePixelWidth: { value: 32.0 },
-    uPerspectiveLineScale: { value: isOrtho ? 1.0 : 64.0 },
-    uOrthoLineScale: { value: isOrtho ? 64.0 : 1.0 },
   };
 }
 
-function buildVisualLineTSLMaterial(
-  uniforms: Record<string, THREE.IUniform>,
-  isOrtho: boolean
-): THREE.Material {
+function buildVisualLineTSLMaterial(uniforms: Record<string, THREE.IUniform>): THREE.Material {
   const material = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
     gammaOne: true,
-    isOrtho,
   }) as unknown as THREE.Material;
   material.transparent = false;
   material.blending = THREE.NoBlending;
@@ -471,7 +470,7 @@ const REMAP_STYLE: LineFixtureStyle = {
  *   the miter limit) and the axial reach is 6.4 * sqrt(0.25) = 3.2 px against a
  *   half-segment of ~10.7 px — comfortably inside the overshoot guard, so the
  *   joint IS mitred rather than falling back.
- *   width 0.1 x uOrthoLineScale 64 = 6.4 px half-width, clear of the 2 px
+ *   width 0.1 x line scale 64 = 6.4 px half-width, clear of the 2 px
  *   rendered-width gate; a thinner line would skip the block and the fixture
  *   would silently go vacuous again.
  *
@@ -523,7 +522,7 @@ function buildJoinTexelSource(): LineTexelSource {
  *   AND clamp(-0.6, 0, 1) = 0 kept the soft endpoint cap, so the joint rendered
  *   DIMMER than with the join disabled. That inversion is what the parity spec
  *   asserts against.
- *   Widths are unchanged at 0.1 x uOrthoLineScale 64 = 6.4 px half-width, clear
+ *   Widths are unchanged at 0.1 x line scale 64 = 6.4 px half-width, clear
  *   of the 2 px rendered-HALF-width gate.
  *
  * Codes follow compute_joint_codes: seg 0's END meets seg 1's END, so
@@ -600,7 +599,7 @@ function perspectivePixelPos(px: number, py: number, depth: number): [number, nu
  *   turn = 0 (a right angle): grow = sqrt(2) is inside the miter limit but the
  *   axial reach 6.4 * sqrt(2 - 1) = 6.4 px exceeds 0.5 * min(10, 10) = 5 px, so
  *   both sides decline and derive cap = clamp(0, 0, 1) = 0.
- *   Widths follow the perspective branch, width * uPerspectiveLineScale / depth
+ *   Widths follow the perspective branch, width * lineScale / depth
  *   with the harness's scale of 64: seg 0 is 0.028 -> 1.79 px at t = 0 and
  *   0.1 -> 6.4 px at t = 1; seg 1 is 0.1 -> 6.4 px and 0.15 -> 6.4 px, i.e.
  *   constant on screen. Only the two 6.4 px ends name a partner (see above).
@@ -749,7 +748,7 @@ function buildFoldJoinTexelSource(width: number): LineTexelSource {
  * large, local and worth asserting on. See the dedicated divergent-pixel test
  * in `tsl-shader-parity.spec.ts`, which the shared mean cannot replace.
  *
- * Widths, and why each number matters (ortho, uOrthoLineScale 64, radius =
+ * Widths, and why each number matters (ortho, line scale 64, radius =
  * width x 64 x CAPSULE_RADIUS_PER_QUAD_HALFWIDTH = width x 42.18 px):
  *   Shared vertex 0.20 -> 8.44 px; both OUTER ends 0.06 -> 2.53 px. A fat
  *   vertex between two thin neighbours is precisely the case the deficit rule
@@ -839,7 +838,7 @@ function buildDeficitPacketJoinTexelSource(): LineTexelSource {
  * Geometry, every number derived at the harness's ortho mapping — the default
  * `OrthographicCamera(-1, 1, 1, -1)` over a 64x64 target is 32 px per world
  * unit, and the capsule pixel radius is
- * `width x uOrthoLineScale(64) x CAPSULE_RADIUS_PER_QUAD_HALFWIDTH(0.6590102)`
+ * `width x lineScale(64) x CAPSULE_RADIUS_PER_QUAD_HALFWIDTH(0.6590102)`
  * (offsets below are px from the viewport centre, where the joint sits):
  *
  *   seg 0 (the SHORT partner)  (0, 0) -> 0.08 x (cos60, sin60)   2.56 px long,
@@ -964,22 +963,19 @@ function buildJoinMesh(src: LineTexelSource, material: THREE.Material): THREE.Ob
 /** The two-segment joint geometry a {@link joinEntry} pair renders. */
 interface JoinFixture {
   readonly texels: () => LineTexelSource;
-  readonly isOrtho: boolean;
   readonly buildCamera?: () => THREE.Camera;
   /** `uNearCull`; defaults to `buildVisualLineUniforms`'s 0.01. */
   readonly nearCull?: number;
 }
 
-const END_TO_START_JOIN: JoinFixture = { texels: buildJoinTexelSource, isOrtho: true };
-const SAME_PARITY_JOIN: JoinFixture = { texels: buildSameParityJoinTexelSource, isOrtho: true };
+const END_TO_START_JOIN: JoinFixture = { texels: buildJoinTexelSource };
+const SAME_PARITY_JOIN: JoinFixture = { texels: buildSameParityJoinTexelSource };
 const TAPER_JOIN: JoinFixture = {
   texels: buildTaperJoinTexelSource,
-  isOrtho: false,
   buildCamera: buildBehindCamera,
 };
 const NEAR_PLANE_JOIN: JoinFixture = {
   texels: buildNearPlaneJoinTexelSource,
-  isOrtho: false,
   buildCamera: buildBehindCamera,
   nearCull: NEAR_PLANE_CULL,
 };
@@ -1050,11 +1046,7 @@ function joinEntry(fixture: JoinFixture, join: number): RegistryEntry {
   return {
     source: LINE_SOURCE,
     buildUniforms: () => ({
-      ...buildVisualLineUniforms(
-        buildJoinDataTexture(fixture.texels()),
-        fixture.isOrtho,
-        fixture.nearCull
-      ),
+      ...buildVisualLineUniforms(buildJoinDataTexture(fixture.texels()), fixture.nearCull),
       uLineJoin: { value: join },
     }),
     buildDefines: () => ({ LUXAR_GAMMA_ONE: '', LUXAR_MAX_RGB_CONTRIBUTION: '' }),
@@ -1062,7 +1054,6 @@ function joinEntry(fixture: JoinFixture, join: number): RegistryEntry {
       const material = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'max',
         gammaOne: true,
-        isOrtho: fixture.isOrtho,
         join: join > 0.5 ? 'miter' : 'none',
       }) as unknown as THREE.Material;
       material.transparent = false;
@@ -1083,8 +1074,7 @@ function jointCodeEntry(jointCode: number): RegistryEntry {
     source: LINE_SOURCE,
     buildUniforms: () =>
       buildVisualLineUniforms(
-        buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], undefined, undefined, style),
-        true
+        buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], undefined, undefined, style)
       ),
     // Max-mode premultiplies RGB by the cap/profile intensity, making the
     // suppression value observable in readback even with NoBlending (normal
@@ -1095,7 +1085,6 @@ function jointCodeEntry(jointCode: number): RegistryEntry {
       const material = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'max',
         gammaOne: true,
-        isOrtho: true,
       }) as unknown as THREE.Material;
       material.transparent = false;
       material.blending = THREE.NoBlending;
@@ -1111,7 +1100,90 @@ function jointCodeEntry(jointCode: number): RegistryEntry {
  * test name. Each entry carries the GLSL source and a `buildUniforms` factory;
  * merged into `SHADER_REGISTRY` and driven by the parity/codegen specs.
  */
+
+/** A slanted segment 3 units down +X, for the cube-capture face cases. */
+const CUBE_LINE_START: readonly [number, number, number] = [3, -0.3, 0.2];
+const CUBE_LINE_END: readonly [number, number, number] = [3, 0.3, -0.25];
+/** Wide enough (~5 px at 3 units) that a clamped-to-floor width would be obvious. */
+const CUBE_LINE_STYLE: LineFixtureStyle = { startWidth: 0.5, endWidth: 0.5 };
+
+/**
+ * A perspective line seen through a CubeCamera face (fov −90, a flipped
+ * projection) or its 180°-rolled +90° equivalent: the same image, because the
+ * pixel-width scale is resY·|P11|, never negative.
+ */
+function buildCubeCaptureLineEntry(buildCamera: () => THREE.Camera): RegistryEntry {
+  return {
+    source: LINE_SOURCE,
+    buildUniforms: () =>
+      buildVisualLineUniforms(
+        buildLineDataTexture(CUBE_LINE_START, CUBE_LINE_END, undefined, undefined, CUBE_LINE_STYLE)
+      ),
+    buildTSLMaterial: (uniforms) => buildVisualLineTSLMaterial(uniforms),
+    buildMesh: (material) =>
+      buildLineInstancedMesh(
+        material,
+        CUBE_LINE_START,
+        CUBE_LINE_END,
+        undefined,
+        undefined,
+        CUBE_LINE_STYLE
+      ),
+    buildCamera,
+  };
+}
+
+/** Scale of the nanometre case: every length, width included, times 1e-5. */
+const TINY = 1e-5;
+
+/**
+ * The `line` fixture shrunk by {@link TINY} in every length (segment, width,
+ * segment length) and seen through an ortho frustum shrunk by the same factor
+ * (height 2e-5): under an orthographic projection that is the SAME image. The
+ * historical CPU scale clamped the frustum height to 1e-4 before dividing, so
+ * this line rendered 5x narrower than its unit-scale twin.
+ */
+const TINY_ORTHO_LINE: RegistryEntry = {
+  source: LINE_SOURCE,
+  buildUniforms: () =>
+    buildVisualLineUniforms(
+      buildLineDataTexture([-0.5 * TINY, 0, 0], [0.5 * TINY, 0, 0], undefined, undefined, {
+        startWidth: 0.1 * TINY,
+        endWidth: 0.1 * TINY,
+        segmentLength: TINY,
+      })
+    ),
+  buildTSLMaterial: (uniforms) => buildVisualLineTSLMaterial(uniforms),
+  buildMesh: (material) =>
+    buildLineInstancedMesh(
+      material,
+      [-0.5 * TINY, 0, 0],
+      [0.5 * TINY, 0, 0],
+      undefined,
+      undefined,
+      {
+        startWidth: 0.1 * TINY,
+        endWidth: 0.1 * TINY,
+        segmentLength: TINY,
+      }
+    ),
+  buildCamera: () => buildOrthoCamera(2 * TINY),
+};
+
+/** The unit-scale twin of {@link TINY_ORTHO_LINE}, through the same builders. */
+const UNIT_ORTHO_LINE: RegistryEntry = {
+  source: LINE_SOURCE,
+  buildUniforms: () => buildVisualLineUniforms(buildLineDataTexture()),
+  buildTSLMaterial: (uniforms) => buildVisualLineTSLMaterial(uniforms),
+  buildMesh: (material) => buildLineInstancedMesh(material),
+  buildCamera: () => buildOrthoCamera(2),
+};
+
 export const LINE_SHADERS: Record<string, RegistryEntry> = {
+  'line-cube-face': buildCubeCaptureLineEntry(buildCubeFaceCamera),
+  'line-cube-face-equivalent': buildCubeCaptureLineEntry(buildCubeFaceEquivalentCamera),
+  'line-tiny-ortho': TINY_ORTHO_LINE,
+  'line-unit-ortho': UNIT_ORTHO_LINE,
   // Line parity: instanced quad line with width, sharpness, GOG.
   // Ortho camera so screen-space conversion is deterministic.
   line: {
@@ -1119,23 +1191,20 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture() },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      // Pre-baked pixel-width scales for this ortho config:
-      //   uOrthoLineScale = 2 * 64 / 2 = 64 (2*resY/frustumHeight)
-      //   uPerspectiveLineScale is unused (uIsOrtho=1) — benign 1.0.
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
+      // The pixel-width scale is read from the camera's projection:
+      //   resY * |P11| = 64 * 2 / 2 = 64 (2*resY/frustumHeight)
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
       uOffset: { value: 0.0 },
     }),
     buildTSLMaterial: (uniforms) => {
-      const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
-        isOrtho: true,
-      }) as unknown as THREE.Material;
+      const m = lineWebGPUFactory(
+        buildLineTSLNodesFromUniforms(uniforms, {}),
+        {}
+      ) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
       return m;
@@ -1202,20 +1271,18 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTextureMultiRow() },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
       uOffset: { value: 0.0 },
     }),
     buildTSLMaterial: (uniforms) => {
-      const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
-        isOrtho: true,
-      }) as unknown as THREE.Material;
+      const m = lineWebGPUFactory(
+        buildLineTSLNodesFromUniforms(uniforms, {}),
+        {}
+      ) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
       return m;
@@ -1233,11 +1300,8 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture() },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 },
       uIntensity: { value: 1.0 },
@@ -1247,7 +1311,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildTSLMaterial: (uniforms) => {
       const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         gammaOne: true,
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1265,11 +1328,8 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture() },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 }, // gamma kept slow path; only no-GOG is exercised
       uIntensity: { value: 1.0 },
@@ -1279,7 +1339,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildTSLMaterial: (uniforms) => {
       const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         noGOG: true,
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1299,11 +1358,8 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture() },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
@@ -1313,7 +1369,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildTSLMaterial: (uniforms) => {
       const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'max',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1330,11 +1385,8 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture() },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 0.02 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
@@ -1344,7 +1396,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildTSLMaterial: (uniforms) => {
       const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'opaque',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1370,11 +1421,8 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
         value: buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], undefined, VOLUMETRIC_LINE_ALPHAS),
       },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 0.7 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
@@ -1386,7 +1434,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildTSLMaterial: (uniforms) => {
       const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'volumetric',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1411,11 +1458,8 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
         value: buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], [0.2, 0.8], VOLUMETRIC_LINE_ALPHAS),
       },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 0.7 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
@@ -1431,7 +1475,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
       const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, { useColormap: true }), {
         useColormap: true,
         blendingMode: 'volumetric',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1449,11 +1492,8 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture() },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.5 },
@@ -1466,7 +1506,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildTSLMaterial: (uniforms) => {
       const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, { useColormap: true }), {
         useColormap: true,
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1482,18 +1521,20 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture() },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNodeId: { value: 42 },
+      // Synced from the visual material in production; GLSL reads 0 when absent.
+      ...pickVisibilityUniforms(),
+      // Synced from the visual material in production; GLSL reads 0 when absent.
+      ...pickVisibilityUniforms(),
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
       // Pre-baked pixel-width scales (mirror `line` parity entry).
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
     }),
     buildTSLMaterial: (uniforms) =>
-      linePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: true,
-      }) as unknown as THREE.Material,
+      linePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: buildLineInstancedMesh,
   },
   // B9c: line behind-camera parity (was point-only coverage). Both
@@ -1504,20 +1545,18 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture([-0.5, 0, 3], [0.5, 0, 3]) },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 0 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 64.0 },
-      uOrthoLineScale: { value: 1.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
       uOffset: { value: 0.0 },
     }),
     buildTSLMaterial: (uniforms) => {
-      const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
-        isOrtho: false,
-      }) as unknown as THREE.Material;
+      const m = lineWebGPUFactory(
+        buildLineTSLNodesFromUniforms(uniforms, {}),
+        {}
+      ) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
       return m;
@@ -1530,17 +1569,19 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture([-0.5, 0, 3], [0.5, 0, 3]) },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 0 },
       uNodeId: { value: 42 },
+      // Synced from the visual material in production; GLSL reads 0 when absent.
+      ...pickVisibilityUniforms(),
+      // Synced from the visual material in production; GLSL reads 0 when absent.
+      ...pickVisibilityUniforms(),
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 64.0 },
-      uOrthoLineScale: { value: 1.0 },
     }),
     buildTSLMaterial: (uniforms) =>
-      linePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: false,
-      }) as unknown as THREE.Material,
+      linePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: (m) => buildLineInstancedMesh(m, [-0.5, 0, 3], [0.5, 0, 3]),
     buildCamera: buildBehindCamera,
   },
@@ -1550,20 +1591,21 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   'line-on-near-plane': {
     source: LINE_SOURCE,
     buildUniforms: () =>
-      buildVisualLineUniforms(buildLineDataTexture([-0.2, 0, 0.5], [0.2, 0, 0]), false, 0.5),
+      buildVisualLineUniforms(buildLineDataTexture([-0.2, 0, 0.5], [0.2, 0, 0]), 0.5),
     buildDefines: () => ({ LUXAR_GAMMA_ONE: '' }),
-    buildTSLMaterial: (uniforms) => buildVisualLineTSLMaterial(uniforms, false),
+    buildTSLMaterial: (uniforms) => buildVisualLineTSLMaterial(uniforms),
     buildMesh: (material) => buildLineInstancedMesh(material, [-0.2, 0, 0.5], [0.2, 0, 0]),
     buildCamera: buildBehindCamera,
   },
   'line-pick-on-near-plane': {
     source: LINE_PICK_SOURCE,
     buildUniforms: () =>
-      buildPickLineUniforms(buildLineDataTexture([-0.2, 0, 0.5], [0.2, 0, 0]), false, 0.5),
+      buildPickLineUniforms(buildLineDataTexture([-0.2, 0, 0.5], [0.2, 0, 0]), 0.5),
     buildTSLMaterial: (uniforms) =>
-      linePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: false,
-      }) as unknown as THREE.Material,
+      linePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: (material) => buildLineInstancedMesh(material, [-0.2, 0, 0.5], [0.2, 0, 0]),
     buildCamera: buildBehindCamera,
   },
@@ -1577,11 +1619,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () =>
       buildVisualLineUniforms(
         buildLineDataTexture([0.15, 0, 1.5], [0.15, 0, 0], undefined, undefined, REMAP_STYLE),
-        false,
         0.5
       ),
     buildDefines: () => ({ LUXAR_GAMMA_ONE: '' }),
-    buildTSLMaterial: (uniforms) => buildVisualLineTSLMaterial(uniforms, false),
+    buildTSLMaterial: (uniforms) => buildVisualLineTSLMaterial(uniforms),
     buildMesh: (material) =>
       buildLineInstancedMesh(
         material,
@@ -1598,13 +1639,13 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () =>
       buildPickLineUniforms(
         buildLineDataTexture([0.15, 0, 1.5], [0.15, 0, 0], undefined, undefined, REMAP_STYLE),
-        false,
         0.5
       ),
     buildTSLMaterial: (uniforms) =>
-      linePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: false,
-      }) as unknown as THREE.Material,
+      linePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: (material) =>
       buildLineInstancedMesh(
         material,
@@ -1632,20 +1673,18 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture([0.15, 0, 1.5], [0.15, 0, 0]) },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 0 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 64.0 },
-      uOrthoLineScale: { value: 1.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
       uOffset: { value: 0.0 },
     }),
     buildTSLMaterial: (uniforms) => {
-      const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
-        isOrtho: false,
-      }) as unknown as THREE.Material;
+      const m = lineWebGPUFactory(
+        buildLineTSLNodesFromUniforms(uniforms, {}),
+        {}
+      ) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
       return m;
@@ -1670,20 +1709,18 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture([0.15, 0, 0], [0.15, 0, 1.5]) },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 0 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 64.0 },
-      uOrthoLineScale: { value: 1.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
       uOffset: { value: 0.0 },
     }),
     buildTSLMaterial: (uniforms) => {
-      const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
-        isOrtho: false,
-      }) as unknown as THREE.Material;
+      const m = lineWebGPUFactory(
+        buildLineTSLNodesFromUniforms(uniforms, {}),
+        {}
+      ) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
       return m;
@@ -1704,17 +1741,19 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture([0.15, 0, 1.5], [0.15, 0, 0]) },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 0 },
       uNodeId: { value: 42 },
+      // Synced from the visual material in production; GLSL reads 0 when absent.
+      ...pickVisibilityUniforms(),
+      // Synced from the visual material in production; GLSL reads 0 when absent.
+      ...pickVisibilityUniforms(),
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 64.0 },
-      uOrthoLineScale: { value: 1.0 },
     }),
     buildTSLMaterial: (uniforms) =>
-      linePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: false,
-      }) as unknown as THREE.Material,
+      linePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: (m) => buildLineInstancedMesh(m, [0.15, 0, 1.5], [0.15, 0, 0]),
     buildCamera: buildBehindCamera,
   },
@@ -1735,17 +1774,19 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture([0.15, 0, 0], [0.15, 0, 1.5]) },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 0 },
       uNodeId: { value: 42 },
+      // Synced from the visual material in production; GLSL reads 0 when absent.
+      ...pickVisibilityUniforms(),
+      // Synced from the visual material in production; GLSL reads 0 when absent.
+      ...pickVisibilityUniforms(),
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 64.0 },
-      uOrthoLineScale: { value: 1.0 },
     }),
     buildTSLMaterial: (uniforms) =>
-      linePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: false,
-      }) as unknown as THREE.Material,
+      linePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: (m) => buildLineInstancedMesh(m, [0.15, 0, 0], [0.15, 0, 1.5]),
     buildCamera: buildBehindCamera,
   },
@@ -1759,20 +1800,18 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildLineDataTexture([-0.5, 0, 0.85], [0.5, 0, 0.85]) },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.5 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
       uOffset: { value: 0.0 },
     }),
     buildTSLMaterial: (uniforms) => {
-      const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
-        isOrtho: true,
-      }) as unknown as THREE.Material;
+      const m = lineWebGPUFactory(
+        buildLineTSLNodesFromUniforms(uniforms, {}),
+        {}
+      ) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
       return m;
@@ -1795,20 +1834,18 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildUniforms: () => ({
       uLineTex: { value: buildSortedPermutedLineTexture() },
       uResolution: { value: new THREE.Vector2(64, 64) },
-      uIsOrtho: { value: 1 },
       uNearCull: { value: 0.01 },
       uMaxLinePixelWidth: { value: 32.0 },
-      uPerspectiveLineScale: { value: 1.0 },
-      uOrthoLineScale: { value: 64.0 },
       uOpacity: { value: 1.0 },
       uInvGamma: { value: 1.0 / 2.2 },
       uIntensity: { value: 1.0 },
       uOffset: { value: 0.0 },
     }),
     buildTSLMaterial: (uniforms) => {
-      const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
-        isOrtho: true,
-      }) as unknown as THREE.Material;
+      const m = lineWebGPUFactory(
+        buildLineTSLNodesFromUniforms(uniforms, {}),
+        {}
+      ) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
       return m;
@@ -1828,11 +1865,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   // ============================================================
   'line-capsule-sideon': {
     source: CAPSULE_LINE_SOURCE,
-    buildUniforms: () => buildVisualLineUniforms(buildLineDataTexture(), true),
+    buildUniforms: () => buildVisualLineUniforms(buildLineDataTexture()),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1844,12 +1880,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   // reason to exist. Must render a finite radial disc on both backends.
   'line-capsule-endon-ortho': {
     source: CAPSULE_LINE_SOURCE,
-    buildUniforms: () =>
-      buildVisualLineUniforms(buildLineDataTexture([0, 0, 0.3], [0, 0, -0.5]), true),
+    buildUniforms: () => buildVisualLineUniforms(buildLineDataTexture([0, 0, 0.3], [0, 0, -0.5])),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1859,12 +1893,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   },
   'line-capsule-endon-persp': {
     source: CAPSULE_LINE_SOURCE,
-    buildUniforms: () =>
-      buildVisualLineUniforms(buildLineDataTexture([0, 0, 0.5], [0, 0, -0.3]), false),
+    buildUniforms: () => buildVisualLineUniforms(buildLineDataTexture([0, 0, 0.5], [0, 0, -0.3])),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: false,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1877,12 +1909,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   // two capsules must tile the bend seamlessly under additive.
   'line-capsule-joint': {
     source: CAPSULE_LINE_SOURCE,
-    buildUniforms: () =>
-      buildVisualLineUniforms(buildJoinDataTexture(buildJoinTexelSource()), true),
+    buildUniforms: () => buildVisualLineUniforms(buildJoinDataTexture(buildJoinTexelSource())),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1895,11 +1925,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   'line-capsule-fold': {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () =>
-      buildVisualLineUniforms(buildJoinDataTexture(buildFoldJoinTexelSource(0.3)), true),
+      buildVisualLineUniforms(buildJoinDataTexture(buildFoldJoinTexelSource(0.3))),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1912,11 +1941,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   'line-capsule-fold-thin': {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () =>
-      buildVisualLineUniforms(buildJoinDataTexture(buildFoldJoinTexelSource(0.02)), true),
+      buildVisualLineUniforms(buildJoinDataTexture(buildFoldJoinTexelSource(0.02))),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1925,7 +1953,7 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildMesh: (material) => buildJoinMesh(buildFoldJoinTexelSource(0.02), material),
   },
   // The same fold at the width that lands INSIDE the band #1495 opens:
-  // 0.05 x uOrthoLineScale 64 x 0.659 = 2.11 px raw, so the joint is under
+  // 0.05 x line scale 64 x 0.659 = 2.11 px raw, so the joint is under
   // the 4 px packet width gate (rMax 2.61) yet at or above the 1.5 px AA
   // floor, and the fold's own axis dot is 0.54 > 0.5. That is exactly the
   // combination the floored sharp-turn exception opens — the wide fixture
@@ -1935,11 +1963,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   'line-capsule-fold-mid': {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () =>
-      buildVisualLineUniforms(buildJoinDataTexture(buildFoldJoinTexelSource(0.05)), true),
+      buildVisualLineUniforms(buildJoinDataTexture(buildFoldJoinTexelSource(0.05))),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1952,13 +1979,11 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () =>
       buildVisualLineUniforms(
-        buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], undefined, undefined, REMAP_STYLE),
-        true
+        buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], undefined, undefined, REMAP_STYLE)
       ),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -1971,7 +1996,7 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   'line-capsule-colormap': {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () => ({
-      ...buildVisualLineUniforms(buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], [0.2, 0.8]), true),
+      ...buildVisualLineUniforms(buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], [0.2, 0.8])),
       uColormapTex: { value: buildColormapTexture() },
       uScalarMin: { value: 0.0 },
       uScalarScale: { value: 1.0 },
@@ -1983,7 +2008,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
         {
           useColormap: true,
           blendingMode: 'additive',
-          isOrtho: true,
         }
       ) as unknown as THREE.Material;
       m.transparent = false;
@@ -1995,13 +2019,12 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   // MAX mode: the premultiplied-RGB output tail.
   'line-capsule-max': {
     source: CAPSULE_LINE_SOURCE,
-    buildUniforms: () => buildVisualLineUniforms(buildLineDataTexture(), true),
+    buildUniforms: () => buildVisualLineUniforms(buildLineDataTexture()),
     buildDefines: () => ({ LUXAR_GAMMA_ONE: '', LUXAR_MAX_RGB_CONTRIBUTION: '' }),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'max',
         gammaOne: true,
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -2014,7 +2037,7 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   'line-capsule-opaque': {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () => ({
-      ...buildVisualLineUniforms(buildLineDataTexture(), true),
+      ...buildVisualLineUniforms(buildLineDataTexture()),
       uOpacity: { value: 0.02 },
     }),
     buildDefines: () => ({ LUXAR_GAMMA_ONE: '', LUXAR_OPAQUE_RGB_CONTRIBUTION: '' }),
@@ -2022,7 +2045,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'opaque',
         gammaOne: true,
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -2036,8 +2058,7 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () => ({
       ...buildVisualLineUniforms(
-        buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], undefined, VOLUMETRIC_LINE_ALPHAS),
-        true
+        buildLineDataTexture([-0.5, 0, 0], [0.5, 0, 0], undefined, VOLUMETRIC_LINE_ALPHAS)
       ),
       uOpacity: { value: 0.7 },
       uAbsorption: { value: 2.0 },
@@ -2047,7 +2068,6 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'volumetric',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -2061,11 +2081,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   'line-capsule-nearclip': {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () =>
-      buildVisualLineUniforms(buildLineDataTexture([0, 0, 1.5], [0, 0, -0.5]), false, 0.35),
+      buildVisualLineUniforms(buildLineDataTexture([0, 0, 1.5], [0, 0, -0.5]), 0.35),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: false,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -2090,13 +2109,11 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
           startSharpness: 0.1,
           endSharpness: 0.9,
         }),
-        false,
         0.35
       ),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: false,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -2118,13 +2135,11 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () =>
       buildVisualLineUniforms(
-        buildLineDataTexture(undefined, undefined, undefined, undefined, FOOTPRINT_STYLE),
-        true
+        buildLineDataTexture(undefined, undefined, undefined, undefined, FOOTPRINT_STYLE)
       ),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -2138,13 +2153,13 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     source: CAPSULE_LINE_PICK_SOURCE,
     buildUniforms: () =>
       buildPickLineUniforms(
-        buildLineDataTexture(undefined, undefined, undefined, undefined, FOOTPRINT_STYLE),
-        true
+        buildLineDataTexture(undefined, undefined, undefined, undefined, FOOTPRINT_STYLE)
       ),
     buildTSLMaterial: (uniforms) =>
-      capsuleLinePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: true,
-      }) as unknown as THREE.Material,
+      capsuleLinePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: (m) =>
       buildLineInstancedMesh(m, undefined, undefined, undefined, undefined, FOOTPRINT_STYLE),
   },
@@ -2152,13 +2167,13 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     source: CAPSULE_LINE_PICK_SOURCE,
     buildUniforms: () =>
       buildPickLineUniforms(
-        buildLineDataTexture([0, 0, 0.3], [0, 0, -0.5], undefined, undefined, FOOTPRINT_STYLE),
-        true
+        buildLineDataTexture([0, 0, 0.3], [0, 0, -0.5], undefined, undefined, FOOTPRINT_STYLE)
       ),
     buildTSLMaterial: (uniforms) =>
-      capsuleLinePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: true,
-      }) as unknown as THREE.Material,
+      capsuleLinePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: (m) =>
       buildLineInstancedMesh(m, [0, 0, 0.3], [0, 0, -0.5], undefined, undefined, FOOTPRINT_STYLE),
   },
@@ -2175,11 +2190,12 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   'line-capsule-pick-joint': {
     source: CAPSULE_LINE_PICK_SOURCE,
     depthCompete: true,
-    buildUniforms: () => buildPickLineUniforms(buildJoinDataTexture(buildJoinTexelSource()), true),
+    buildUniforms: () => buildPickLineUniforms(buildJoinDataTexture(buildJoinTexelSource())),
     buildTSLMaterial: (uniforms) =>
-      capsuleLinePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: true,
-      }) as unknown as THREE.Material,
+      capsuleLinePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: (material) => buildJoinMesh(buildJoinTexelSource(), material),
   },
   // The V again with alternating vertex widths, so the joint packet gate
@@ -2188,11 +2204,10 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
   'line-capsule-joint-taper': {
     source: CAPSULE_LINE_SOURCE,
     buildUniforms: () =>
-      buildVisualLineUniforms(buildJoinDataTexture(buildDeficitPacketJoinTexelSource()), true),
+      buildVisualLineUniforms(buildJoinDataTexture(buildDeficitPacketJoinTexelSource())),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'additive',
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -2220,12 +2235,11 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     // 70 of 908 under its own shader's mutation.
     buildDefines: () => ({ LUXAR_GAMMA_ONE: '', LUXAR_MAX_RGB_CONTRIBUTION: '' }),
     buildUniforms: () =>
-      buildVisualLineUniforms(buildJoinDataTexture(buildShortPartnerJoinTexelSource()), true),
+      buildVisualLineUniforms(buildJoinDataTexture(buildShortPartnerJoinTexelSource())),
     buildTSLMaterial: (uniforms) => {
       const m = capsuleLineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
         blendingMode: 'max',
         gammaOne: true,
-        isOrtho: true,
       }) as unknown as THREE.Material;
       m.transparent = false;
       m.blending = THREE.NoBlending;
@@ -2247,11 +2261,54 @@ export const LINE_SHADERS: Record<string, RegistryEntry> = {
     source: CAPSULE_LINE_PICK_SOURCE,
     depthCompete: true,
     buildUniforms: () =>
-      buildPickLineUniforms(buildJoinDataTexture(buildShortPartnerJoinTexelSource()), true),
+      buildPickLineUniforms(buildJoinDataTexture(buildShortPartnerJoinTexelSource())),
     buildTSLMaterial: (uniforms) =>
-      capsuleLinePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
-        isOrtho: true,
-      }) as unknown as THREE.Material,
+      capsuleLinePickWebGPUFactory(
+        buildLinePickTSLNodesFromUniforms(uniforms),
+        {}
+      ) as unknown as THREE.Material,
     buildMesh: (material) => buildJoinMesh(buildShortPartnerJoinTexelSource(), material),
   },
 };
+
+/**
+ * The PRODUCTION screen-space quad graphs: `LineTSLMaterial` /
+ * `LinePickingTSLMaterial` build the quad with a compile-time projection
+ * variant chosen per draw from the drawn camera (`projection-variant.ts`),
+ * not the runtime-ortho graph the entries above exercise. Same fixtures and
+ * cameras as `line` / `line-pick` (ortho) and `line-crossing` /
+ * `line-pick-crossing` (perspective, near-plane clip reached), so codegen pins the variant code and the
+ * parity harness can compare it against GLSL.
+ */
+function quadVariantEntry(
+  base: string,
+  projection: 'ortho' | 'perspective',
+  pick: boolean
+): RegistryEntry {
+  const entry = LINE_SHADERS[base];
+  return {
+    ...entry,
+    buildTSLMaterial: (uniforms) => {
+      if (pick) {
+        return linePickWebGPUFactory(buildLinePickTSLNodesFromUniforms(uniforms), {
+          projection,
+        }) as unknown as THREE.Material;
+      }
+      const m = lineWebGPUFactory(buildLineTSLNodesFromUniforms(uniforms, {}), {
+        projection,
+      }) as unknown as THREE.Material;
+      m.transparent = false;
+      m.blending = THREE.NoBlending;
+      return m;
+    },
+  };
+}
+
+LINE_SHADERS['line-variant-ortho'] = quadVariantEntry('line', 'ortho', false);
+LINE_SHADERS['line-variant-persp'] = quadVariantEntry('line-crossing', 'perspective', false);
+LINE_SHADERS['line-pick-variant-ortho'] = quadVariantEntry('line-pick', 'ortho', true);
+LINE_SHADERS['line-pick-variant-persp'] = quadVariantEntry(
+  'line-pick-crossing',
+  'perspective',
+  true
+);

@@ -10,6 +10,7 @@
 import * as THREE from 'three';
 import { ControlsManager } from '../controls/controls-manager';
 import { loadScene } from '../data';
+import { SceneLoaderManager } from '../data/scene-loader-manager';
 import type { LoaderConfig } from '../data/data-loader-types';
 import { notifier } from '../utils/cross-layer/notifier';
 import { config } from '../config';
@@ -63,6 +64,7 @@ import {
   clearLoadedSceneContent,
   disposeSceneGraphResources,
 } from './scene-manager/render-pipeline/scene-disposal';
+import { detachSceneGraphIndex } from '../utils/scene-graph-index';
 import {
   applyZarrViewerConfig as applyZarrViewerConfigHelper,
   createDefaultPerspectiveCamera,
@@ -97,6 +99,7 @@ import {
 import { type LuxarCamera, isPerspectiveCamera, isOrthographicCamera } from '../utils/camera-utils';
 import { isDocumentFullscreen } from '../utils/fullscreen';
 import type { ControlType } from '../controls/controls-manager';
+import { DepthSortCoordinator } from '../rendering/depth-sort-coordinator';
 import type { AutoRotateAxis } from '../controls/types';
 
 /** Default scene up (world +Y) — overridden per scene by `viewer_config.up`. */
@@ -181,6 +184,16 @@ export class SceneManager extends THREE.EventDispatcher<{
   private unsubscribeEnvironment: (() => void) | null = null;
 
   /**
+   * This app's depth-sort coordinator: the scene loader's commits report to it,
+   * the post-processing glass split reads its node registry, and the dataset
+   * switch releases its nodes. Owned here because the scene manager is the one
+   * per-app object every one of those already reaches; the init pipeline wires
+   * its camera and render loop (`configure`) and the app's dispose pipeline
+   * disposes it.
+   */
+  public readonly depthSort = new DepthSortCoordinator();
+
+  /**
    * Capabilities snapshot for the active renderer. Hides raw-GL queries
    * behind a typed interface so the eventual WebGPU port has a single
    * implementation seam.
@@ -239,9 +252,6 @@ export class SceneManager extends THREE.EventDispatcher<{
   set resizeLocked(v: boolean) {
     this.resizer.resizeLocked = v;
   }
-
-  /** Cached ortho zoom level to avoid redundant material updates during panning */
-  private lastOrthoZoom: number = 1;
 
   /**
    * Perspective FOV in effect at the last perspective→ortho swap, restored on
@@ -316,8 +326,42 @@ export class SceneManager extends THREE.EventDispatcher<{
     this.camera.fov = fov;
     this.camera.updateProjectionMatrix();
     this.updateMaterialsForCurrentCamera();
-    this.dispatchEvent({ type: 'change' });
+    this.commitCameraChange();
     return true;
+  }
+
+  /**
+   * The one way to publish a camera change made outside the controls' own
+   * input handling.
+   *
+   * Runs `write` (if given), brings the camera's world matrices up to date,
+   * and makes sure exactly ONE `change` event reaches the controls manager.
+   * That is where every consumer of a camera change listens: the scene
+   * manager's relay (loop wake, picking dirty), the input handler, and the
+   * embedder's `camera-changed`. If the write already made the controls fire
+   * `change` (an orbit `update()` does when the pose moved), nothing more is
+   * dispatched; if it fired none (fly controls never do for an outside write;
+   * a fov or zoom change goes through no controls at all), one is dispatched.
+   *
+   * Before this, writers each picked their own subset: the fov and clipping
+   * setters dispatched on the scene manager only, so embedders never heard of
+   * a fov change; the framing helpers relied on `controls.update()`, which in
+   * fly mode fires nothing, so framing there neither woke an idle loop nor
+   * told the embedder; `setCameraZoom` notified nobody.
+   */
+  commitCameraChange(write?: () => void): void {
+    let fired = 0;
+    const onChange = (): void => {
+      fired++;
+    };
+    this.controls.addEventListener('change', onChange);
+    try {
+      write?.();
+    } finally {
+      this.controls.removeEventListener('change', onChange);
+    }
+    this.camera.updateMatrixWorld();
+    if (fired === 0) this.controls.dispatchEvent({ type: 'change' });
   }
 
   /** Apply an authored zoom after the camera has switched to ortho projection. */
@@ -325,9 +369,9 @@ export class SceneManager extends THREE.EventDispatcher<{
     if (!isOrthographicCamera(this.camera) || !Number.isFinite(zoom) || zoom <= 0) return;
     this.camera.zoom = zoom;
     this.camera.updateProjectionMatrix();
-    this.lastOrthoZoom = zoom;
     this.updateMaterialsForCurrentCamera();
     this.controls.setZoomLimits(zoom / ZOOM_OUT_FACTOR, zoom * ZOOM_IN_FACTOR);
+    this.commitCameraChange();
   }
 
   /**
@@ -485,7 +529,9 @@ export class SceneManager extends THREE.EventDispatcher<{
   }
 
   private async setupWebGLRenderer(): Promise<void> {
-    const { renderer, capabilities } = await createWebGLRenderer(this.canvasElement);
+    const { renderer, capabilities } = await createWebGLRenderer(this.canvasElement, {
+      debug: this.debug,
+    });
     this.renderer = renderer;
     this.capabilities = capabilities;
 
@@ -725,13 +771,9 @@ export class SceneManager extends THREE.EventDispatcher<{
     this.controls.setControlType('orbit');
 
     // Listen for control changes to trigger renders
+    // (An ortho zoom needs no material push: it lives in the projection
+    // matrix, which every shader reads per draw.)
     this.controls.addEventListener('change', () => {
-      // Ortho zoom changes camera.zoom, which affects material frustum height.
-      // Only update materials if zoom actually changed (skip during panning).
-      if (isOrthographicCamera(this.camera) && this.camera.zoom !== this.lastOrthoZoom) {
-        this.lastOrthoZoom = this.camera.zoom;
-        this.updateMaterialsForCurrentCamera();
-      }
       this.dispatchEvent({ type: 'change' });
     });
 
@@ -765,6 +807,7 @@ export class SceneManager extends THREE.EventDispatcher<{
       capabilities: this.capabilities,
       scene: this.scene,
       camera: this.camera,
+      glassSource: this.depthSort,
       onResize: () => {
         if (this.camera) this.updateMaterialsForCurrentCamera();
       },
@@ -803,79 +846,24 @@ export class SceneManager extends THREE.EventDispatcher<{
         this.updateMaterialsForCurrentCamera();
       }
 
-      const root = await loadScene(src, loaderConfig);
+      const embedderOnSceneMetadata = loaderConfig?.onSceneMetadata;
+      // The LuxarApp's loader manager; its loaders' commits report to this
+      // app's depth-sort coordinator.
+      const sceneLoaders = SceneLoaderManager.getInstance();
+      sceneLoaders.setDepthSortCoordinator(this.depthSort);
+      const root = await loadScene(sceneLoaders, src, {
+        ...loaderConfig,
+        // Frame first, then hand the root to an embedder's own hook, which
+        // then sees the pose the scene opens on (as load-time decisions do).
+        onSceneMetadata: (metaRoot) => {
+          this.frameBeforeNodesLoad(metaRoot, options);
+          embedderOnSceneMetadata?.(metaRoot);
+        },
+      });
       notifier.hideLoading();
       this.scene.add(root);
       this.invalidateBoundsCache();
-
-      // Resolve the scene's DISPLAYED dimensions before anything below reads
-      // bounds. Every metadata-bounds consumer in this method (scene scale,
-      // auto-frame, clipping planes, near-cull) projects the nD
-      // `position_bounds` through `sceneDimsManager.getDims().displayed`, and
-      // falls back to [0, 1, 2] when the manager is uninitialised. The
-      // dimension-navigation UI initialises it too, but only AFTER this method
-      // resolves — so a scene whose displayed dims are not the first three
-      // (e.g. a leading non-displayed time / order / channel axis) used to be
-      // framed around the WRONG axes: the non-displayed axis' extent landed on
-      // world X, putting the look-at target off to one side of the geometry and
-      // inflating the fit distance by that axis' range. `initFromScene` is a
-      // pure metadata read (no listeners fire, no camera touched), and the
-      // later UI call re-runs it identically.
-      sceneDimsManager.initFromScene(this.scene);
-
-      // Material parameters were initialized before loadScene(). A scene FOV
-      // applied below refreshes them again before the first rendered frame.
-
-      // Establish scale-aware orbit distance limits from scene bounds BEFORE
-      // applying the author's camera. The orbit controls start with a small
-      // default maxDistance (config.controls.orbit.zoom.maxDistance); a
-      // viewer_config that places the camera far from its target (a wide
-      // establishing shot) would otherwise have that distance clamped to the
-      // default max by reinitialize()+update(), snapping the camera near the
-      // target. setSceneScale only sets the distance limits (it never moves
-      // the camera) and is idempotent, so the later autoAdjustClippingPlanes()
-      // call — which sets the same scale — is a no-op for it.
-      const metaBoundsForScale = this.getSceneBoundsFromMetadata();
-      if (metaBoundsForScale) {
-        this.controls.setSceneScale(getBoundingBoxDiagonal(metaBoundsForScale));
-      }
-
-      // Apply viewer config from zarr (camera position, background color).
-      // The helper returns whether an explicit camera position was applied;
-      // also extract once more to detect author-set target/targetNode.
-      const viewerConfig = root.userData?.viewerConfig as ZarrViewerConfig | undefined;
-      const { positionApplied, appliedUp } = this.applyZarrViewerConfig(root);
-      if ((options.applyViewerConfigFov || positionApplied) && viewerConfig) {
-        const fovOverride = extractRenderingOverrides(viewerConfig).fov;
-        const validFovOverride =
-          fovOverride !== undefined &&
-          Number.isFinite(fovOverride) &&
-          fovOverride >= config.camera.fovMin &&
-          fovOverride <= config.camera.fovMax;
-        if (fovOverride !== undefined && (options.applyViewerConfigFov || validFovOverride)) {
-          this.setFov(fovOverride);
-        }
-      }
-      // The scene up governs every camera fit/reset (Home/F, center-on-
-      // origin, this auto-frame): world +Y unless the author set one.
-      this.sceneUp.copy(appliedUp ?? DEFAULT_SCENE_UP);
-      const camOverrides = viewerConfig ? extractCameraOverrides(viewerConfig) : {};
-      const hasAuthorTarget = !!(camOverrides.target || camOverrides.targetNode);
-
-      // Auto-frame camera to fit scene contents, unless the zarr author specified
-      // a camera position. Only an explicit position suppresses auto-framing — a
-      // target/targetNode alone means the author wants the orbit pivot set but
-      // still expects the camera to be at a sensible distance.
-      if (!positionApplied) {
-        // No author camera position — auto-frame using metadata bounds.
-        // If the author set a target, preserve it as the look-at point
-        // instead of overwriting with bounding box center.
-        this.autoFrameCamera(hasAuthorTarget);
-      }
-
-      // Auto-adjust clipping planes using scene bounds from metadata
-      // (must run AFTER autoFrameCamera since camera position affects clipping)
-      this.autoAdjustClippingPlanes();
+      this.frameFromRootMetadata(root, options);
 
       log.info(
         Modules.SCENE_MANAGER,
@@ -886,6 +874,111 @@ export class SceneManager extends THREE.EventDispatcher<{
       log.error(Modules.SCENE_MANAGER, 'Failed to load scene:', error);
       notifier.error(`Failed to load scene from "${src}". Please check the path and try again.`);
       throw error;
+    }
+  }
+
+  /**
+   * Frame the opening camera from the root's METADATA alone, before any node
+   * loads (the loader's `onSceneMetadata` hook). Load-time decisions that read
+   * the view — B4's partition gating ranks parts against the camera and the
+   * displayed dims — then see the pose the scene opens on, rather than the
+   * reset pose and the previous scene's (or no) dimensions. The root joins the
+   * scene only for the synchronous framing call, so no frame draws it
+   * half-built. {@link loadSceneData} frames again once the nodes are in, which
+   * re-applies the same pose. A `target_node` names a node not built yet, so
+   * such a scene is framed after the load only (as before).
+   */
+  private frameBeforeNodesLoad(root: THREE.Group, options: SceneLoadOptions): void {
+    const viewerConfig = root.userData?.viewerConfig as ZarrViewerConfig | undefined;
+    if (viewerConfig && extractCameraOverrides(viewerConfig).targetNode) return;
+    this.scene.add(root);
+    this.invalidateBoundsCache();
+    try {
+      this.frameFromRootMetadata(root, options);
+    } finally {
+      this.scene.remove(root);
+      this.invalidateBoundsCache();
+    }
+  }
+
+  /**
+   * The opening-camera framing of `root` (already in `this.scene`): displayed
+   * dims, scene-scale orbit limits, the authored camera (or an auto-frame from
+   * the metadata bounds) and the clipping planes. Idempotent.
+   */
+  private frameFromRootMetadata(root: THREE.Group, options: SceneLoadOptions): void {
+    // Resolve the scene's DISPLAYED dimensions before anything below reads
+    // bounds. Every metadata-bounds consumer in this method (scene scale,
+    // auto-frame, clipping planes, near-cull) projects the nD
+    // `position_bounds` through `sceneDimsManager.getDims().displayed`, and
+    // falls back to [0, 1, 2] when the manager is uninitialised. The
+    // dimension-navigation UI initialises it too, but only AFTER loadSceneData
+    // resolves — so a scene whose displayed dims are not the first three
+    // (e.g. a leading non-displayed time / order / channel axis) used to be
+    // framed around the WRONG axes: the non-displayed axis' extent landed on
+    // world X, putting the look-at target off to one side of the geometry and
+    // inflating the fit distance by that axis' range. `initFromScene` is a
+    // pure metadata read (no listeners fire, no camera touched), and the
+    // later UI call re-runs it identically.
+    sceneDimsManager.initFromScene(this.scene);
+
+    // Material parameters were initialized before loadScene(). A scene FOV
+    // applied below refreshes them again before the first rendered frame.
+
+    // Establish scale-aware orbit distance limits from scene bounds BEFORE
+    // applying the author's camera. The orbit controls start with a small
+    // default maxDistance (config.controls.orbit.zoom.maxDistance); a
+    // viewer_config that places the camera far from its target (a wide
+    // establishing shot) would otherwise have that distance clamped to the
+    // default max by reinitialize()+update(), snapping the camera near the
+    // target. setSceneScale only sets the distance limits (it never moves
+    // the camera) and is idempotent, so the later autoAdjustClippingPlanes()
+    // call — which sets the same scale — is a no-op for it.
+    const metaBoundsForScale = this.getSceneBoundsFromMetadata();
+    if (metaBoundsForScale) {
+      this.controls.setSceneScale(getBoundingBoxDiagonal(metaBoundsForScale));
+    }
+
+    // Apply viewer config from zarr (camera position, background color).
+    // The helper returns whether an explicit camera position was applied;
+    // also extract once more to detect author-set target/targetNode.
+    const viewerConfig = root.userData?.viewerConfig as ZarrViewerConfig | undefined;
+    const { positionApplied, appliedUp } = this.applyZarrViewerConfig(root);
+    if ((options.applyViewerConfigFov || positionApplied) && viewerConfig) {
+      this.applyViewerConfigFov(viewerConfig, options);
+    }
+    // The scene up governs every camera fit/reset (Home/F, center-on-
+    // origin, this auto-frame): world +Y unless the author set one.
+    this.sceneUp.copy(appliedUp ?? DEFAULT_SCENE_UP);
+    const camOverrides = viewerConfig ? extractCameraOverrides(viewerConfig) : {};
+    const hasAuthorTarget = !!(camOverrides.target || camOverrides.targetNode);
+
+    // Auto-frame camera to fit scene contents, unless the zarr author specified
+    // a camera position. Only an explicit position suppresses auto-framing — a
+    // target/targetNode alone means the author wants the orbit pivot set but
+    // still expects the camera to be at a sensible distance.
+    if (!positionApplied) {
+      // No author camera position — auto-frame using metadata bounds.
+      // If the author set a target, preserve it as the look-at point
+      // instead of overwriting with bounding box center.
+      this.autoFrameCamera(hasAuthorTarget);
+    }
+
+    // Auto-adjust clipping planes using scene bounds from metadata
+    // (must run AFTER autoFrameCamera since camera position affects clipping)
+    this.autoAdjustClippingPlanes();
+  }
+
+  /** The scene FOV, applied unconditionally when the caller asked for it, else only if valid. */
+  private applyViewerConfigFov(viewerConfig: ZarrViewerConfig, options: SceneLoadOptions): void {
+    const fovOverride = extractRenderingOverrides(viewerConfig).fov;
+    const validFovOverride =
+      fovOverride !== undefined &&
+      Number.isFinite(fovOverride) &&
+      fovOverride >= config.camera.fovMin &&
+      fovOverride <= config.camera.fovMax;
+    if (fovOverride !== undefined && (options.applyViewerConfigFov || validFovOverride)) {
+      this.setFov(fovOverride);
     }
   }
 
@@ -906,27 +999,29 @@ export class SceneManager extends THREE.EventDispatcher<{
   /**
    * Give the scene environment what a live `scene` capture needs (the init pipeline
    * calls this once the load-activity predicate exists). The capture pushes the cube
-   * camera's params (90° fov, a square drawing buffer, pixel ratio 1) to the material
-   * manager so point and line footprints render at the right size in the six faces,
-   * and restores the main camera's push afterwards through the ordinary path.
+   * camera's params (a square drawing buffer, pixel ratio 1) to the material manager
+   * so point and line footprints render at the right size in the six faces, and
+   * restores the main camera's push afterwards through the ordinary path. The 90°
+   * projection itself — its ortho test included — is read from the cube camera at
+   * draw time, so the camera KIND needs no push: every GLSL program and TSL graph
+   * reads it in shader from the matrix, except the TSL screen-space line quad,
+   * whose per-draw hook re-points it at its cached perspective graph for the faces
+   * (a lookup, no build; see `selectProjectionVariant`).
    */
-  attachEnvironmentRuntime(isSettled: () => boolean): void {
+  attachEnvironmentRuntime(isSettled: () => boolean, captureReady: () => boolean): void {
     const root = (): THREE.Object3D | null =>
       this.scene.children.find((c) => c.name === 'LuxarScene') ?? null;
     this.environment?.attachRuntime({
       sceneRoot: root,
       pushCaptureCameraParams: (resolution) => {
-        materialManager.updateCameraParams(
-          Math.PI / 2,
-          new THREE.Vector2(resolution, resolution),
-          false,
-          undefined,
-          1
-        );
+        materialManager.updateCameraParams(new THREE.Vector2(resolution, resolution), undefined, 1);
       },
       restoreCameraParams: () => this.updateMaterialsForCurrentCamera(),
       isSettled,
+      captureReady,
       baseUrl: () => root()?.userData?.zarrBaseUrl as string | undefined,
+      // An HDRI landing asynchronously: the 'change' event wakes the loop.
+      requestRender: () => this.dispatchEvent({ type: 'change' }),
     });
   }
 
@@ -957,7 +1052,10 @@ export class SceneManager extends THREE.EventDispatcher<{
   private clearSceneContent(): void {
     clearBlendModeProgramWarmup();
     this.invalidateBoundsCache();
-    const removed = clearLoadedSceneContent(this.scene);
+    // The outgoing scene root carries the loader's path index (every member
+    // node holds its add/remove listeners): stop maintaining it.
+    for (const child of this.scene.children) detachSceneGraphIndex(child);
+    const removed = clearLoadedSceneContent(this.scene, this.depthSort);
     log.info(Modules.SCENE_MANAGER, `Cleared ${removed} objects from scene`);
   }
 
@@ -980,6 +1078,11 @@ export class SceneManager extends THREE.EventDispatcher<{
    * ```
    */
   public centerCameraOnScene(): void {
+    this.commitCameraChange(() => this.frameScene());
+  }
+
+  /** {@link centerCameraOnScene}'s write, published by the caller. */
+  private frameScene(): void {
     // Prefer the scene's AUTHORED camera (zarr viewer_config) when it pins an
     // explicit position: F should return to the author's intended framing, not
     // re-fit to the raw min/max bounding box. A bounds fit zooms out to include
@@ -1012,7 +1115,11 @@ export class SceneManager extends THREE.EventDispatcher<{
    * framable geometry (e.g. a partition whose parts haven't streamed yet).
    */
   public fitCameraToObject(obj: THREE.Object3D): boolean {
-    return frameCameraOnObject(obj, this.camera, this.controls, this.sceneUp) !== null;
+    let framed = false;
+    this.commitCameraChange(() => {
+      framed = frameCameraOnObject(obj, this.camera, this.controls, this.sceneUp) !== null;
+    });
+    return framed;
   }
 
   /**
@@ -1079,7 +1186,7 @@ export class SceneManager extends THREE.EventDispatcher<{
    * {@link toggleCentering} switches back to the bounding box.
    */
   public centerOnOrigin(): void {
-    centerOnOrigin(this.camera, this.controls, this.sceneUp);
+    this.commitCameraChange(() => centerOnOrigin(this.camera, this.controls, this.sceneUp));
     this.isCenteredOnBoundingBox = false;
   }
 
@@ -1150,8 +1257,15 @@ export class SceneManager extends THREE.EventDispatcher<{
    * a `ResizeObserver` already get browser-batched delivery (~once/frame).
    */
   public resizeToCanvas(): void {
+    const canvas = this.renderer.domElement;
+    const before = `${canvas.width}x${canvas.height}`;
     const { width, height } = this.measureViewport();
     this.resizer.resizeNow(width, height, this.makeResizeCtx());
+    // A real size change clears the drawing buffer and changes the aspect:
+    // wake the loop to repaint it (and mark picking dirty). The container
+    // ResizeObserver lands here, and on an idle loop nothing else would draw
+    // until the next interaction, leaving the cleared canvas blank.
+    if (`${canvas.width}x${canvas.height}` !== before) this.dispatchEvent({ type: 'change' });
   }
 
   /** Build the per-call ResizeCtx snapshot used by the resize orchestrator. */
@@ -1200,6 +1314,11 @@ export class SceneManager extends THREE.EventDispatcher<{
    * acceptable thresholds, and by the manual DPR control when adaptive
    * mode is disabled.
    *
+   * Unlike {@link resizeToCanvas} this does NOT dispatch `change`, although
+   * the resize clears the canvas: the idle restore resizes right after the
+   * loop stops and draws its own frame, and a `change` would wake the loop
+   * again. A caller outside a tick (a UI control) requests the repaint.
+   *
    * @param dpr - The new device pixel ratio to use
    */
   public setAdaptivePixelRatio(dpr: number): void {
@@ -1242,7 +1361,7 @@ export class SceneManager extends THREE.EventDispatcher<{
       return true;
     }
     const applied = adjustFOV(this.makeCameraMaterialsCtx(), deltaY);
-    if (applied) this.dispatchEvent({ type: 'change' });
+    if (applied) this.commitCameraChange();
     return applied;
   }
 
@@ -1305,10 +1424,12 @@ export class SceneManager extends THREE.EventDispatcher<{
    * per-frame scene graph traversal. A metadata-less scene is the exception:
    * the cache has no negative caching, so the per-frame `ensure()` re-walks
    * the graph each frame (see `clipping/scene-bounds-cache.ts`).
+   *
+   * @returns true when near/far changed (the frame must be redrawn)
    */
-  updateDynamicClippingPlanes(): void {
-    if (!this.dynamicClippingEnabled) return;
-    updateDynamicFromCache(this.makeClippingCtx());
+  updateDynamicClippingPlanes(): boolean {
+    if (!this.dynamicClippingEnabled) return false;
+    return updateDynamicFromCache(this.makeClippingCtx());
   }
 
   /**
@@ -1443,7 +1564,7 @@ export class SceneManager extends THREE.EventDispatcher<{
     // (WebGL resources are not garbage collected). Delegated to
     // scene-manager/render-pipeline/scene-disposal so the same one-shot
     // final-dispose pass is unit-testable in isolation.
-    disposeSceneGraphResources(this.scene);
+    disposeSceneGraphResources(this.scene, this.depthSort);
   }
 
   /**
@@ -1585,9 +1706,6 @@ export class SceneManager extends THREE.EventDispatcher<{
       renderer: this.renderer,
       postProcessing: this.postProcessing,
       updateMaterialsForCurrentCamera: () => this.updateMaterialsForCurrentCamera(),
-      setLastOrthoZoom: (zoom) => {
-        this.lastOrthoZoom = zoom;
-      },
       getLastPerspectiveFov: () => this.lastPerspectiveFov,
       setLastPerspectiveFov: (fov) => {
         this.lastPerspectiveFov = fov;

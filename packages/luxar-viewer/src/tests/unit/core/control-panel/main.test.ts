@@ -7,6 +7,7 @@ import type { ControllerSocketPorts } from '../../../../core/control-panel/contr
 import {
   CHAPTER_RETRY_BASE_MS,
   CHAPTER_RETRY_MAX_MS,
+  PANEL_RESYNC_MS,
   bootstrap,
   type ControlPanelBootstrapPorts,
 } from '../../../../core/control-panel/main';
@@ -190,7 +191,14 @@ describe('control-panel bootstrap', () => {
             subtitle: 'Authored subtitle',
             columns: 2,
             stylesheet: '.tile { color: blue; }',
-            chapters: { 1: { label: 'Blood', sublabel: 'Protein family' } },
+            chapters: {
+              1: {
+                label: 'Blood',
+                sublabel: 'Protein family',
+                shortLabel: 'Hb',
+                shortSublabel: 'Family',
+              },
+            },
           },
         };
       }
@@ -207,6 +215,8 @@ describe('control-panel bootstrap', () => {
       subtitle: 'Authored subtitle',
       columns: 2,
       sublabels: { 1: 'Protein family' },
+      shortLabels: { 1: 'Hb' },
+      shortSublabels: { 1: 'Family' },
     });
     const styles = document.querySelectorAll('#luxar-control-author-style');
     expect(styles).toHaveLength(1);
@@ -261,7 +271,9 @@ describe('control-panel bootstrap', () => {
     await settle();
 
     context.panelPorts.onInteraction?.();
-    await vi.runAllTimersAsync();
+    // Bounded, not `runAllTimersAsync`: the resync interval never runs out.
+    // An hour is thirty default idle periods.
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
 
     expect(context.socket.notify).not.toHaveBeenCalled();
   });
@@ -342,6 +354,82 @@ describe('control-panel bootstrap', () => {
 
     expect(context.socket.call).toHaveBeenCalledTimes(1);
     expect(context.socket.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-highlights and re-subscribes after the display reloads', async () => {
+    // A reloaded display has no subscribers and sends no event, so only the
+    // periodic resync can notice that it now sits on another story.
+    vi.useFakeTimers();
+    const context = harness();
+    context.socketPorts.onStatus?.('open');
+    await settle();
+    expect(context.panel.setActive).toHaveBeenLastCalledWith(1);
+
+    vi.mocked(context.socket.call).mockClear();
+    vi.mocked(context.socket.call).mockImplementation(async (method: string) =>
+      method === 'getDimensions' ? { ...DIMS, currentStep: [0, 0, 0, 0] } : undefined
+    );
+    await vi.advanceTimersByTimeAsync(PANEL_RESYNC_MS);
+
+    expect(context.panel.setActive).toHaveBeenLastCalledWith(0);
+    expect(context.socket.call).toHaveBeenCalledWith('getDimensions');
+    expect(context.socket.call).toHaveBeenCalledWith('subscribe', ['dimensions-changed']);
+    // Polling never drives the display: only a visitor's tap or the idle reset does.
+    expect(context.socket.notify).not.toHaveBeenCalled();
+  });
+
+  it('keeps resyncing through a display that is away', async () => {
+    vi.useFakeTimers();
+    const context = harness();
+    context.socketPorts.onStatus?.('open');
+    await settle();
+
+    vi.mocked(context.socket.call).mockRejectedValue(
+      new ControllerCallError({ code: -32001, message: 'no viewer' })
+    );
+    await vi.advanceTimersByTimeAsync(PANEL_RESYNC_MS * 2);
+
+    vi.mocked(context.socket.call).mockImplementation(async (method: string) =>
+      method === 'getDimensions' ? { ...DIMS, currentStep: [0, 0, 0, 0] } : undefined
+    );
+    await vi.advanceTimersByTimeAsync(PANEL_RESYNC_MS);
+    expect(context.panel.setActive).toHaveBeenLastCalledWith(0);
+  });
+
+  it('pauses resync while hidden and resumes when visible', async () => {
+    vi.useFakeTimers();
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    try {
+      const context = harness();
+      context.socketPorts.onStatus?.('open');
+      await settle();
+      vi.mocked(context.socket.call).mockClear();
+
+      await vi.advanceTimersByTimeAsync(PANEL_RESYNC_MS * 2);
+      expect(context.socket.call).not.toHaveBeenCalled();
+
+      visibility.mockReturnValue('visible');
+      await vi.advanceTimersByTimeAsync(PANEL_RESYNC_MS);
+      expect(context.socket.call).toHaveBeenCalledWith('getDimensions');
+      expect(context.socket.call).toHaveBeenCalledWith('subscribe', ['dimensions-changed']);
+      context.teardown();
+    } finally {
+      visibility.mockRestore();
+    }
+  });
+
+  it('starts no resync before chapters load, and stops it on teardown', async () => {
+    vi.useFakeTimers();
+    const context = harness();
+    await vi.advanceTimersByTimeAsync(PANEL_RESYNC_MS * 3);
+    expect(context.socket.call).not.toHaveBeenCalled();
+
+    context.socketPorts.onStatus?.('open');
+    await settle();
+    context.teardown();
+    vi.mocked(context.socket.call).mockClear();
+    await vi.advanceTimersByTimeAsync(PANEL_RESYNC_MS * 3);
+    expect(context.socket.call).not.toHaveBeenCalled();
   });
 
   it('cancels an armed idle reset during teardown', async () => {

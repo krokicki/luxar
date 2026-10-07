@@ -17,7 +17,7 @@
  */
 
 import { LuxarApp, type LuxarAppOptions } from './app';
-import { KeyAction } from '../input';
+import { parseBookmark, restoreBookmark } from './app/bookmark-state';
 import { dataSourceDocumentTitle, setDocumentTitle } from './document-title';
 import { config } from '../config';
 import { archiveFaultFrom } from '../cache/chunk-source';
@@ -33,18 +33,18 @@ import { setInputProfileOverride } from '../utils/input-capabilities';
 import { setLineJoinOverride } from '../types/line-join';
 import { setLinePrimitiveOverride, setLinePrimitivePolicy } from '../types/line-primitive';
 import { StorageKeys } from '../utils/storage-keys';
-import { showError, clearError } from '../ui/error-overlay';
-import { showToast } from '../ui/toast';
-import { showHelpOverlay, hideHelpOverlay } from '../ui/help-overlay';
-import { showLoadingIndicator, hideLoadingIndicator } from '../ui/loading-indicator';
-import { showSceneIdentityBanner, hideSceneIdentityBanner } from '../ui/scene-identity-banner';
-import { setNotifierBackend } from '../utils/cross-layer/notifier';
+import { showViewerError } from './app/error-dialog';
 import { ThemeManager } from '../themes/theme-manager';
 import { consoleInterceptor } from '../utils/console-interceptor';
-import { log, Modules, LogEmoji } from '../utils/log';
+import { log, Modules, LogEmoji, setVerboseLogging } from '../utils/log';
 import { getErrorMessage } from '../utils/format-error';
 import { codecRegistry } from '../data/zarr';
 import { computePerfSnapshot } from './app/debug/perf-snapshot';
+import { installDebugPerfInstruments } from './app/debug/perf-instruments';
+import { perfCounters } from '../profiling/perf-counters';
+import { prefetchRootDocument } from '../cache/root-document-prefetch';
+import { normalizeURL } from '../data/scene-loader/lifecycle/url-normalization';
+import { loadsDirectlyWithoutProbe } from './app/dataset/should-show-browser';
 
 /**
  * Options for {@link bootstrapStandalone}.
@@ -211,31 +211,6 @@ export async function bootstrapStandalone(opts: BootstrapOptions): Promise<Luxar
   }
   log.custom(LogEmoji.START, Modules.LUXAR, `Luxar viewer ${buildInfoLine()}`);
 
-  // Wire the cross-layer notifier surface to the concrete UI helpers.
-  // Lower layers (data, scene, input) call notifier.toast / .error /
-  // .showHelp etc. without importing the ui/ helper modules directly —
-  // that's what keeps the dependency-cruiser layer order clean.
-  setNotifierBackend({
-    showError: (message, options) =>
-      showError(
-        message,
-        shortcutForAction,
-        {
-          datasetBrowser: KeyAction.toggleDatasetBrowser,
-          help: KeyAction.toggleHelp,
-        },
-        options?.persistent ? { autoDismiss: false } : undefined
-      ),
-    showToast,
-    showHelpOverlay,
-    hideHelpOverlay,
-    showLoadingIndicator,
-    hideLoadingIndicator,
-    clearError,
-    showSceneIdentityBanner,
-    hideSceneIdentityBanner,
-  });
-
   if (validateConfig) {
     const ok = validateAndLog(config);
     if (!ok) {
@@ -299,6 +274,13 @@ export async function bootstrapStandalone(opts: BootstrapOptions): Promise<Luxar
     /* Storage disabled — debug mode then comes only from `?debug`. */
   }
   const isDebugMode = urlParams.debug || storedDebug === 'true';
+  let storedVerbose: string | null = null;
+  try {
+    storedVerbose = localStorage.getItem(StorageKeys.verboseLog);
+  } catch {
+    /* Storage disabled — verbose logging then comes only from `?verboseLog`. */
+  }
+  setVerboseLogging(urlParams.verboseLog || storedVerbose === 'true');
 
   const appOptions: LuxarAppOptions = {
     canvas: opts.canvas,
@@ -333,6 +315,9 @@ export async function bootstrapStandalone(opts: BootstrapOptions): Promise<Luxar
       (userSettings.advanced.renderer !== 'auto' ? userSettings.advanced.renderer : undefined),
     webgpuForceWebGL: urlParams.webgpuForceWebGL,
     perfTimestamp: urlParams.perfTimestamp,
+    // `?renderAlways` (render every tick) and the debug-only `?renderAudit`.
+    renderAlways: urlParams.renderAlways,
+    renderAudit: urlParams.renderAudit,
     // `?dpr=<value>` pins a fixed pixel ratio for deterministic
     // E2E/visual runs; undefined → normal adaptive-DPR behavior.
     pinnedDPR: urlParams.dpr ?? undefined,
@@ -365,9 +350,24 @@ export async function bootstrapStandalone(opts: BootstrapOptions): Promise<Luxar
       : undefined,
   };
 
+  // Put the dataset's root document on the wire NOW, in parallel with renderer
+  // init (shader links, adapter negotiation), instead of after it: startup was
+  // serial, and the first dataset request left 155-315 ms after the bundle.
+  // The scene load claims this in-flight response, and cache validation and
+  // the store open both read it (`cache/root-document-prefetch.ts`) — one root
+  // fetch per cold load, not two. Only for a URL the loader opens without a
+  // browser probe, so a directory listing never costs a stray request.
+  if (loadsDirectlyWithoutProbe(appOptions.src)) {
+    prefetchRootDocument(normalizeURL(appOptions.src as string, window.location.origin));
+  }
+
   app = new LuxarApp();
 
   if (isDebugMode) {
+    // Instrument the FIRST load too: probes read getPerf() while it runs. The
+    // renderer is resolved per frame, so it reads as absent until init() has
+    // built the scene manager.
+    installDebugPerfInstruments(() => app?.components.sceneManager?.renderer);
     // Seed the debug surface before init() so consumers (e.g. Playwright)
     // that hook into `window.__luxarDebug` can rely on `.app` being there
     // even while init() is still in flight. LuxarApp.setupDebugInterface()
@@ -400,17 +400,47 @@ export async function bootstrapStandalone(opts: BootstrapOptions): Promise<Luxar
       // runtime-aware snapshot once the components exist.
       perfReady: true,
       getPerf: () => computePerfSnapshot(),
-      showError: (message) =>
-        showError(message, shortcutForAction, {
-          datasetBrowser: KeyAction.toggleDatasetBrowser,
-          help: KeyAction.toggleHelp,
-        }),
+      getPerfRecords: (kind: string) => perfCounters.records(kind),
+      resetPerfCounters: () => perfCounters.reset(),
+      showError: (message) => showViewerError(message, shortcutForAction),
     };
     log.custom(LogEmoji.CONSOLE, Modules.LUXAR, 'Debug interface available at window.__luxarDebug');
   }
 
   try {
     await app.init(appOptions);
+    const restoreView = async (raw: string): Promise<void> => {
+      const bookmark = parseBookmark(raw);
+      if (bookmark) {
+        try {
+          await restoreBookmark(app, bookmark);
+          // A cross-dataset switch rewrites ?src and drops the old view.
+          // Keep the just-restored bookmark in the URL for a reload.
+          if (!window.location.hash.startsWith('#view=')) {
+            const hash = new URLSearchParams({ view: raw }).toString();
+            window.history.replaceState(
+              window.history.state,
+              '',
+              `${window.location.pathname}${window.location.search}#${hash}`
+            );
+          }
+        } catch (error) {
+          log.warning(Modules.LUXAR, 'Could not restore view bookmark:', error);
+        }
+      } else {
+        log.warning(Modules.LUXAR, 'Ignoring invalid view bookmark URL');
+      }
+    };
+    if (urlParams.view !== null) {
+      await restoreView(urlParams.view);
+    }
+    const onHashChange = (): void => {
+      if (!window.location.hash.startsWith('#view=')) return;
+      const view = readUrlParams(window.location.search, undefined, window.location.hash).view;
+      if (view !== null) void restoreView(view);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    app.onDispose(() => window.removeEventListener('hashchange', onHashChange));
   } catch (error) {
     log.error(Modules.LUXAR, `Failed to start Luxar application: ${getErrorMessage(error)}`, error);
     // Two failures carry a user-actionable message of their own: an archive
@@ -418,15 +448,11 @@ export async function bootstrapStandalone(opts: BootstrapOptions): Promise<Luxar
     // names the version, the supported set and the remedy). Everything else
     // is a programming/environment error and keeps the generic text.
     const surfaced = archiveFaultFrom(error) ?? unsupportedFormatVersionFrom(error);
-    showError(
+    showViewerError(
       surfaced
         ? surfaced.message
         : 'Failed to start the application. Please check the console for details.',
       shortcutForAction,
-      {
-        datasetBrowser: KeyAction.toggleDatasetBrowser,
-        help: KeyAction.toggleHelp,
-      },
       { autoDismiss: false }
     );
     throw error;

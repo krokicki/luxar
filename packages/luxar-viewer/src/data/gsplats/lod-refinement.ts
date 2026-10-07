@@ -62,11 +62,13 @@ export interface GSplatsRefinementCtx {
     attrs: GSplatsMetadata | undefined,
     opts: { applyPartialExtendTolerance: boolean }
   ): { skip: false; viewState: ViewState };
+  /** `signal` is the refinement run's abort signal (a superseded run rejects promptly). */
   processGSplats(
     path: string,
     data: LoadedGSplatsData,
     viewState: GSplatsViewState,
-    session?: UpdateSession
+    session?: UpdateSession,
+    signal?: AbortSignal
   ): Promise<StagedGSplatsCommit | null>;
   commitGSplats(staged: StagedGSplatsCommit, session?: UpdateSession): void;
   /**
@@ -79,7 +81,7 @@ export interface GSplatsRefinementCtx {
   /** Aggregate visible counts from all line + gsplat meshes into the monitor. */
   updateVisibleCountsInMonitor(): void;
   /**
-   * Release the SceneLoader's `_updateInProgress` lock. Called when the
+   * Release the SceneLoader's serialization lock. Called when the
    * loop completes normally (no more LODs). On cancellation the loop
    * hands off the lock to retriggerUpdate's rAF callback instead.
    */
@@ -95,7 +97,7 @@ export interface GSplatsRefinementCtx {
   isActive?(): boolean;
   /**
    * Per-refinement-run abort signal. The orchestrator assigns the run's
-   * controller to the SceneLoader's `_updateAbortController`, so a
+   * controller to the SceneLoader's live controller (`PassScheduler.controller`), so a
    * superseding `updateView` (or dispose) aborts in-flight refinement
    * chunk reads MID-PASS instead of waiting out the whole pass. An
    * `AbortError` in the per-loader catch is cancellation, not failure.
@@ -125,7 +127,7 @@ export async function runGSplatsRefinement(ctx: GSplatsRefinementCtx): Promise<v
       // typed as plain `GSplatsDataLoader`: a non-progressive loader has no
       // ladder. `admitRefinementCandidate` gates on `hasMoreLODs`.
       const progressiveLoader = loader as GSplatsDataLoader & RefinableLoader;
-      const admission = admitRefinementCandidate(
+      const admission = await admitRefinementCandidate(
         path,
         progressiveLoader,
         ctx.residencyBudget,
@@ -157,7 +159,13 @@ export async function runGSplatsRefinement(ctx: GSplatsRefinementCtx): Promise<v
           if (data) {
             let committed = false;
             try {
-              const staged = await ctx.processGSplats(path, data, gsplatsViewState, session);
+              const staged = await ctx.processGSplats(
+                path,
+                data,
+                gsplatsViewState,
+                session,
+                ctx.signal
+              );
               // Superseded/disposed while we were loading + processing: an abort
               // landing during the async process round-trip is not a throw (so
               // the AbortError catch below misses it). Skip the commit so no

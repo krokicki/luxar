@@ -52,6 +52,12 @@ import {
 import type { LoadedLinesData } from '../../../../types/lines';
 import { log } from '../../../../utils/log';
 import { WorkerTimeoutError, WorkerUnavailableError } from '../../../../workers/worker-pool/errors';
+import { SliceCache } from '../../../../cache/slice-cache';
+import { perfCounters } from '../../../../profiling/perf-counters';
+import {
+  restoreLadder,
+  storeLadder,
+} from '../../../../data/loaders/progressive/slice-cache-helper';
 
 /**
  * Dispatcher-shaped result (keyed by `visibleSegmentCount`, plus empty
@@ -675,6 +681,24 @@ describe('projectLinesTo3DUsingWorker', () => {
       1
     );
 
+  it('projection.lines.worker counts every projection handed to the pool, a fallback included', async () => {
+    perfCounters.reset();
+    const projectLinesTo3D = vi.fn(async () => makeDispatcherLinesResult(1));
+    mockGetWorkerPool.mockReturnValue({
+      runWithTimeout: vi.fn(async (_op, _kind, fn) => fn({ projectLinesTo3D })),
+    });
+    await callProjectLines();
+    mockGetWorkerPool.mockReturnValue({
+      runWithTimeout: vi.fn(async () => {
+        throw new WorkerUnavailableError('[WorkerPool] No workers available after initialization');
+      }),
+    });
+    mockBuildInstanceBuffers.mockReturnValue(makeDispatcherLinesResult(3));
+    await callProjectLines();
+
+    expect(perfCounters.get('projection.lines.worker')).toBe(2);
+  });
+
   // Worker UNAVAILABILITY — the pool never got the work to a worker at all, so
   // the in-process dispatcher is the only executor left.
   it('falls back to the in-process dispatcher on WorkerUnavailableError', async () => {
@@ -784,5 +808,104 @@ describe('projectLinesTo3DUsingWorker', () => {
     });
     // The whole point: the main-thread dispatcher is NOT involved.
     expect(mockBuildInstanceBuffers).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A pool whose `runWithTimeout` honours the caller's signal the way the real
+ * pool does (rejects with a WorkerAbortError when it aborts) and otherwise
+ * never settles — a projection that would hold the update lock for its whole
+ * 50-150 ms run at 1-3M elements.
+ */
+function makeAbortablePool() {
+  const runWithTimeout = vi.fn(
+    (_op: string, _kind: string, _fn: unknown, signal?: AbortSignal) =>
+      new Promise((_, reject) => {
+        signal?.addEventListener('abort', () => {
+          const error = new Error('aborted by caller signal');
+          error.name = 'WorkerAbortError';
+          reject(error);
+        });
+      })
+  );
+  mockGetWorkerPool.mockReturnValue({ runWithTimeout });
+  return runWithTimeout;
+}
+
+describe('per-update abort signal through the lines projection (B7)', () => {
+  const vs = { displayDims: [0, 1, 2], slicePosition: [0, 0, 0], tolerance: [0, 0, 0] };
+
+  it('projectLinesTo3DUsingWorker passes the signal to runWithTimeout and rejects on abort', async () => {
+    const runWithTimeout = makeAbortablePool();
+    const controller = new AbortController();
+    const pass = projectLinesTo3DUsingWorker(makeData(), vs, [1, 1, 1], 1, controller.signal);
+    expect(runWithTimeout.mock.calls[0][3]).toBe(controller.signal);
+    controller.abort();
+    await expect(pass).rejects.toMatchObject({ name: 'WorkerAbortError' });
+    expect(mockBuildInstanceBuffers).not.toHaveBeenCalled();
+  });
+
+  it('processLinesData forwards the signal so a superseded pass rejects promptly', async () => {
+    const root = new THREE.Group();
+    root.add(makeMesh('/lines'));
+    const runWithTimeout = makeAbortablePool();
+    const controller = new AbortController();
+    const pass = processLinesData(
+      '/lines',
+      makeData(2000),
+      vs,
+      root,
+      1,
+      undefined,
+      controller.signal
+    );
+    await vi.waitFor(() => expect(runWithTimeout).toHaveBeenCalledTimes(1));
+    expect(runWithTimeout.mock.calls[0][3]).toBe(controller.signal);
+    controller.abort();
+    await expect(pass).rejects.toMatchObject({ name: 'WorkerAbortError' });
+  });
+});
+
+// Post-projection stage cache (#2944 B2) — the lines twin of the gsplats test.
+describe('projection stage cache (S-cache hit skips the worker projection)', () => {
+  it('an S-cache hit with unchanged projection params triggers no worker projection', async () => {
+    const root = new THREE.Group();
+    root.add(makeMesh('/lines'));
+    const projectLinesTo3D = vi.fn(async () => makeDispatcherLinesResult(2000));
+    const runWithTimeout = vi.fn(
+      async (_op: string, _kind: string, fn: (api: unknown) => unknown) => fn({ projectLinesTo3D })
+    );
+    mockGetWorkerPool.mockReturnValue({ runWithTimeout });
+
+    const segmentCount = 2000;
+    const data4d: LoadedLinesData = {
+      positions: new Float32Array(segmentCount * 2 * 4),
+      segments: new Uint32Array(segmentCount * 2),
+      widths: new Float32Array(segmentCount * 2),
+      colors: null,
+      sharpness: null,
+      segmentCount,
+      vertexCount: segmentCount * 2,
+      ndim: 4,
+    };
+    const view = {
+      displayDims: [0, 1, 2],
+      slicePosition: [0, 0, 0, 3],
+      tolerance: [0, 0, 0, 0.5],
+    };
+    const cache = new SliceCache({ maxSize: 64 * 1024 * 1024 });
+    storeLadder(cache, '/lines', view, [data4d]);
+    const hit = (): LoadedLinesData => {
+      const lods = restoreLadder<LoadedLinesData>(cache, '/lines', view, 1);
+      if (!lods) throw new Error('expected an S-cache hit');
+      return lods[0];
+    };
+
+    await processLinesData('/lines', hit(), view, root, 2);
+    expect(runWithTimeout).toHaveBeenCalledTimes(1);
+    const staged = await processLinesData('/lines', hit(), view, root, 2);
+    expect(runWithTimeout).toHaveBeenCalledTimes(1);
+    if (!staged || staged.noop) throw new Error('expected a geometry staged commit');
+    expect(staged.processed.segmentCount).toBe(2000);
   });
 });

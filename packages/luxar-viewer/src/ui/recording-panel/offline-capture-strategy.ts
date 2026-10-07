@@ -19,7 +19,9 @@
  *    mid-orbit can be mid-reload when it swings back, and capturing
  *    immediately bakes a coarse-level pop into the sequence (#1695).
  *    Skipped entirely — that mandatory rAF included — when the hook
- *    answers `null`, i.e. this scene has no lod_group to wait for
+ *    answers `null`, i.e. this scene has no lod_group to wait for —
+ *    then a depth re-sort for the pinned pose (`resortForCapture`), so an
+ *    order-dependent node is drawn with this frame's ordering
  * 3. Scene rendered (full pipeline, into the capture's own target)
  * 4. Pixels read back asynchronously (PBO fence on WebGL2, mapAsync on
  *    WebGPU) — the rAF loop keeps ticking through the await, which is
@@ -60,6 +62,7 @@
  */
 
 import { log, Modules } from '../../utils/log';
+import { getDensityGuard } from '../../scene/density-guard';
 import { showToast } from '../toast';
 import type { SceneManager } from '../../scene/scene-manager';
 import type { AnimationController } from '../../scene/animation/animation-controller';
@@ -200,6 +203,9 @@ export class OfflineCaptureStrategy implements CaptureStrategy {
     }
     session.isRecording = true;
     session.isOfflineCaptureActive = true;
+    // An export is a quality render: no projected-density thinning in it
+    // (released again by runCaptureTeardown).
+    getDensityGuard().setCaptureActive(true);
     session.recordingStartTime = Date.now();
     session.showRecordingIndicator();
 
@@ -279,7 +285,8 @@ export class OfflineCaptureStrategy implements CaptureStrategy {
       // would freeze depth order and LOD level at the opening pose
       // while the camera swings a full turn.
       this.animationController.startAnimation();
-      this.animationController.addPerFrameCallback(keepAliveId, () => {}, { continuous: true });
+      // Keep-alive only: it draws nothing (each capture renders its own pass).
+      this.animationController.addPerFrameCallback(keepAliveId, () => false, { continuous: true });
 
       const { capturedFrames, attemptedFrames } = await runFrameLoop({
         plan,

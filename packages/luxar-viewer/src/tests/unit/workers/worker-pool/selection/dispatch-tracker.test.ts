@@ -1,0 +1,122 @@
+/**
+ * Worker dispatch perf counters (`worker.dispatches`, `worker.busyMs`,
+ * `worker.misroutes`): the pure {@link DispatchTracker}, plus one WorkerPool
+ * integration case showing that a caller abort keeps `activeQueries` busy
+ * until the worker settles, avoiding a misroute to that worker.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DispatchTracker } from '../../../../../workers/worker-pool/selection/dispatch-tracker';
+import type { WorkerInstance } from '../../../../../workers/worker-pool/types';
+import { WorkerAbortError } from '../../../../../workers/worker-pool';
+import { perfCounters } from '../../../../../profiling/perf-counters';
+import { deferred } from '../../../../helpers/deferred';
+import { poolWithWorkers } from '../../../../helpers/fake-worker';
+
+function makeInstance(label: string): WorkerInstance {
+  return {
+    worker: { _label: label, terminate: vi.fn() } as unknown as Worker,
+    api: { _label: label } as unknown as WorkerInstance['api'],
+    activeQueries: 0,
+    wasmFallback: false,
+  };
+}
+
+const flush = async (): Promise<void> => {
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+};
+
+describe('DispatchTracker', () => {
+  let nowMs: number;
+
+  beforeEach(() => {
+    perfCounters.reset();
+    nowMs = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => nowMs);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('counts dispatches and sums worker-side busy time', async () => {
+    const tracker = new DispatchTracker();
+    const a = makeInstance('A');
+    const t1 = deferred();
+    const t2 = deferred();
+    tracker.dispatch(a.worker, [a], t1.promise);
+    nowMs = 5;
+    tracker.dispatch(a.worker, [a], t2.promise);
+    expect(tracker.inFlight(a.worker)).toBe(2);
+    nowMs = 12;
+    t1.resolve();
+    t2.reject(new Error('worker failed')); // a rejection still ends the task
+    await flush();
+    expect(tracker.inFlight(a.worker)).toBe(0);
+    expect(perfCounters.get('worker.dispatches')).toBe(2);
+    expect(perfCounters.get('worker.busyMs')).toBe(12 + 7);
+  });
+
+  it('flags a dispatch to a busy worker only while another worker is idle', async () => {
+    const tracker = new DispatchTracker();
+    const a = makeInstance('A');
+    const b = makeInstance('B');
+    const workers = [a, b];
+    const ta = deferred();
+    tracker.dispatch(a.worker, workers, ta.promise); // A idle: fine
+    tracker.dispatch(a.worker, workers, deferred().promise); // A busy, B idle: misroute
+    expect(perfCounters.get('worker.misroutes')).toBe(1);
+
+    tracker.dispatch(b.worker, workers, deferred().promise); // B idle: fine
+    tracker.dispatch(a.worker, workers, deferred().promise); // both busy: not a misroute
+    expect(perfCounters.get('worker.misroutes')).toBe(1);
+    expect(perfCounters.get('worker.dispatches')).toBe(4);
+
+    ta.resolve();
+    await flush();
+    expect(tracker.inFlight(a.worker)).toBe(2);
+  });
+
+  it('a single-worker pool never misroutes', () => {
+    const tracker = new DispatchTracker();
+    const a = makeInstance('A');
+    tracker.dispatch(a.worker, [a], deferred().promise);
+    tracker.dispatch(a.worker, [a], deferred().promise);
+    expect(perfCounters.get('worker.misroutes')).toBe(0);
+  });
+});
+
+describe('WorkerPool dispatch counters', () => {
+  beforeEach(() => {
+    perfCounters.reset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('no misroute after a caller abort: the slot stays busy until the worker settles (B7)', async () => {
+    const a = makeInstance('A');
+    const b = makeInstance('B');
+    const typed = poolWithWorkers([a, b]);
+
+    const stuck = deferred<string>();
+    const controller = new AbortController();
+    const first = typed.runWithTimeout('op', 'decode', () => stuck.promise, controller.signal);
+    await flush();
+    controller.abort();
+    await expect(first).rejects.toBeInstanceOf(WorkerAbortError);
+    // Before B7 the caller-side race released this slot while A still ran the
+    // abandoned task, so the next dispatch tied at A and was counted a misroute.
+    expect(a.activeQueries).toBe(1);
+
+    const second = typed.runWithTimeout('op', 'decode', () => Promise.resolve('ok'));
+    await expect(second).resolves.toBe('ok');
+    expect(perfCounters.get('worker.dispatches')).toBe(2);
+    expect(perfCounters.get('worker.misroutes')).toBe(0);
+
+    stuck.resolve('late');
+    await flush();
+    expect(a.activeQueries).toBe(0);
+  });
+});

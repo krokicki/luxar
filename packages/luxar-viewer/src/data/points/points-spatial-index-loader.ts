@@ -7,8 +7,10 @@
  */
 
 import * as zarr from '../zarr';
+import type { FetchPriority } from '../../utils/fetch-concurrency';
+import { LoaderLifetime } from '../loaders/loader-lifetime';
 import { isArrayListed } from '../loaders/optional-array-listing';
-import { log, Modules } from '../../utils/log';
+import { log, LogEmoji, Modules } from '../../utils/log';
 import { clamp } from '../../utils/clamp';
 import {
   DataLoader,
@@ -56,13 +58,10 @@ import {
   colorComponentsOf,
   prefetchRangesIntoCache,
   planChunkBoundaryViewStates,
-  OnceInit,
   makeInitialLoaderMetrics,
   buildSpatialIndexMetrics,
   loadSliceWithCache,
   recordLoadMetrics,
-  runWithActiveSignal,
-  runWithResidencyProbe,
   type SpatialFacadeCtx,
   LoaderEventEmitter,
   warnExtendToAllNoDimensions,
@@ -76,7 +75,6 @@ import { config as appConfig } from '../../config';
 import type { UpdateSession } from '../../profiling/update-profiler';
 import { DecompressedChunkCache } from '../../cache/decompressed-chunk-cache';
 import { wrapWithCache } from '../../cache/decompressed-chunk-cache/cached-zarr-array';
-import { ResidencyAccumulator } from '../../cache/residency-probe';
 import { ChunkPrefetcher } from '../../cache/chunk-prefetcher';
 import type { SliceCache } from '../../cache/slice-cache';
 
@@ -112,7 +110,13 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
   private _effectiveRadiusConfig: EffectiveRadiusConfig | null = null;
   private zarrLocation: zarr.Location<zarr.Readable>;
   private node: SceneNode;
-  private _onceInit = new OnceInit();
+  /**
+   * Disposed latch, lifetime signal, one-shot initialization and the per-call
+   * demand-load context (`lifetime.calls`) the wrapped arrays' getChunk reads
+   * through the `() => this._lifetime.calls.signal` / `.probe` thunks below
+   * (see `LoaderLifetime`, `ActiveLoadContext`).
+   */
+  private readonly _lifetime = new LoaderLifetime();
   private arrays: {
     positions?: zarr.Array<zarr.DataType, zarr.Readable>;
     colors?: zarr.Array<zarr.DataType, zarr.Readable>;
@@ -152,16 +156,6 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
   // L0 decompressed chunk cache (optional, avoids Blosc decompression on repeat access)
   private l0Cache: DecompressedChunkCache | null = null;
 
-  // Active cache-residency probe for the in-flight demand load. Set by
-  // updateViewWithResidency() and read by the wrapped arrays' getChunk;
-  // null at all other times (so prefetch traffic isn't recorded).
-  private _activeProbe: ResidencyAccumulator | null = null;
-  // Per-update abort signal for the in-flight `updateView`. Set at the top of
-  // `updateView` and cleared in its `finally`; read by the `wrapWithCache` L0
-  // proxy (via the `() => this._activeSignal` thunk below) so a superseded
-  // update bails before fetch/decode. Mirrors `_activeProbe`'s lifetime.
-  private _activeSignal: AbortSignal | null = null;
-
   // Chunk prefetcher (optional, for registering array bounds to suppress 404s)
   private prefetcher: ChunkPrefetcher | null = null;
 
@@ -193,11 +187,22 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
     this.zarrLocation = zarrLocation;
     this.node = node;
     this.rangeLoader = new RangeLoader(refRegistry || new ArrayRefRegistry());
-    // Forward the per-update abort signal into worker decodes (LUT/quantized/
-    // broadcasted) so a superseded update's decode bails before dispatch.
-    this.rangeLoader.setSignalSource(() => this._activeSignal);
+    // Initial builds have no update signal; their decodes still belong to this loader.
+    this.rangeLoader.setSignalSource(() => this._lifetime.calls.signal ?? this._lifetime.signal);
     this.zarrStore = zarrStore || null;
     this.l0Cache = l0Cache || null;
+    // array_ref targets: opened once per (store, target) and read through L0
+    // with this loader's hooks, exactly like its own attribute arrays.
+    if (l0Cache) {
+      this.rangeLoader.setRefTargetWrapper({
+        wrap: (array, targetPath) =>
+          wrapWithCache(array, l0Cache, targetPath, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          }),
+        epoch: () => l0Cache.generation,
+      });
+    }
     this.prefetcher = prefetcher || null;
     this.sliceCache = sliceCache || null;
     this.metrics = makeInitialLoaderMetrics('point-spatial-index', node.path);
@@ -210,6 +215,7 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
       nextQueryId: () => this.nextQueryId++,
       accumulatorMemoryMB: () => this.getAccumulatorStats()?.memoryMB ?? 0,
       emit: (event) => this.emitEvent(event),
+      activeSignal: () => this._lifetime.calls.signal,
     };
   }
 
@@ -223,19 +229,83 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
   }
 
   /**
+   * Initialize metadata once without loading any attribute payload chunks,
+   * under the disposed latch (`LoaderLifetime.ensureInitialized`): a disposed
+   * loader refuses to re-initialize, and an initialization still in flight
+   * when {@link dispose} runs is discarded instead of repopulating the loader.
+   *
+   * `priority` classes the `chunk_bounds` read of an initialization THIS call
+   * starts (B6: a progressive loader warms rung k+1's index at
+   * `'refinement'` while rung k loads; the speculative entry points pass
+   * `'speculative'`). A later call without one raises an in-flight warm to
+   * `demand`.
+   */
+  ensureInitialized(priority?: FetchPriority): Promise<void> {
+    return this._lifetime.ensureInitialized(
+      `Points loader ${this.node.path}`,
+      (signal) => this.initialize(signal),
+      () => this.dispose(),
+      priority
+    );
+  }
+
+  /**
    * Initialize the loader by loading spatial index and opening arrays
    */
-  async initialize(): Promise<void> {
+  async initialize(signal?: AbortSignal): Promise<void> {
     // Load chunk-based spatial index
     try {
+      const spatialExtendDims = await this.loadSpatialExtendDimsFromSceneDimensions();
+      if (spatialExtendDims) {
+        this._effectiveRadiusConfig = {
+          spatialExtendDims,
+          maxRadius: this.attrs.max_radius || appConfig.dataLoading.spatial.defaultMaxRadius,
+        };
+
+        const spatialDims = spatialExtendDims
+          .map((isSpatial: boolean, idx: number) => (isSpatial ? idx : null))
+          .filter((idx: number | null) => idx !== null);
+
+        log.info(
+          Modules.SPATIAL_INDEX_LOADER,
+          `Spatial extension enabled for dimensions: [${spatialDims.join(', ')}]`
+        );
+      }
+
+      // Open radii for effective-radius projection when available.
+      if (!isArrayListed(this.node, 'radii')) {
+        log.info(
+          Modules.SPATIAL_INDEX_LOADER,
+          'No radii array in the store listing (using default radii)'
+        );
+      } else {
+        try {
+          let radiiArray = await zarr.open(this.zarrLocation.resolve('radii'), { kind: 'array' });
+          this.registerBounds('radii', radiiArray);
+          if (this.l0Cache) {
+            radiiArray = wrapWithCache(radiiArray, this.l0Cache, `${this.node.path}/radii`, {
+              getProbe: () => this._lifetime.calls.probe,
+              getSignal: () => this._lifetime.calls.signal,
+            });
+          }
+          this.arrays.radii = radiiArray;
+        } catch (e: unknown) {
+          if (!isNotFoundError(e)) {
+            log.info(Modules.SPATIAL_INDEX_LOADER, 'No radii array found (using default radii)');
+          }
+        }
+      }
+
       this.chunkIndex = await loadPointsChunkIndex(
         this.zarrLocation,
-        this.node.attrs as PointsNodeAttrs
+        this.node.attrs as PointsNodeAttrs,
+        signal
       );
 
       if (!this.chunkIndex) {
         // For 3D datasets without Morton ordering, fall back to loading all points
-        log.info(
+        log.verbose(
+          LogEmoji.QUERY,
           Modules.SPATIAL_INDEX_LOADER,
           `No chunk-based index for ${this.node.path} - will load all points`
         );
@@ -262,7 +332,8 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
           }
 
           if (this.totalPointsNoIndex > 0) {
-            log.query(
+            log.verbose(
+              LogEmoji.QUERY,
               Modules.SPATIAL_INDEX_LOADER,
               `Detected ${this.totalPointsNoIndex} points in 3D dataset`
             );
@@ -271,7 +342,7 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
           // Check if this is an nD dataset (ndim > 3) without spatial indexing
           // This is inefficient because ALL points must be loaded for each view
           const ndim = positionsArray.shape[1] || 3;
-          if (ndim > 3) {
+          if (ndim > 3 && (!this.node.attrs.ordering || this.node.attrs.ordering === 'none')) {
             log.warning(
               Modules.SPATIAL_INDEX_LOADER,
               `⚠️ nD dataset (${ndim}D) without spatial index for ${this.node.path}. ` +
@@ -288,7 +359,8 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
         }
       } else {
         // Chunk index loaded successfully
-        log.query(
+        log.verbose(
+          LogEmoji.QUERY,
           Modules.SPATIAL_INDEX_LOADER,
           `Chunk index loaded: ${this.chunkIndex.metadata.total_chunks} chunks, ${this.chunkIndex.metadata.total_points} points`
         );
@@ -299,26 +371,6 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
         log.info(
           Modules.SPATIAL_INDEX_LOADER,
           `  Ordering dims: [${this.chunkIndex.metadata.ordering_dims.join(', ')}], Slice dims: [${this.chunkIndex.metadata.slice_dims.join(', ')}]`
-        );
-      }
-
-      // Load spatial extension configuration from scene_dimensions (derived from root attributes)
-      // This determines which dimensions points physically extend through vs categorical dimensions
-      const spatialExtendDims = await this.loadSpatialExtendDimsFromSceneDimensions();
-      if (spatialExtendDims) {
-        this._effectiveRadiusConfig = {
-          spatialExtendDims: spatialExtendDims,
-          maxRadius: this.attrs.max_radius || appConfig.dataLoading.spatial.defaultMaxRadius,
-        };
-
-        // Log which dimensions are spatial
-        const spatialDims = spatialExtendDims
-          .map((isSpatial: boolean, idx: number) => (isSpatial ? idx : null))
-          .filter((idx: number | null) => idx !== null);
-
-        log.info(
-          Modules.SPATIAL_INDEX_LOADER,
-          `Spatial extension enabled for dimensions: [${spatialDims.join(', ')}]`
         );
       }
     } catch (error) {
@@ -342,8 +394,10 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
           positionsArray,
           this.l0Cache,
           `${this.node.path}/positions`,
-          () => this._activeProbe,
-          () => this._activeSignal
+          {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          }
         );
       }
       this.arrays.positions = positionsArray;
@@ -364,13 +418,10 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
         this.registerBounds('colors', colorsArray);
         // Wrap with L0 cache if enabled
         if (this.l0Cache) {
-          colorsArray = wrapWithCache(
-            colorsArray,
-            this.l0Cache,
-            `${this.node.path}/colors`,
-            () => this._activeProbe,
-            () => this._activeSignal
-          );
+          colorsArray = wrapWithCache(colorsArray, this.l0Cache, `${this.node.path}/colors`, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          });
         }
         this.arrays.colors = colorsArray;
         // Learn the color layout (3 = RGB, 4 = RGBA) from the zarr shape at
@@ -381,34 +432,6 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
         // Colors are optional - only log if it's not a 404
         if (!isNotFoundError(e)) {
           log.info(Modules.SPATIAL_INDEX_LOADER, 'No colors array found (using default colors)');
-        }
-      }
-    }
-
-    if (!isArrayListed(this.node, 'radii')) {
-      log.info(
-        Modules.SPATIAL_INDEX_LOADER,
-        'No radii array in the store listing (using default radii)'
-      );
-    } else {
-      try {
-        let radiiArray = await zarr.open(this.zarrLocation.resolve('radii'), { kind: 'array' });
-        this.registerBounds('radii', radiiArray);
-        // Wrap with L0 cache if enabled
-        if (this.l0Cache) {
-          radiiArray = wrapWithCache(
-            radiiArray,
-            this.l0Cache,
-            `${this.node.path}/radii`,
-            () => this._activeProbe,
-            () => this._activeSignal
-          );
-        }
-        this.arrays.radii = radiiArray;
-      } catch (e: unknown) {
-        // Radii are optional - only log if it's not a 404
-        if (!isNotFoundError(e)) {
-          log.info(Modules.SPATIAL_INDEX_LOADER, 'No radii array found (using default radii)');
         }
       }
     }
@@ -430,8 +453,10 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
             sharpnessArray,
             this.l0Cache,
             `${this.node.path}/sharpnesses`,
-            () => this._activeProbe,
-            () => this._activeSignal
+            {
+              getProbe: () => this._lifetime.calls.probe,
+              getSignal: () => this._lifetime.calls.signal,
+            }
           );
         }
         this.arrays.sharpness = sharpnessArray;
@@ -455,13 +480,10 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
         });
         this.registerBounds('scalars', scalarsArray);
         if (this.l0Cache) {
-          scalarsArray = wrapWithCache(
-            scalarsArray,
-            this.l0Cache,
-            `${this.node.path}/scalars`,
-            () => this._activeProbe,
-            () => this._activeSignal
-          );
+          scalarsArray = wrapWithCache(scalarsArray, this.l0Cache, `${this.node.path}/scalars`, {
+            getProbe: () => this._lifetime.calls.probe,
+            getSignal: () => this._lifetime.calls.signal,
+          });
         }
         this.arrays.scalars = scalarsArray;
       } catch (e: unknown) {
@@ -523,7 +545,7 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
     queryId: string,
     startTime: number
   ): Promise<LoadedPointsData> {
-    await this._onceInit.ensure(() => this.initialize());
+    await this.ensureInitialized();
 
     // Check if loader is properly initialized (chunk index OR fallback with total points count)
     if (!this.chunkIndex && this.totalPointsNoIndex === 0) {
@@ -609,7 +631,8 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
     const loadSession = session?.begin('Load Arrays');
     try {
       if (!this._initialLoadDone) {
-        log.load(
+        log.verbose(
+          LogEmoji.LOAD,
           Modules.SPATIAL_INDEX_LOADER,
           `Loading attributes concurrently for ${ranges.length} ranges`
         );
@@ -747,6 +770,14 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
         : this.chunkIndex?.metadata.ndim || 3;
     const wasm = await getPointsBackend(ndimForBackend);
 
+    // Disposed mid-load (dataset switch tore this loader down while the chunk
+    // reads or the backend load were in flight): the update was abandoned on
+    // purpose. Bail as a cancellation — run-loader-updates' isAbortError branch
+    // stages null quietly — instead of projecting into a disposed accumulator
+    // and handing back a payload for a loader that no longer exists. The
+    // Points counterpart of the Lines/GSplats accumulator-identity guard.
+    this._lifetime.throwIfDisposed(`Points loader disposed during load: ${this.node.path}`);
+
     let result: LoadedPointsData;
     if (session) {
       const projectSession = session.begin('Project to 3D');
@@ -797,33 +828,26 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
     session?: UpdateSession,
     signal?: AbortSignal
   ): Promise<LoadedPointsData> {
-    return runWithActiveSignal(
-      (s) => (this._activeSignal = s),
-      signal,
-      async () => {
-        const result = await this.loadPoints(viewState, session);
-        if (!this._initialLoadDone) {
-          this._initialLoadDone = true;
-          this.rangeLoader.setVerbose(false);
-        }
-        return result;
+    return this._lifetime.calls.runWithSignal(signal, async () => {
+      const result = await this.loadPoints(viewState, session);
+      if (!this._initialLoadDone) {
+        this._initialLoadDone = true;
+        this.rangeLoader.setVerbose(false);
       }
-    );
+      return result;
+    });
   }
 
   /**
    * Like {@link updateView} but also reports whether the load was served
-   * entirely from cache (see `runWithResidencyProbe`).
+   * entirely from cache (see `ActiveLoadContext.runWithProbe`).
    */
   async updateViewWithResidency(
     viewState: ViewState,
     session?: UpdateSession,
     signal?: AbortSignal
   ): Promise<{ data: LoadedPointsData; allResident: boolean }> {
-    return runWithResidencyProbe(
-      (p) => (this._activeProbe = p),
-      () => this.updateView(viewState, session, signal)
-    );
+    return this._lifetime.calls.runWithProbe(() => this.updateView(viewState, session, signal));
   }
 
   /**
@@ -831,12 +855,15 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
    *
    * Mirrors `GSplatsSpatialIndexLoader.prefetchChunks` so the dimension
    * animation controller can fire `prefetchChunks(nextSlice)` while the
-   * current frame renders, hiding network latency. The returned typed
-   * arrays are discarded — only the L0 + L1 + L2 caches and the prefetch
-   * queue's `seen`/parsed-cache get populated as a side-effect.
+   * current frame renders, hiding network latency. Each distinct chunk the
+   * visible ranges touch is fetched (L1/L2) and decoded into L0 via the proxy's
+   * `warmChunk` — no zarr `get()`, so no output selection is assembled, and the
+   * demand load's abort signal / residency probe are not consulted (see
+   * `prefetchRangesIntoCache`).
    */
-  async prefetchChunks(viewState: ViewState): Promise<void> {
-    await this._onceInit.ensure(() => this.initialize());
+  async prefetchChunks(viewState: ViewState, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
+    await this.ensureInitialized('speculative');
 
     if (!this.arrays.positions) return;
 
@@ -851,25 +878,30 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
     }
     if (ranges.length === 0) return;
 
-    await prefetchRangesIntoCache(this.prefetchArrays(), ranges);
+    await prefetchRangesIntoCache(this.prefetchArrays(), ranges, signal);
   }
 
-  async prefetchChunkBoundary(current: ViewState, predicted: ViewState): Promise<void> {
-    await this._onceInit.ensure(() => this.initialize());
+  async prefetchChunkBoundary(
+    current: ViewState,
+    predicted: ViewState,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (signal?.aborted) return;
+    await this.ensureInitialized('speculative');
     if (!this.chunkIndex || !this.arrays.positions) {
-      await this.prefetchChunks(predicted);
+      await this.prefetchChunks(predicted, signal);
       return;
     }
     let ranges: PointRange[];
     try {
       ranges = await this.queryVisiblePointRanges(current);
     } catch {
-      await this.prefetchChunks(predicted);
+      await this.prefetchChunks(predicted, signal);
       return;
     }
     const arrays = this.prefetchArrays();
     const views = planChunkBoundaryViewStates(current, predicted, ranges, this.chunkIndex, arrays);
-    await Promise.all(views.map((view) => this.prefetchChunks(view)));
+    await Promise.all(views.map((view) => this.prefetchChunks(view, signal)));
   }
 
   private prefetchArrays(): zarr.Array<zarr.DataType, zarr.Readable>[] {
@@ -920,7 +952,11 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
       const totalPoints: number = (this.node.attrs.n_points ||
         this.totalPointsNoIndex ||
         0) as number;
-      log.query(Modules.SPATIAL_INDEX_LOADER, `No index: loading all ${totalPoints} points`);
+      log.verbose(
+        LogEmoji.QUERY,
+        Modules.SPATIAL_INDEX_LOADER,
+        `No index: loading all ${totalPoints} points`
+      );
       return [{ start: 0, end: totalPoints }];
     }
 
@@ -1095,7 +1131,11 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
     const totalPoints = ranges.reduce((sum, r) => sum + (r.end - r.start), 0);
 
     if (!this._initialLoadDone) {
-      log.load(Modules.SPATIAL_INDEX_LOADER, `Loading colors for ${ranges.length} ranges`);
+      log.verbose(
+        LogEmoji.LOAD,
+        Modules.SPATIAL_INDEX_LOADER,
+        `Loading colors for ${ranges.length} ranges`
+      );
     }
 
     const output = await loadColorRanges(array, ranges, this.rangeLoader, storeToUse, 'Points');
@@ -1128,7 +1168,11 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
     if (!array) return null;
 
     if (!this._initialLoadDone) {
-      log.load(Modules.SPATIAL_INDEX_LOADER, `Loading ${arrayName} for ${ranges.length} ranges`);
+      log.verbose(
+        LogEmoji.LOAD,
+        Modules.SPATIAL_INDEX_LOADER,
+        `Loading ${arrayName} for ${ranges.length} ranges`
+      );
     }
 
     // Analyze array metadata
@@ -1475,9 +1519,9 @@ export class PointsSpatialIndexLoader implements DataLoader, LoaderMonitor {
    * Clean up resources
    */
   dispose(): void {
+    this._lifetime.dispose();
     this.chunkIndex = null;
     this.arrays = {};
-    this._onceInit.reset();
     this.events.clear();
     this.activeQueries.clear();
 

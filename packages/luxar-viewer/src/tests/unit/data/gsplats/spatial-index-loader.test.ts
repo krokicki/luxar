@@ -35,6 +35,7 @@ import { makeMockZarrLocation } from '../../../builders/spatial-loader-fixtures'
 import { SliceCache } from '../../../../cache/slice-cache';
 import { log } from '../../../../utils/log';
 import { MIN_TRUNCATION_RADIUS } from '../../../../rendering/materials/gsplat/math';
+import { signalPriority } from '../../../../utils/fetch-concurrency';
 
 vi.mock('zarrita', () => ({
   registry: {},
@@ -182,18 +183,49 @@ describe('GSplatsSpatialIndexLoader', () => {
     let mockZarrLocation: { resolve: ReturnType<typeof vi.fn> };
     let mockNode: SceneNode;
     let mockArrays: {
-      centers: { shape: number[]; chunks: number[]; dtype: string; attrs?: object };
-      amplitudes: { shape: number[]; chunks: number[]; dtype: string; attrs?: object };
+      centers: {
+        shape: number[];
+        chunks: number[];
+        dtype: string;
+        attrs?: object;
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
+      amplitudes: {
+        shape: number[];
+        chunks: number[];
+        dtype: string;
+        attrs?: object;
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
       // v3.1 split Cholesky layout (diagonal + off-diagonal).
-      cholesky_factors_diag: { shape: number[]; chunks: number[]; dtype: string; attrs?: object };
+      cholesky_factors_diag: {
+        shape: number[];
+        chunks: number[];
+        dtype: string;
+        attrs?: object;
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
       cholesky_factors_offdiag: {
         shape: number[];
         chunks: number[];
         dtype: string;
         attrs?: object;
+        getChunk?: ReturnType<typeof vi.fn>;
       };
-      colors: { shape: number[]; chunks: number[]; dtype: string; attrs?: object };
-      label_ids: { shape: number[]; chunks: number[]; dtype: string; attrs?: object };
+      colors: {
+        shape: number[];
+        chunks: number[];
+        dtype: string;
+        attrs?: object;
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
+      label_ids: {
+        shape: number[];
+        chunks: number[];
+        dtype: string;
+        attrs?: object;
+        getChunk?: ReturnType<typeof vi.fn>;
+      };
     };
     let chunkBoundsArray: { shape: number[]; dtype: string; attrs: object };
 
@@ -219,6 +251,13 @@ describe('GSplatsSpatialIndexLoader', () => {
         colors: { shape: [5000, 3], chunks: [256, 3], dtype: 'float32', attrs: {} },
         label_ids: { shape: [5000], chunks: [256], dtype: 'uint64', attrs: {} },
       };
+      // Prefetch warms chunk-by-chunk through getChunk (never zarr.get), so the
+      // attribute mocks need one; demand loads still go through zarr.get.
+      for (const arr of Object.values(mockArrays)) {
+        arr.getChunk = vi
+          .fn()
+          .mockResolvedValue({ data: new Float32Array(1), shape: [1], stride: [1] });
+      }
 
       mockZarrLocation = makeMockZarrLocation();
       mockNode = makeGSplatsNode();
@@ -1637,6 +1676,93 @@ describe('GSplatsSpatialIndexLoader', () => {
     });
 
     describe('resource cleanup', () => {
+      it('an initialize still in flight at dispose does not repopulate the loader', async () => {
+        // dispose() resets the one-shot initializer and clears the arrays, but an
+        // initialize() already awaiting its metadata opens used to finish afterwards
+        // and write chunkIndex / arrays back into the disposed loader.
+        const view: ViewState = {
+          displayDims: [0, 1, 2],
+          slicePosition: [0, 0, 0],
+          tolerance: [0, 0, 0],
+        };
+        const open = zarr.open as any;
+        const original = open.getMockImplementation() as (...args: unknown[]) => unknown;
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        open.mockImplementation((...args: unknown[]) => gate.then(() => original(...args)));
+        const load = bodyLoader.loadGSplats(view);
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+
+        bodyLoader.dispose();
+        release();
+
+        await expect(load).rejects.toMatchObject({ name: 'AbortError' });
+        expect((bodyLoader as any).chunkIndex).toBeNull();
+        expect((bodyLoader as any).arrays).toEqual({});
+      });
+
+      it("dispose aborts a speculative initialization's chunk_bounds read", async () => {
+        // ensureInitialized('speculative') minted its own never-aborted signal,
+        // so a warm-up of a rung that was then torn down kept its index read
+        // on the wire for a loader nothing will use.
+        const get = zarr.get as unknown as ReturnType<typeof vi.fn>;
+        const original = get.getMockImplementation() as (...args: unknown[]) => unknown;
+        let seen: AbortSignal | undefined;
+        let release!: () => void;
+        const blocked = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        get.mockImplementation((...args: unknown[]) => {
+          const opts = args[2] as { signal?: AbortSignal } | undefined;
+          if (opts?.signal) {
+            seen = opts.signal;
+            return blocked.then(() => original(...args));
+          }
+          return original(...args);
+        });
+        const fresh = new GSplatsSpatialIndexLoader(
+          mockZarrLocation as unknown as ConstructorParameters<typeof GSplatsSpatialIndexLoader>[0],
+          makeGSplatsNode()
+        );
+        const init = fresh.ensureInitialized('speculative').catch(() => undefined);
+        await vi.waitFor(() => expect(seen).toBeDefined());
+
+        fresh.dispose();
+
+        expect(seen!.aborted).toBe(true);
+        release();
+        await init;
+      });
+
+      it('detaches a completed speculative initialization from the loader lifetime', async () => {
+        const fresh = new GSplatsSpatialIndexLoader(
+          mockZarrLocation as unknown as ConstructorParameters<typeof GSplatsSpatialIndexLoader>[0],
+          makeGSplatsNode()
+        );
+        const lifetimeSignal = (fresh as any)._lifetime.signal as AbortSignal;
+        const remove = vi.spyOn(lifetimeSignal, 'removeEventListener');
+        await fresh.ensureInitialized('speculative');
+        expect(remove.mock.calls.some(([event]) => event === 'abort')).toBe(true);
+        fresh.dispose();
+      });
+
+      it('a disposed loader refuses to re-initialize', async () => {
+        bodyLoader.dispose();
+        (zarr.open as unknown as ReturnType<typeof vi.fn>).mockClear();
+        await expect(
+          bodyLoader.loadGSplats({
+            displayDims: [0, 1, 2],
+            slicePosition: [0, 0, 0],
+            tolerance: [0, 0, 0],
+          })
+        ).rejects.toMatchObject({
+          name: 'AbortError',
+        });
+        expect(zarr.open).not.toHaveBeenCalled();
+      });
+
       it('dispose clears the active-query map (mid-flight leak guard)', async () => {
         // Regression (×3 symmetric): points dispose() historically omitted
         // activeQueries.clear(), so a dispose mid-flight leaked the tracked
@@ -1793,6 +1919,20 @@ describe('GSplatsSpatialIndexLoader', () => {
     // two test files (justified asymmetry).
     // ────────────────────────────────────────────────────────────────
     describe('prefetchChunks (gsplats-only)', () => {
+      /** Chunk warm-ups issued so far (prefetch warms via getChunk, not get). */
+      const warmCalls = (): number =>
+        Object.values(mockArrays).reduce(
+          (n: number, arr: any) => n + (arr.getChunk.mock.calls.length as number),
+          0
+        );
+      /** get() calls that read an attribute array (prefetch must issue none). */
+      const attributeGets = (): unknown[] => {
+        const attributeArrays = new Set<unknown>(Object.values(mockArrays));
+        return (zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls.filter((call) =>
+          attributeArrays.has(call[0])
+        );
+      };
+
       it('does no initialization or query work for an already-aborted request', async () => {
         const controller = new AbortController();
         controller.abort();
@@ -1829,7 +1969,26 @@ describe('GSplatsSpatialIndexLoader', () => {
           [0, 0, 1],
           [0, 0, 2],
         ]);
-        expect((zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(6);
+        // The predicted slice alone: chunk 0 of each of the five arrays.
+        expect(warmCalls()).toBe(5);
+        expect(attributeGets()).toHaveLength(0);
+      });
+
+      it('forwards the predicted-view signal to the warm-up it falls back to', async () => {
+        const current: ViewState = {
+          displayDims: [0, 1],
+          slicePosition: [0, 0, 1],
+          tolerance: [0, 0, 0],
+        };
+        const predicted = { ...current, slicePosition: [0, 0, 2] };
+        mockExecute.mockRejectedValueOnce(new Error('malformed current view'));
+        mockExecute.mockResolvedValue([{ start: 100, end: 200 }]);
+        const spy = vi.spyOn(bodyLoader, 'prefetchChunks');
+        const signal = new AbortController().signal;
+
+        await bodyLoader.prefetchChunkBoundary(current, predicted, signal);
+
+        expect(spy).toHaveBeenCalledWith(predicted, signal);
       });
 
       it('warms the predicted slice and only the nearest next chunk boundary', async () => {
@@ -1880,7 +2039,9 @@ describe('GSplatsSpatialIndexLoader', () => {
           SpatialQueryBuilder as unknown as ReturnType<typeof vi.fn>
         ).mock.calls.map((call) => (call[1] as ViewState).slicePosition[3]);
         expect(queriedTimes).toEqual([1, 2, 4]);
-        expect((zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(10);
+        // Two warmed views × five arrays; rows [100, 200) sit in chunk 0 of each.
+        expect(warmCalls()).toBe(10);
+        expect(attributeGets()).toHaveLength(0);
       });
 
       it('estimates the visible sliced working set from stored chunk dtypes', async () => {
@@ -1936,7 +2097,7 @@ describe('GSplatsSpatialIndexLoader', () => {
         expect(mockExecute).toHaveBeenCalledTimes(1);
       });
 
-      it('warms the cache with zarr.get on every array × range', async () => {
+      it('warms each touched chunk of every array without zarr.get', async () => {
         mockExecute.mockResolvedValueOnce([{ start: 0, end: 50 }]);
 
         const viewState: ViewState = {
@@ -1947,10 +2108,12 @@ describe('GSplatsSpatialIndexLoader', () => {
 
         await bodyLoader.prefetchChunks(viewState);
 
-        // Required arrays + colors = 4 arrays. With 1 range each → 4 get() calls.
-        // Plus 1 chunk_bounds get() during initialize().
-        const getCalls = (zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls;
-        expect(getCalls.length).toBeGreaterThanOrEqual(4);
+        // Rows [0, 50) sit in chunk 0 of each of the five arrays (centers,
+        // amplitudes, both Cholesky halves, colors): one warm-up each and no
+        // output-assembling get() (initialize()'s chunk_bounds read aside).
+        expect(warmCalls()).toBe(5);
+        expect(mockArrays.centers.getChunk!.mock.calls[0][0]).toEqual([0, 0]);
+        expect(attributeGets()).toHaveLength(0);
       });
 
       it('includes label_ids when the categorical channel is declared', async () => {
@@ -1973,11 +2136,7 @@ describe('GSplatsSpatialIndexLoader', () => {
           tolerance: [0, 0, 0],
         });
 
-        expect(
-          (zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls.some(
-            ([array]) => array === mockArrays.label_ids
-          )
-        ).toBe(true);
+        expect(mockArrays.label_ids.getChunk!).toHaveBeenCalled();
       });
 
       it('skips fetches when the spatial query returns no ranges', async () => {
@@ -1989,7 +2148,7 @@ describe('GSplatsSpatialIndexLoader', () => {
           tolerance: [0, 0, 0],
         });
 
-        const callsBefore = (zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+        const callsBefore = warmCalls();
 
         // Second prefetch with no ranges → no additional fetches.
         mockExecute.mockResolvedValueOnce([]);
@@ -1999,9 +2158,43 @@ describe('GSplatsSpatialIndexLoader', () => {
           tolerance: [0, 0, 0],
         });
 
-        const callsAfter = (zarr.get as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
+        const callsAfter = warmCalls();
         expect(callsAfter).toBe(callsBefore);
       });
     });
+  });
+});
+
+describe('GSplatsSpatialIndexLoader — speculative calls keep a refinement-class index warm (B6)', () => {
+  it('planPrefetch / prefetchChunks / prefetchChunkBoundary do not raise it to demand', async () => {
+    const loader = new GSplatsSpatialIndexLoader(
+      makeMockZarrLocation() as unknown as ConstructorParameters<
+        typeof GSplatsSpatialIndexLoader
+      >[0],
+      makeGSplatsNode()
+    );
+    let initSignal: AbortSignal | undefined;
+    vi.spyOn(loader, 'initialize').mockImplementation((signal?: AbortSignal) => {
+      initSignal = signal;
+      return new Promise<void>(() => undefined);
+    });
+    const view: ViewState = {
+      displayDims: [0, 1, 2],
+      slicePosition: [0, 0, 0],
+      tolerance: [0, 0, 0],
+    };
+
+    void loader.ensureInitialized('refinement');
+    void loader.planPrefetch(view);
+    void loader.prefetchChunks(view);
+    void loader.prefetchChunkBoundary(view, view);
+    await Promise.resolve();
+    // A speculative warm-up of rung k+1 is not a frame waiting on the index.
+    expect(signalPriority(initSignal)?.value).toBe('refinement');
+
+    // A demand load still raises it.
+    void loader.ensureInitialized();
+    expect(signalPriority(initSignal)?.value).toBe('demand');
+    loader.dispose();
   });
 });

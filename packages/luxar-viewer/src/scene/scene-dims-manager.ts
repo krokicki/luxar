@@ -40,6 +40,16 @@ export function snapDiscreteValue(value: number, step: number, min: number, max:
   return snapped;
 }
 
+function constrainDimensionValue(
+  value: number,
+  range: [number, number] | undefined,
+  metadata: DimensionMetadata | undefined
+): number {
+  const [min, max] = range ?? [-Infinity, Infinity];
+  const clamped = range ? clamp(value, min, max) : value;
+  return metadata?.discrete ? snapDiscreteValue(clamped, metadata.step || 1.0, min, max) : clamped;
+}
+
 /**
  * Centralized dimension state manager ensuring consistency across all nD objects in the scene.
  *
@@ -93,7 +103,7 @@ export class SceneDimsManager {
   private dimensionRanges: Array<[number, number]> | null = null;
 
   /** Observer callbacks that react to dimension changes (can be async) */
-  private listeners: Set<() => void | Promise<void>> = new Set();
+  private listeners: Set<(changed: boolean) => void | Promise<void>> = new Set();
 
   /** Promise tracking pending listener completion (for animation synchronization) */
   private pendingUpdatePromise: Promise<void> | null = null;
@@ -116,10 +126,12 @@ export class SceneDimsManager {
    * - Set non-displayed dimensions to their minimum values
    * - Identify which dimensions should be displayed (max 3)
    *
-   * @param scene - THREE.js scene containing nD objects with metadata
+   * @param scene - THREE.js scene (or a single Luxar root group, which carries the
+   *   metadata itself — what a LuxarLayer passes so a host scene holding several
+   *   layers cannot hand one layer another's dimensions)
    * @returns True if dimensions were successfully initialized, false if no metadata found
    */
-  initFromScene(scene: THREE.Scene): boolean {
+  initFromScene(scene: THREE.Object3D): boolean {
     // Step 1: Search for scene dimensions metadata
     let sceneDimensions = scene.userData.sceneDimensions;
 
@@ -289,14 +301,16 @@ export class SceneDimsManager {
    * 2. Clamp value to valid range for this dimension
    * 3. Quantize discrete dimensions to their step size
    * 4. Update internal state
-   * 5. Notify all observers (triggers UI updates and re-slicing)
+   * 5. Notify observers only when the resulting value changes, unless forced
    *
    * @param dimIndex - Index of dimension to update
    * @param value - New position value in dimension units
+   * @param options.force - Re-notify listeners at the current value to refine a pinned slice
+   * @returns whether the position changed (a forced re-notify at the same value is not a change)
    */
-  setDimensionValue(dimIndex: number, value: number): void {
+  setDimensionValue(dimIndex: number, value: number, options: { force?: boolean } = {}): boolean {
     if (!this.dims || dimIndex < 0 || dimIndex >= this.dims.ndim) {
-      return;
+      return false;
     }
 
     // Reject non-finite (NaN, ±Infinity) inputs — silently writing NaN into
@@ -306,25 +320,20 @@ export class SceneDimsManager {
         Modules.SCENE_DIMS,
         `setDimensionValue: ignoring non-finite value ${value} for dim ${dimIndex}`
       );
-      return;
+      return false;
     }
 
-    // Apply range constraints to prevent navigation beyond data bounds
-    let min = -Infinity;
-    let max = Infinity;
-    if (this.dimensionRanges) {
-      [min, max] = this.dimensionRanges[dimIndex];
-      value = clamp(value, min, max);
-    }
+    value = constrainDimensionValue(
+      value,
+      this.dimensionRanges?.[dimIndex],
+      this.dims.metadata?.[dimIndex]
+    );
 
-    // Handle discrete dimensions (e.g., time frames, categorical data)
-    const dimMeta = this.dims.metadata?.[dimIndex];
-    if (dimMeta?.discrete) {
-      value = snapDiscreteValue(value, dimMeta.step || 1.0, min, max);
-    }
-
+    const changed = value !== this.dims.currentStep[dimIndex];
+    if (!changed && !options.force) return false;
     this.dims.currentStep[dimIndex] = value;
-    this.notifyListeners(); // Trigger reactive updates throughout the system
+    this.notifyListeners(changed); // Trigger reactive updates throughout the system
+    return changed;
   }
 
   /**
@@ -348,16 +357,20 @@ export class SceneDimsManager {
    * Reset every dimension back to its initial default position (same policy
    * as {@link initFromScene}) and notify listeners — sliders, slicing, and
    * status displays all refresh reactively. Used by the rail Home popover's
-   * "Reset dimensions" action. No-op before initialization.
+   * "Reset dimensions" action. A reset still notifies when every dimension is
+   * already at its default, with changed=false. No-op before initialization.
    */
   resetPositions(): void {
     if (!this.dims || !this.dimensionRanges) return;
+    let changed = false;
     for (let i = 0; i < this.dims.ndim; i++) {
       const meta = this.dims.metadata?.[i];
       if (!meta) continue;
-      this.dims.currentStep[i] = SceneDimsManager.defaultPosition(meta, this.dimensionRanges[i]);
+      const value = SceneDimsManager.defaultPosition(meta, this.dimensionRanges[i]);
+      changed ||= value !== this.dims.currentStep[i];
+      this.dims.currentStep[i] = value;
     }
-    this.notifyListeners();
+    this.notifyListeners(changed);
     log.info(Modules.SCENE_DIMS, 'Dimension positions reset to defaults');
   }
 
@@ -370,9 +383,10 @@ export class SceneDimsManager {
    *
    * Callbacks can be async — their completion can be awaited via waitForUpdate().
    *
-   * @param callback - Function to call when dimensions change (can return Promise)
+   * @param callback - Function to call on a change or forced refresh (can return Promise).
+   * Receives false for a refresh that leaves the slice position unchanged.
    */
-  addListener(callback: () => void | Promise<void>): void {
+  addListener(callback: (changed: boolean) => void | Promise<void>): void {
     this.listeners.add(callback);
   }
 
@@ -383,7 +397,7 @@ export class SceneDimsManager {
    *
    * @param callback - Previously registered callback function
    */
-  removeListener(callback: () => void | Promise<void>): void {
+  removeListener(callback: (changed: boolean) => void | Promise<void>): void {
     this.listeners.delete(callback);
   }
 
@@ -396,12 +410,12 @@ export class SceneDimsManager {
    *
    * @private
    */
-  private notifyListeners(): void {
+  private notifyListeners(changed: boolean): void {
     const promises: Promise<void>[] = [];
 
     this.listeners.forEach((callback) => {
       try {
-        const result = callback();
+        const result = callback(changed);
         if (result instanceof Promise) {
           promises.push(
             result.catch((error) => {

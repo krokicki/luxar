@@ -1,8 +1,11 @@
 /**
  * Renderer-construction helpers extracted from SceneManager.
  *
- * Three concerns live here:
+ * Four concerns live here:
  *
+ *   - `configureRendererBackend` — point the backend-dependent rendering
+ *     paths (texture layout, ordering applies, RenderObject eviction,
+ *     element-texture row uploads) at a renderer; shared with layer mode.
  *   - `selectBackend` — apply the URL-param / env-var / default
  *     precedence ladder to pick WebGL or WebGPU.
  *   - `createWebGLRenderer` — construct a `THREE.WebGLRenderer`
@@ -31,10 +34,64 @@ import {
 } from '../../../rendering/renderer-capabilities';
 import { configureElementTextureLayout } from '../../../rendering/element-texture-layout';
 import { configureSortedIndexChunkedApply } from '../../../rendering/element-storage';
+import { installUploadCounters } from '../../../rendering/upload-counters';
+import { installElementTextureRowUploads } from '../../../rendering/element-texture-row-upload';
 import { configureRenderObjectEviction } from '../../../data/scene-loader/commit/invalidate-render-object';
 import { configureHDRRenderer, logHDRCapabilities } from '../../../utils/hdr/hdr-detection';
 import { log, Modules } from '../../../utils/log';
 import { notifier } from '../../../utils/cross-layer/notifier';
+
+/**
+ * Point the backend-dependent rendering paths at `renderer`. Every renderer
+ * Luxar draws through needs this — the app's own (both `create*Renderer`
+ * below) and a host's in layer mode (`core/layer/luxar-layer.ts`) — because
+ * each switch is a module default tuned for classic WebGL:
+ *
+ *   - element textures are laid out against the device's `maxTextureSize`;
+ *   - both WebGPU backends ignore texture update ranges, so element textures
+ *     upload only their dirty rows there (#2944) — a no-op on classic WebGL;
+ *   - chunked ordering applies need honoured attribute update ranges and the
+ *     `onUploadCallback` back-pressure, which neither WebGPU backend fires —
+ *     classic WebGL only (see element-storage's chunked-apply note);
+ *   - RenderObject eviction (dispose dispatch) flushes the stale vertexBuffers
+ *     chainMap cache only WebGPU keeps; on classic WebGL the same event
+ *     destroys the compiled program (a shader recompile), so WebGPU only.
+ *
+ * Call after the renderer is initialised (WebGPU's backend exists only after
+ * `init()`).
+ *
+ * The switches are page-wide and the last call wins, so every Luxar host on a
+ * page (a LuxarApp, LuxarLayers) must render through ONE backend. Not enforced
+ * — a page may re-init on another backend once the first host is gone — but a
+ * call that switches the backend warns once.
+ */
+export function configureRendererBackend(
+  renderer: Renderer,
+  capabilities: RendererCapabilities
+): void {
+  warnOnBackendMix(capabilities.apiSurface);
+  configureElementTextureLayout(capabilities.maxTextureSize);
+  installElementTextureRowUploads(renderer);
+  configureSortedIndexChunkedApply(capabilities.apiSurface === 'webgl2');
+  configureRenderObjectEviction(capabilities.apiSurface === 'webgpu');
+}
+
+/** The backend the page-wide switches were last configured for. */
+let configuredApiSurface: RendererCapabilities['apiSurface'] | null = null;
+let warnedBackendMix = false;
+
+function warnOnBackendMix(apiSurface: RendererCapabilities['apiSurface']): void {
+  const previous = configuredApiSurface;
+  configuredApiSurface = apiSurface;
+  if (previous === null || previous === apiSurface || warnedBackendMix) return;
+  warnedBackendMix = true;
+  log.warning(
+    Modules.RENDERER,
+    `Renderer backend switched from ${previous} to ${apiSurface}: the backend switches are ` +
+      'page-wide, so if another Luxar host on this page still renders through ' +
+      `${previous} it now runs on ${apiSurface}'s settings. Use one backend per page.`
+  );
+}
 
 /**
  * URL-param / env-var / default precedence ladder for backend
@@ -127,14 +184,33 @@ export interface CreatedRenderer {
   capabilities: RendererCapabilities;
 }
 
+/** Options that `createWebGLRenderer` honours. */
+export interface CreateWebGLOptions {
+  /**
+   * Debug mode (`?debug`). Keeps three's `checkShaderErrors` on, so a broken
+   * shader gets three's formatted report with the offending source lines.
+   */
+  debug?: boolean;
+}
+
 /**
  * Construct a `THREE.WebGLRenderer` from a WebGL2 context obtained
  * via `canvas.getContext('webgl2', config.webgl.context)`.
  *
+ * Outside debug mode `renderer.debug.checkShaderErrors` is turned OFF. With it
+ * on, three reads `getProgramInfoLog` and both shader logs straight after every
+ * link — a synchronous GPU round trip that defeats the driver's parallel
+ * compile and measured 15-91 ms of main-thread stall on a cold start. A broken
+ * shader still surfaces without it: the browser logs the failed link as a WebGL
+ * warning and the draw is skipped.
+ *
  * Returns the renderer plus a `RendererCapabilities` snapshot. The
  * caller wires materialManager / HDR / clear color / initial resize.
  */
-export async function createWebGLRenderer(canvas: HTMLCanvasElement): Promise<CreatedRenderer> {
+export async function createWebGLRenderer(
+  canvas: HTMLCanvasElement,
+  options: CreateWebGLOptions = {}
+): Promise<CreatedRenderer> {
   // Try to get HDR canvas context first using config values.
   //
   // Allow-list rule: a `getContext` call is permitted ONLY if it
@@ -164,15 +240,13 @@ export async function createWebGLRenderer(canvas: HTMLCanvasElement): Promise<Cr
     premultipliedAlpha: config.webgl.context.premultipliedAlpha,
     ...config.webgl.renderer,
   });
+  renderer.debug.checkShaderErrors = options.debug === true;
+
+  // Tally every CPU→GPU upload for the perf counters (instrumentation only).
+  installUploadCounters(renderer);
 
   const capabilities = createRendererCapabilities(renderer);
-  configureElementTextureLayout(capabilities.maxTextureSize);
-  // Chunked ordering applies need honored attribute update ranges —
-  // classic WebGL only (see element-storage's chunked-apply note).
-  configureSortedIndexChunkedApply(capabilities.apiSurface === 'webgl2');
-  // RenderObject eviction (dispose dispatch) is WebGPU-only — on classic
-  // WebGL the same event destroys the compiled program (shader recompile).
-  configureRenderObjectEviction(capabilities.apiSurface === 'webgpu');
+  configureRendererBackend(renderer, capabilities);
 
   log.info(Modules.RENDERER, `Rendering API: ${capabilities.apiSurface}`);
 
@@ -354,16 +428,11 @@ export async function createWebGPURenderer(
     ...(perfTimestamp ? { trackTimestamp: true } : {}),
   } as ConstructorParameters<typeof WebGPURenderer>[0]);
   await gpuRenderer.init();
+  // After init(): the backend's device / WebGL2 context exists only now.
+  installUploadCounters(gpuRenderer);
 
   const capabilities = createRendererCapabilities(gpuRenderer);
-  configureElementTextureLayout(capabilities.maxTextureSize);
-  // Both WebGPU backends ignore attribute update ranges (full re-upload
-  // per needsUpdate) — chunking would multiply the GPU upload, so large
-  // orderings keep the single-shot path there.
-  configureSortedIndexChunkedApply(capabilities.apiSurface === 'webgl2');
-  // RenderObject eviction (dispose dispatch) is WebGPU-only — it flushes
-  // the stale vertexBuffers chainMap cache that only WebGPU maintains.
-  configureRenderObjectEviction(capabilities.apiSurface === 'webgpu');
+  configureRendererBackend(gpuRenderer, capabilities);
   log.info(Modules.RENDERER, `Rendering API: ${capabilities.apiSurface}`);
 
   const hdrCapabilities = capabilities.hdr;

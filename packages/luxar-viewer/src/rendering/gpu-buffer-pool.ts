@@ -9,7 +9,8 @@
  * - In-place data updates (fused texel writes into the pooled element
  *   texture for all three geometry types)
  * - Size-based bucketing for efficient matching
- * - LRU eviction after 300 frames of non-use
+ * - LRU eviction after 300 atomic commits of non-use (commits, NOT rendered
+ *   frames — see {@link GPUBufferPool.beginCommit})
  * - Multi-type support for all TypedArray formats
  *
  * TYPE SUPPORT (COMPLETE):
@@ -35,9 +36,11 @@ import type { LoadedPointsData } from '../data/data-loader-types';
 import type { ProcessedLinesData } from '../types/lines';
 import type { PooledBuffer, PoolStats } from './gpu-buffer-pool/pool-stats';
 import { evictUntilUnderByteBudget } from './gpu-buffer-pool/byte-budget-evictor';
+import { ActiveBufferMap } from './gpu-buffer-pool/byte-tracked-maps';
 import { PointsBufferAdapter } from './gpu-buffer-pool/points-adapter';
 import { LinesBufferAdapter } from './gpu-buffer-pool/lines-adapter';
 import { GSplatsBufferAdapter, type PackedGSplatsData } from './gpu-buffer-pool/gsplats-adapter';
+import type { InstancedOrderingOptions } from './gpu-buffer-pool/texture-backed-adapter';
 
 // Per-type spec arrays and helpers live in
 // ./gpu-buffer-pool/{points,lines,gsplats}-adapter.
@@ -49,6 +52,7 @@ export { estimateGeometryBytes, invalidateCachedByteSize };
 // Re-export the public surface so the parent rendering/gpu-buffer-pool.ts
 // stub (and existing consumers) keep working unchanged.
 export type { PackedGSplatsData } from './gpu-buffer-pool/gsplats-adapter';
+export type { InstancedOrderingOptions } from './gpu-buffer-pool/texture-backed-adapter';
 export type {
   PooledBuffer,
   TypePoolStats,
@@ -56,6 +60,7 @@ export type {
   PooledBufferRef,
 } from './gpu-buffer-pool/pool-stats';
 import { GSPLAT_DEFAULT_TRUNCATION_RADIUS } from '../config/constants';
+const OVER_LIMIT_GRACE_COMMITS = 60;
 // (`selectBuffersToEvict` / `chooseCapacity` used to be re-exported here
 // too, but every consumer imports them from their `gpu-buffer-pool/`
 // modules directly — the facade copies were dead.)
@@ -84,20 +89,31 @@ export class GPUBufferPool {
   /** @internal — gsplats-specific pool state and methods. */
   readonly gsplats: GSplatsBufferAdapter;
 
-  /** @internal — shared with the per-type adapters. */
-  activeBuffers = new Map<string, PooledBuffer>(); // nodeId → active geometry
-  /** @internal — shared with the per-type adapters; increments via beginFrame(). */
-  frameCount = 0;
+  /**
+   * nodeId → active geometry, keeping a running byte total (see
+   * `gpu-buffer-pool/byte-tracked-maps.ts`). @internal — shared with the
+   * per-type adapters.
+   */
+  readonly activeBuffers = new ActiveBufferMap();
+  /** Committed, non-pooled mesh geometries. The scene graph owns their lifetime. */
+  private meshGeometries = new Map<string, THREE.BufferGeometry>();
+  private trackedMeshGeometries = new WeakSet<THREE.BufferGeometry>();
+  /**
+   * Atomic-commit counter — the pool's unit of age (#2939). @internal —
+   * shared with the per-type adapters; increments via {@link beginCommit}.
+   */
+  commitCount = 0;
 
   private maxPoolSize: number;
-  private evictionFrames: number;
+  /** LRU age limit, in atomic commits (see {@link beginCommit}). */
+  private evictionCommits: number;
   /**
    * Maximum geometries the pool will dispose in a single
    * `evictUnused()` call when not over the hard limit. Without this
    * cap, a single eviction sweep can dispose dozens of buffers
    * synchronously — each `geometry.dispose()` is 5–20 ms on slow
    * GPUs, so a burst stutters visibly. Remaining evictable buffers
-   * are deferred to the next frame's eviction sweep. The
+   * are deferred to the next eviction sweep. The
    * `mustEvict` (pool-over-limit) path ignores this cap so the pool
    * never grows unbounded.
    */
@@ -161,12 +177,12 @@ export class GPUBufferPool {
 
   constructor(
     maxPoolSize: number = 20,
-    evictionFrames: number = 300,
+    evictionCommits: number = 300,
     evictBatchSize: number = 5,
     getByteBudget: () => number = () => 512_000_000
   ) {
     this.maxPoolSize = maxPoolSize;
-    this.evictionFrames = evictionFrames;
+    this.evictionCommits = evictionCommits;
     this.evictBatchSize = Math.max(1, evictBatchSize);
     this.getByteBudget = getByteBudget;
     this.points = new PointsBufferAdapter(this);
@@ -175,11 +191,24 @@ export class GPUBufferPool {
   }
 
   /**
-   * Advance the frame counter. Call once per frame before any acquire calls.
-   * This ensures eviction timing is based on rendered frames, not acquire calls.
+   * Advance the commit counter. Call once per ATOMIC COMMIT (a non-discarded
+   * update pass), before its acquire calls — the only production caller is
+   * `data/scene-loader/update-view/atomic-commit.ts`.
+   *
+   * The pool therefore ages pooled buffers in commits, not rendered frames
+   * (#2939): `evictionCommits` (default 300) is 300 commits, and the
+   * over-limit `mustEvict` grace below is `OVER_LIMIT_GRACE_COMMITS` (60).
+   * That is deliberate —
+   * buffers are only acquired and released on commits — but it has two
+   * consequences worth knowing when tuning it:
+   *  - while the view orbits or sits idle no commit runs, so pooled buffers
+   *    do NOT age; they are freed only by the byte budget or `maxPoolSize`;
+   *  - during playback or scrubbing (many commits per second) 300 commits can
+   *    elapse in seconds.
+   * (There is no idle time-based sweep; one would be a separate policy.)
    */
-  beginFrame(): void {
-    this.frameCount++;
+  beginCommit(): void {
+    this.commitCount++;
   }
 
   /**
@@ -227,19 +256,19 @@ export class GPUBufferPool {
 
   /**
    * Update Points geometry attributes in-place (zero GPU allocations).
-   * @param options - `preserveOrdering`: keep the geometry's existing
-   *   `aSortedIndex` permutation instead of resetting it to identity
-   *   (same-node same-count recommit — the commit path decides; see
-   *   commit-points-geometry.ts). `fromInstance`: append fast path
-   *   (Phase 4 Stage 2) — write & upload only the `[fromInstance, count)`
-   *   suffix, preserving the prefix texels + permutation already on the
-   *   GPU.
+   * @param options - The commit ordering the commit path chose
+   *   (`writeInstancedCommitOrdering`, shared by all three types):
+   *   `preserveOrdering` / `repairFromCount` keep or rebuild the existing
+   *   permutation; `fromInstance` (append fast path) writes & uploads only the
+   *   `[fromInstance, count)` suffix and HOLDS the draw at the previous
+   *   population until the grown population's ordering lands; `seedOrdering`
+   *   holds a GROWN geometry on the previous geometry's drawn permutation.
    */
   updatePointsGeometry(
     geometry: THREE.InstancedBufferGeometry,
     data: LoadedPointsData,
     count: number,
-    options?: { preserveOrdering?: boolean; repairFromCount?: number; fromInstance?: number }
+    options?: InstancedOrderingOptions
   ): void {
     this.points.updateGeometry(geometry, data, count, options);
   }
@@ -264,18 +293,14 @@ export class GPUBufferPool {
 
   /**
    * Update Lines geometry in place.
-   * @param options - `preserveOrdering`: keep the existing `aSortedIndex`
-   *   permutation instead of resetting to identity (same-count recommit
-   *   of an already-sorted node — the commit path decides; see
-   *   commit-lines-geometry.ts). `fromInstance`: append fast path
-   *   (Phase 4 Stage 2) — write & upload only the `[fromInstance, count)`
-   *   segment suffix, preserving the prefix already on the GPU.
+   * @param options - The commit ordering, as for {@link updatePointsGeometry}
+   *   (counted in segments).
    */
   updateLinesGeometry(
     geometry: THREE.InstancedBufferGeometry,
     data: ProcessedLinesData,
     count: number,
-    options?: { preserveOrdering?: boolean; repairFromCount?: number; fromInstance?: number }
+    options?: InstancedOrderingOptions
   ): void {
     this.lines.updateGeometry(geometry, data, count, options);
   }
@@ -299,20 +324,14 @@ export class GPUBufferPool {
    * @param truncationRadius - Truncation radius in sigmas (defaults to
    *   `GSPLAT_DEFAULT_TRUNCATION_RADIUS`).
    *   Must match the material's truncationRadius for correct frustum culling.
-   * @param options - `preserveOrdering`: keep the geometry's existing
-   *   `aSortedIndex` permutation instead of resetting it to identity
-   *   (same-node same-count recommit — the commit path decides; see
-   *   commit-gsplats-geometry.ts). `fromInstance`: append fast path (Phase 4
-   *   Stage 2) — write & upload only the `[fromInstance, count)` suffix,
-   *   preserving the prefix texels while resetting the enlarged ordering to
-   *   full identity until the commit-triggered sort lands.
+   * @param options - The commit ordering, as for {@link updatePointsGeometry}.
    */
   updateGSplatsGeometry(
     geometry: THREE.InstancedBufferGeometry,
     data: PackedGSplatsData,
     count: number,
     truncationRadius: number = GSPLAT_DEFAULT_TRUNCATION_RADIUS,
-    options?: { preserveOrdering?: boolean; repairFromCount?: number; fromInstance?: number }
+    options?: InstancedOrderingOptions
   ): void {
     this.gsplats.updateGeometry(geometry, data, count, truncationRadius, options);
   }
@@ -324,7 +343,7 @@ export class GPUBufferPool {
   /**
    * Get size bucket for capacity-based pooling.
    * Buckets: 1K, 5K, 10K, 50K, 100K, 500K, 1M.
-   * @internal — called by adapters; public to satisfy PointsAdapterHost.
+   * @internal — called by adapters; public to satisfy PoolAdapterHost.
    */
   getBucket(count: number): number {
     if (count <= 1000) return 1000;
@@ -343,7 +362,7 @@ export class GPUBufferPool {
    * Public for testing and manual pool management.
    */
   evictUnused(fromAcquire: boolean = false): number {
-    const currentFrame = this.frameCount;
+    const currentCommit = this.commitCount;
 
     // Check total pool size
     const totalPooled =
@@ -354,13 +373,13 @@ export class GPUBufferPool {
     // If pool is over limit, evict aggressively
     const mustEvict = totalPooled > this.maxPoolSize;
 
-    // Per-call eviction batch cap. Without this, a frame in which many
+    // Per-call eviction batch cap. Without this, a sweep in which many
     // buckets simultaneously cross the eviction threshold (common after
     // a long pause + a viewport change) would burst-dispose every
     // qualifying buffer in a single frame. Each `geometry.dispose()`
     // can take 5–20 ms on slow GPUs; a 50-buffer burst stutters
     // visibly. By capping the per-call batch, the remaining evictable
-    // buffers are deferred to the next frame's `acquire*` call. The
+    // buffers are deferred to the next sweep (the next `acquire*`/release). The
     // `mustEvict` over-limit path bypasses the cap so we never let the
     // pool drift unbounded above its limit.
     const batchCap = mustEvict ? Number.POSITIVE_INFINITY : this.evictBatchSize;
@@ -369,7 +388,7 @@ export class GPUBufferPool {
     // when the per-call budget is exhausted. Buffers that WERE
     // eviction-eligible but couldn't run this call (batch cap exhausted)
     // are counted as `deferredEvictions` on the global stats so callers
-    // can observe the eviction queue stretching across frames.
+    // can observe the eviction queue stretching across sweeps.
     const evictFromPool = (pool: Map<number, PooledBuffer[]>, budget: number): number => {
       let poolEvicted = 0;
       if (budget <= 0) return 0;
@@ -378,11 +397,12 @@ export class GPUBufferPool {
         const toDispose: PooledBuffer[] = [];
 
         for (const buffer of buffers) {
-          const framesSinceUse = currentFrame - buffer.lastUsedFrame;
+          const commitsSinceUse = currentCommit - buffer.lastUsedCommit;
           const evictable =
-            framesSinceUse > this.evictionFrames || (mustEvict && framesSinceUse > 60);
+            commitsSinceUse > this.evictionCommits ||
+            (mustEvict && commitsSinceUse > OVER_LIMIT_GRACE_COMMITS);
 
-          // Evict if: unused for >evictionFrames OR pool over limit,
+          // Evict if: unused for >evictionCommits OR pool over limit,
           // AND we're under the per-call batch cap.
           if (evictable && poolEvicted < budget) {
             toDispose.push(buffer);
@@ -467,11 +487,11 @@ export class GPUBufferPool {
         maxPoolBytes: pooledTarget,
         maxPoolSize: this.maxPoolSize,
         typeEvictionCounters: this.typeStats,
-        // Same-frame grace applies ONLY to acquire-triggered sweeps —
+        // Same-commit grace applies ONLY to acquire-triggered sweeps —
         // the release path keeps its original semantics (a release
         // followed by evictUnused() may reclaim that very buffer).
-        // graceFrame -1 never matches a real frame counter.
-        graceFrame: fromAcquire ? this.frameCount : -1,
+        // graceCommit -1 never matches a real commit counter.
+        graceCommit: fromAcquire ? this.commitCount : -1,
       },
       sentinel
     );
@@ -479,27 +499,40 @@ export class GPUBufferPool {
     return evicted;
   }
 
-  /** Sum of bytes held by active (in-use) buffers. Uses cached per-geometry estimates. */
+  /**
+   * Sum of bytes held by active (in-use) buffers. O(1): the map keeps the
+   * total incrementally (B9b) — it used to walk every active buffer.
+   */
   private sumActiveBytes(): number {
-    let total = 0;
-    for (const buffer of this.activeBuffers.values()) {
-      total += estimateGeometryBytes(buffer.geometry);
+    // Active buffers keep a running total. Committed mesh levels are summed
+    // here from their cached estimate: each commit re-registers (and so
+    // re-measures) the geometry it rewrote in place, and the estimate itself
+    // notices the WebGPU backend widening the index at upload.
+    let total = this.activeBuffers.bytes;
+    for (const geometry of this.meshGeometries.values()) {
+      total += estimateGeometryBytes(geometry);
     }
     return total;
   }
 
-  /** Sum of bytes held by pooled (released, retained-for-reuse) buffers. */
+  /** Track a committed mesh without making it eligible for buffer reuse. */
+  registerMeshGeometry(nodeId: string, geometry: THREE.BufferGeometry): void {
+    invalidateCachedByteSize(geometry);
+    this.meshGeometries.set(nodeId, geometry);
+    if (this.trackedMeshGeometries.has(geometry)) return;
+    this.trackedMeshGeometries.add(geometry);
+    geometry.addEventListener('dispose', () => {
+      if (this.meshGeometries.get(nodeId) === geometry) this.meshGeometries.delete(nodeId);
+    });
+  }
+
+  /** Sum of bytes held by pooled (released, retained-for-reuse) buffers. O(1). */
   private sumPooledBytes(): number {
-    let total = 0;
-    const add = (pool: Map<number, PooledBuffer[]>): void => {
-      for (const arr of pool.values()) {
-        for (const b of arr) total += estimateGeometryBytes(b.geometry);
-      }
-    };
-    add(this.points.pointBuffers);
-    add(this.lines.lineBuffers);
-    add(this.gsplats.gsplatBuffers);
-    return total;
+    return (
+      this.points.pointBuffers.bytes +
+      this.lines.lineBuffers.bytes +
+      this.gsplats.gsplatBuffers.bytes
+    );
   }
 
   /**
@@ -580,12 +613,16 @@ export class GPUBufferPool {
       }
     }
 
-    const activeBytes = pointsActiveBytes + linesActiveBytes + gsplatsActiveBytes;
+    let meshActiveBytes = 0;
+    for (const geometry of this.meshGeometries.values()) {
+      meshActiveBytes += estimateGeometryBytes(geometry);
+    }
+    const activeBytes = pointsActiveBytes + linesActiveBytes + gsplatsActiveBytes + meshActiveBytes;
     const pooledBytes = pointsPooledBytes + linesPooledBytes + gsplatsPooledBytes;
 
     return {
       ...this.stats,
-      activeBuffers: this.activeBuffers.size,
+      activeBuffers: this.activeBuffers.size + this.meshGeometries.size,
       pooledBuffers: pointsPooled + linesPooled + gsplatsPooled,
       activeBytes,
       pooledBytes,
@@ -655,10 +692,11 @@ export class GPUBufferPool {
    *    LRU sweep into aggressive `mustEvict` mode), and queued for a
    *    second `dispose()` by the evictors.
    *
-   * Resident-byte / stats accounting is DERIVED from `activeBuffers` +
-   * free-bucket membership (see {@link getStats} / {@link getResidentBytes}),
-   * so removing the entry is the entire correction — there is no persistent
-   * counter to decrement. On the normal release/evict/dispose paths the
+   * Resident-byte / stats accounting follows `activeBuffers` + free-bucket
+   * membership (see {@link getStats} / {@link getResidentBytes}; the byte
+   * totals are kept incrementally BY those containers), so removing the
+   * entry is the entire correction — there is no separate counter to
+   * decrement. On the normal release/evict/dispose paths the
    * entry (or its free-bucket slot) is already gone before `dispose()`
    * runs, so this listener finds nothing and is a safe no-op there — it
    * never double-counts eviction stats and never mutates a bucket array
@@ -696,14 +734,7 @@ export class GPUBufferPool {
   private removeFromFreeBuckets(geometry: THREE.BufferGeometry): void {
     const pools = [this.points.pointBuffers, this.lines.lineBuffers, this.gsplats.gsplatBuffers];
     for (const pool of pools) {
-      for (const [bucket, buffers] of pool) {
-        const index = buffers.findIndex((b) => b.geometry === geometry);
-        if (index !== -1) {
-          buffers.splice(index, 1);
-          if (buffers.length === 0) pool.delete(bucket);
-          return;
-        }
-      }
+      if (pool.removeFirst((b) => b.geometry === geometry, true)) return;
     }
   }
 
@@ -721,6 +752,7 @@ export class GPUBufferPool {
       geometries.push(buffer.geometry);
     }
     this.activeBuffers.clear();
+    this.meshGeometries.clear();
 
     const drainPool = (pool: Map<number, PooledBuffer[]>): void => {
       for (const buffers of pool.values()) {

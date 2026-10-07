@@ -10,9 +10,9 @@ function view(time: number): ViewState {
   };
 }
 
-function index() {
-  const bounds = new Float32Array(8 * 4 * 2);
-  for (let atom = 0; atom < 8; atom++) {
+function index(atomCount = 8, atomRows = 100) {
+  const bounds = new Float32Array(atomCount * 4 * 2);
+  for (let atom = 0; atom < atomCount; atom++) {
     for (let dim = 0; dim < 4; dim++) {
       const offset = atom * 8 + dim * 2;
       bounds[offset] = dim === 3 ? atom : 0;
@@ -21,12 +21,27 @@ function index() {
   }
   return {
     chunkBounds: bounds,
-    chunkCount: 8,
-    metadata: { ndim: 4, chunk_size: 100 },
+    chunkCount: atomCount,
+    metadata: { ndim: 4, chunk_size: atomRows },
   };
 }
 
 describe('planChunkBoundaryViewStates', () => {
+  it('finds both boundary directions across a million disjoint ranges', () => {
+    const ranges = Array.from({ length: 1_000_000 }, (_, i) => ({
+      start: 400_000 + 2 * i,
+      end: 400_001 + 2 * i,
+    }));
+    const chunkIndex = index(16, 200_000);
+    const arrays = [{ shape: [3_200_000], chunks: [400_000] }];
+
+    const forward = planChunkBoundaryViewStates(view(1), view(2), ranges, chunkIndex, arrays);
+    expect(forward.map((candidate) => candidate.slicePosition[3])).toEqual([2, 12]);
+
+    const reverse = planChunkBoundaryViewStates(view(6), view(5), ranges, chunkIndex, arrays);
+    expect(reverse.map((candidate) => candidate.slicePosition[3])).toEqual([5, 1]);
+  });
+
   it('adds only the nearest future slice that enters a next zarr chunk', () => {
     const views = planChunkBoundaryViewStates(
       view(1),

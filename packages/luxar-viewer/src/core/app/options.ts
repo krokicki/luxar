@@ -44,7 +44,9 @@ export interface LuxarAppOptions {
   gpuPoolMaxBytes?: number | null;
   /**
    * Reflect the loaded dataset URL in the browser address bar via
-   * `history.replaceState` so the page can be reloaded or shared.
+   * `history.replaceState` so the page can be reloaded or shared. Applies to
+   * every dataset switch — a dataset-browser selection and a
+   * `LuxarApp.switchDataset` call (kiosk, remote control) alike.
    *
    * Defaults to `false` for programmatic/embedded safety. The standalone
    * bootstrap sets this to `true` explicitly.
@@ -129,6 +131,22 @@ export interface LuxarAppOptions {
    * (`?perfTimestamp` URL flag). Ignored under `WebGLRenderer`.
    */
   perfTimestamp?: boolean;
+
+  /**
+   * Render every loop tick, as the loop did before render-on-change (the
+   * `?renderAlways` kill switch). Default false: a tick re-renders only when
+   * something changed (`config.animation.renderOnChange`). Pixels are the
+   * same either way; this only brings back the redundant re-renders.
+   */
+  renderAlways?: boolean;
+
+  /**
+   * `?renderAudit` — debug only (ignored unless `debug` is on): render every
+   * tick and verify each one the scheduler would have skipped drew the same
+   * pixels as the last real frame, counting violations in the perf counter
+   * `render.missedDirty`. See `scene/animation/render-audit.ts`.
+   */
+  renderAudit?: boolean;
 
   /**
    * Pin a fixed device pixel ratio for the whole session. Mirrors

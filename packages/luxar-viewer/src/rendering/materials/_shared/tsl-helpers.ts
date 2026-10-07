@@ -41,6 +41,7 @@ import {
   max,
   min,
   modelViewMatrix,
+  pow,
   smoothstep,
   sqrt,
   vec2,
@@ -78,8 +79,7 @@ export type TSLNode = any;
  * grows afterwards renders the scene black.
  *
  * `uSortedIndexSlot` must stay a RUNTIME uniform: a compile-time flag
- * would rebuild the graph on every swap. (The lines material treats
- * `uIsOrtho` as compile-time — deliberately NOT the pattern here.)
+ * would rebuild the graph on every swap.
  *
  * BRANCHLESS on purpose. `.select()` emits an if/else STATEMENT, and the
  * pick factories consume this index at `varying(float(...))` — evaluated
@@ -120,6 +120,26 @@ export function densityDroppedNode(uDensityDrop: TSLNode, sortedIndex: TSLNode):
   return float(uDensityDrop)
     .greaterThan(0.0)
     .and(unit.lessThan(float(uDensityDrop)));
+}
+
+/**
+ * Alpha-over density compensation. Mirrors GLSL `luxarDensityAlpha()`
+ * (glsl-lib.ts): `1 − (1 − a)^uDensityAlphaExp` when the exponent exceeds 1
+ * (a thinned `normal` node, exponent `1/keep`), else `a` untouched. Only the
+ * `normal` graphs call it, so every other graph's generated code is unchanged.
+ */
+export function densityAlphaNode(alpha: TSLNode, uDensityAlphaExp: TSLNode): TSLNode {
+  const e: TSLNode = float(uDensityAlphaExp);
+  return e.greaterThan(1.0).select(densityThinnedAlphaNode(alpha, e), alpha);
+}
+
+/**
+ * The thinned branch of {@link densityAlphaNode} alone, `1 − (1 − a)^e`, for a
+ * caller that already guards on `e > 1` and scales more than alpha under the
+ * same branch (the gsplat `normal` premultiplied RGB).
+ */
+export function densityThinnedAlphaNode(alpha: TSLNode, e: TSLNode): TSLNode {
+  return float(1.0).sub(pow(max(float(1.0).sub(alpha), 0.0), e));
 }
 
 /** Sanitise a non-negative scalar. Mirrors GLSL `sanitizeNonNegative`. */
@@ -179,8 +199,25 @@ export function proxyIUniform<T>(node: TSLNode): IUniform<T> {
 }
 
 /**
- * Unified perspective near-plane fade (runtime-uniform variant, for
- * the point/gsplat graphs whose ortho flag is the `uIsOrtho` uniform).
+ * TSL twins of GLSL `luxarIsOrthoProjection` / `luxarProjectionSizeScale`
+ * (glsl-lib.ts): read from `cameraProjectionMatrix`, which three sets for the
+ * camera being drawn with. `element(c)` is column c, so P[3][3] is
+ * `element(3).w` and P[1][1] is `element(1).y`.
+ */
+export function isOrthoProjectionTSL(): TSLNode {
+  const P: TSLNode = cameraProjectionMatrix;
+  return P.element(int(3)).w.greaterThan(0.5).select(int(1), int(0));
+}
+
+/** |P11|: see {@link isOrthoProjectionTSL}. */
+export function projectionSizeScaleTSL(): TSLNode {
+  const P: TSLNode = cameraProjectionMatrix;
+  return P.element(int(1)).y.abs();
+}
+
+/**
+ * Unified perspective near-plane fade. `isOrthoInt` is the int ortho flag of the
+ * draw — every caller passes {@link isOrthoProjectionTSL} (or a var holding it).
  * Mirrors GLSL `perspectiveNearFade` in glsl-lib.ts: perspective =
  * 0.0 behind the camera, smoothstep across [nearCull, 2*nearCull];
  * ortho = 1.0 always (NDC clipping is the sole cull authority).
@@ -188,29 +225,13 @@ export function proxyIUniform<T>(node: TSLNode): IUniform<T> {
  * surviving amplitude/alpha/brightness by it.
  */
 export function perspectiveNearFadeTSL(
-  uIsOrtho: TSLNode,
+  isOrthoInt: TSLNode,
   viewZ: TSLNode,
   uNearCull: TSLNode
 ): TSLNode {
   const fade = smoothstep(uNearCull, uNearCull.mul(2.0), viewZ.negate());
   const persp = viewZ.greaterThanEqual(0.0).select(float(0.0), fade);
-  return int(uIsOrtho).equal(int(1)).select(float(1.0), persp);
-}
-
-/**
- * Compile-time-ortho variant for the line graphs (their ortho flag is
- * the factory `config.isOrtho`, baked into the graph): ortho variants
- * carry NO fade/cull code at all.
- */
-export function perspectiveNearFadeStaticTSL(
-  isOrtho: boolean,
-  viewZ: TSLNode,
-  uNearCull: TSLNode
-): TSLNode {
-  if (isOrtho) return float(1.0);
-  return viewZ
-    .greaterThanEqual(0.0)
-    .select(float(0.0), smoothstep(uNearCull, uNearCull.mul(2.0), viewZ.negate()));
+  return int(isOrthoInt).equal(int(1)).select(float(1.0), persp);
 }
 
 /**
@@ -242,25 +263,33 @@ export function tslLineJointCapSuppression(jointCode: TSLNode): TSLNode {
  * and equals the per-vertex value exactly at the corner that consumes it, so
  * the geometry is unchanged.
  *
- * `isOrtho` is the build-time graph variant, so only one branch is emitted.
+ * `isOrtho` is the draw's ortho test as a BOOL node (a var the caller set from
+ * {@link isOrthoProjectionTSL}), so both branches are emitted and one is
+ * selected per draw, as the GLSL twin's `luxarLineIsOrtho` ternary does.
+ * `lineScale` is resY·|P11| (GLSL `luxarLineScale`), the same scale in both
+ * projections.
  */
 export function tslLineEndPixelWidth(
-  isOrtho: boolean,
+  isOrtho: TSLNode,
   widthAtEnd: TSLNode,
   viewZ: TSLNode,
   nearCull: TSLNode,
-  uOrthoLineScale: TSLNode,
-  uPerspectiveLineScale: TSLNode
+  lineScale: TSLNode
 ): TSLNode {
-  return isOrtho
-    ? widthAtEnd.mul(uOrthoLineScale)
-    : widthAtEnd.mul(uPerspectiveLineScale).div(max(viewZ.negate(), nearCull));
+  return isOrtho.select(
+    widthAtEnd.mul(lineScale),
+    widthAtEnd.mul(lineScale).div(max(viewZ.negate(), nearCull))
+  );
 }
 
 /** Everything `tslLineJoin` needs from its calling vertex stage. */
 export interface TSLLineJoinArgs {
-  /** Build-time camera mode — the line graphs' `config.isOrtho`. */
-  readonly isOrtho: boolean;
+  /**
+   * The draw's ortho test as a BOOL var (from {@link isOrthoProjectionTSL},
+   * `.toVar()`ed in the caller's prologue so it is not first materialised
+   * inside one of the `If` blocks below).
+   */
+  readonly isOrtho: TSLNode;
   /** The RGBA32F line texture node (6 texels/segment). */
   readonly uLineTex: TSLNode;
   /** Its width in texels — already `.toVar()`ed by the caller's prologue. */
@@ -342,8 +371,7 @@ export interface TSLLineJoinArgs {
  *
  * STRUCTURAL DIFFERENCE FROM THE GLSL TWIN, and it is deliberate: the join
  * STYLE is a build-time graph variant here (the caller simply does not call
- * this when the style is `none`), exactly as the line factories already treat
- * `config.isOrtho`, whereas GLSL keeps `uLineJoin` a runtime uniform so a
+ * this when the style is `none`), whereas GLSL keeps `uLineJoin` a runtime uniform so a
  * `?lineJoin=` override never recompiles a program. The parity harness compares
  * pixels, not mechanisms.
  *
@@ -414,7 +442,7 @@ export function tslLineJoin(args: TSLLineJoinArgs): void {
     // the main path's wGuard (ortho: w == 1 exactly, the guard is inert).
     const mvFar: TSLNode = modelViewMatrix.mul(vec4(partnerFar, 1.0)).toVar();
     const clipFar: TSLNode = cameraProjectionMatrix.mul(mvFar).toVar();
-    const wGuardFar: TSLNode = isOrtho ? float(1.0) : nearCull;
+    const wGuardFar: TSLNode = isOrtho.select(float(1.0), nearCull);
     const farPx: TSLNode = vec2(
       clipFar.xy.div(max(clipFar.w, wGuardFar)).mul(uResolution.mul(0.5))
     ).toVar();
@@ -441,9 +469,9 @@ export function tslLineJoin(args: TSLLineJoinArgs): void {
     // B miters alone and B's rotated edge has nothing to tile against. With the
     // conjunction A tests {A.far, B.far} and B tests {B.far, A.far} — the same
     // pair — so both take the same branch. Inert under ortho (no 1/z).
-    const bothFarInFront: TSLNode = isOrtho
-      ? float(1.0).greaterThan(0.0)
-      : mvFar.z.negate().greaterThanEqual(nearCull).and(selfFarDepth.greaterThanEqual(nearCull));
+    const bothFarInFront: TSLNode = isOrtho.or(
+      mvFar.z.negate().greaterThanEqual(nearCull).and(selfFarDepth.greaterThanEqual(nearCull))
+    );
 
     // A DEGENERATE partner is the one decline that must not fall back to the
     // code-implied default. The kernel matches endpoints by vertex index and

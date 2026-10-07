@@ -47,6 +47,8 @@
  * @module data/scene-loader/nodes/load-lod-group-node
  */
 
+import { latchChildFailure } from '../../../utils/lod-child-failure';
+import { findObjectByName } from '../../../utils/scene-graph-index';
 import * as THREE from 'three';
 import * as zarr from '../../zarr';
 import { archiveFaultFrom } from '../../../cache/chunk-source';
@@ -159,9 +161,8 @@ function attachLazyChild(
         entryChild.failed = true;
         const archiveFault = archiveFaultFrom(error);
         if (archiveFault) {
-          entryChild.permanentlyFailed = true;
-          entryChild.failureReason = archiveFault.message;
-          entryChild.failedTick = undefined;
+          latchChildFailure(entryChild, archiveFault.message);
+          entryChild.failedAtMs = undefined;
           // A container fault makes the whole archive unreadable, not just this lazy level.
           if (ctx.isDatasetLive()) ctx.reportArchiveFault(archiveFault);
         }
@@ -171,6 +172,8 @@ function attachLazyChild(
         );
       } finally {
         entryChild.loading = false;
+        // Lets the registry time the load to now, not to its next frame.
+        entryChild.onLoadSettled?.();
       }
     })();
   };
@@ -184,7 +187,7 @@ function attachLazyChild(
       entryChild.loading = false;
       if (!entryChild.permanentlyFailed) {
         entryChild.failed = false;
-        entryChild.failedTick = undefined;
+        entryChild.failedAtMs = undefined;
       }
     };
   }
@@ -486,15 +489,9 @@ export async function loadLodGroupNode(
           coverageFraction,
           ctx,
           () => loadMeshNodeExpensive(lazyChild, ctx, loader),
-          // `releaseLazyMesh` does LESS than its three peers, not nothing. They
-          // release a pooled GPU buffer back to the evictable pool on demotion; a
-          // mesh is `pooled: false` (an indexed BufferGeometry, not the
-          // instanced-quad stack), so there is nothing to hand back and no pool
-          // adapter to hand it to — a demoted level keeps its geometry until the
-          // node is disposed, the same lifetime a non-LOD mesh already has. What it
-          // DOES share is the depth-sort release, because mesh is `depthSortable`
-          // (#1347): a demoted `normal`-mode level would otherwise pin its
-          // coordinator state and worker-side centroids while not being drawn.
+          // A mesh is not pooled: demotion disposes its committed geometry and
+          // restores the empty placeholder. It also releases depth-sort state
+          // and worker-side centroids (#1347).
           () => ctx.releaseLazyMesh(lazyChild.path),
           // The same probe the other three pass, and it became load-bearing when
           // mesh gained a reveal ladder (#1476). A lazy level is deliberately kept
@@ -593,8 +590,7 @@ export async function loadLodGroupNode(
           const reason =
             `lod_group deferred child ${lazyChild.path} retry refused: ` +
             'placeholder already has attached children';
-          entryChild.permanentlyFailed = true;
-          entryChild.failureReason = reason;
+          latchChildFailure(entryChild, reason);
           throw new Error(reason);
         }
         await loadChildren(lazyChild, placeholder, childLoc, ctx);
@@ -625,7 +621,7 @@ export async function loadLodGroupNode(
       releaseWorkingSet();
     }
 
-    const childObject = lodThreeGroup.getObjectByName(child.path);
+    const childObject = findObjectByName(lodThreeGroup, child.path);
     if (!childObject) {
       log.warning(
         Modules.SCENE_LOADER,

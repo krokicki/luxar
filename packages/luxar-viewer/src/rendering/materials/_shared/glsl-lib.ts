@@ -74,6 +74,55 @@ float perspectiveNearFade(int isOrtho, float viewZ, float nearCull) {
 `;
 
 /**
+ * View scales read from the projection matrix three sets for the camera
+ * being drawn with. `projectionMatrix` is a vertex built-in; a fragment stage
+ * that includes these declares `uniform mat4 projectionMatrix;` itself (the
+ * line visual fragment does). Deriving them here, instead of pushing CPU copies computed
+ * from `camera.fov`, keeps them right for every camera the scene is drawn
+ * with — a cube-capture face (fov −90, a flipped P), a zoomed or asymmetric
+ * frustum, an embedder's camera — and makes a stale copy impossible.
+ * CPU mirror and tests: `projection-math.ts`.
+ *
+ *   - `luxarIsOrthoProjection()`: 1 for an orthographic P (last row
+ *     (0,0,0,1)), 0 for perspective.
+ *   - `luxarProjectionSizeScale()`: |P11|, pixels per view unit at unit
+ *     depth per half viewport height. Every size scale is a multiple of
+ *     `uResolution.y * luxarProjectionSizeScale()`. The absolute value keeps
+ *     sizes positive under a flipped P; positions keep the sign.
+ */
+export const GLSL_PROJECTION_FUNCTIONS = `
+int luxarIsOrthoProjection() {
+  return projectionMatrix[3][3] > 0.5 ? 1 : 0;
+}
+float luxarProjectionSizeScale() {
+  return abs(projectionMatrix[1][1]);
+}
+`;
+
+/**
+ * The line pixel-width scale, resY * |P11| (replacing the former CPU-pushed
+ * perspective / ortho line-scale uniforms). Declared once as a vertex-stage global and assigned as
+ * the FIRST statement of `main()` (`luxarLineScale = uResolution.y *
+ * luxarProjectionSizeScale();`), so every consumer — the line shader body and
+ * the shared width/join helpers — reads it exactly where the uniform used to be
+ * read, in the same expression shape (`width * luxarLineScale / dist`).
+ * Inlining the product at each use site instead lets the compiler associate it
+ * differently per site, a per-vertex rounding change measured at ~10x the flips
+ * of a 1-ulp change in the scale itself (ANGLE/Metal, render gate).
+ *
+ * `luxarLineIsOrtho` rides along the same way: assigned right after it
+ * (`luxarLineIsOrtho = luxarIsOrthoProjection();`), it is the ortho branch of
+ * the projection THIS draw uses — not a CPU-pushed camera-type flag, which a
+ * draw through another projection (a cube-capture face, an embedder camera)
+ * would contradict. A fragment stage that needs it re-derives it from the
+ * same uniform (line visual) or receives it as a flat varying (line pick).
+ */
+export const GLSL_LINE_SCALE = `
+float luxarLineScale;
+int luxarLineIsOrtho;
+`;
+
+/**
  * The pick buffer's 16-bit element-id split, as a standalone function of an
  * arbitrary index.
  *
@@ -173,6 +222,24 @@ bool luxarDensityDropped() {
 `;
 
 /**
+ * Fragment-stage companion of the density thinning above, for alpha-over
+ * (`normal`) nodes: the density guard drops a `1 − keep` fraction of the
+ * elements and sets `uDensityAlphaExp = 1/keep`, so a survivor's alpha
+ * `1 − (1 − α)^(1/keep)` makes `keep·N` survivors transmit what `N` did. At
+ * an exponent ≤ 1 — every unthinned node, and a material that never set the
+ * uniform (reads 0) — the helper returns `a` untouched, so such a node draws
+ * bit-identically. Sum-projected modes compensate through opacity instead
+ * (`applyLodFade`) and always carry the identity exponent.
+ */
+export const GLSL_DENSITY_ALPHA = `
+uniform float uDensityAlphaExp;
+float luxarDensityAlpha(float a) {
+  if (!(uDensityAlphaExp > 1.0)) return a;
+  return 1.0 - pow(max(1.0 - a, 0.0), uDensityAlphaExp);
+}
+`;
+
+/**
  * Line joint-code helpers, shared by the visual and picking GLSL vertex stages
  * (both build the same screen-space quad, so both must read the code the same
  * way — see `rendering/line-geometry.ts` for the texel layout and
@@ -260,8 +327,8 @@ export const LINE_JOIN_MIN_HALF_WIDTH = 2.0;
  * what the eye sees, so this lives here rather than being written twice.
  *
  * REQUIRED GLOBALS (same implicit-context pattern as `GLSL_SORTED_INDEX`):
- * `uLineTex`, `uResolution`, `uIsOrtho`, `uOrthoLineScale`,
- * `uPerspectiveLineScale`, `modelViewMatrix`, `projectionMatrix`, and
+ * `uLineTex`, `uResolution`, `luxarLineIsOrtho` (GLSL_LINE_SCALE), `luxarProjectionSizeScale`
+ * (GLSL_PROJECTION_FUNCTIONS), `modelViewMatrix`, `projectionMatrix`, and
  * `luxarSortedIndex()`. Include this block AFTER those declarations — GLSL
  * resolves names top-down. `uLineJoin` is declared here, so an including
  * shader must not declare it again.
@@ -279,7 +346,7 @@ uniform float uLineJoin;
 vec3 luxarLinePixelPos(vec3 localPos, float nearCullValue) {
   vec4 mv = modelViewMatrix * vec4(localPos, 1.0);
   vec4 clip = projectionMatrix * mv;
-  float wG = (uIsOrtho == 1) ? 1.0 : nearCullValue;
+  float wG = (luxarLineIsOrtho == 1) ? 1.0 : nearCullValue;
   vec2 ndc = clip.xy / max(clip.w, wG);
   return vec3(ndc * (0.5 * uResolution), -mv.z);
 }
@@ -301,9 +368,9 @@ vec3 luxarLinePixelPos(vec3 localPos, float nearCullValue) {
 // mvEnd and endW), so the geometry is unchanged. Both segments meeting at a
 // joint also read the SAME shared vertex, so they still agree on the gate.
 float luxarLineEndPixelWidth(float widthAtEnd, float viewZ, float nearCullValue) {
-  return (uIsOrtho == 1)
-    ? (widthAtEnd * uOrthoLineScale)
-    : (widthAtEnd * uPerspectiveLineScale / max(-viewZ, nearCullValue));
+  return (luxarLineIsOrtho == 1)
+    ? (widthAtEnd * luxarLineScale)
+    : (widthAtEnd * luxarLineScale / max(-viewZ, nearCullValue));
 }
 
 // The corner offset and endpoint cap for one end of one segment.
@@ -403,7 +470,7 @@ vec3 luxarLineJoin(
   // against. With the conjunction A tests {A.far, B.far} and B tests {B.far,
   // A.far} — the same pair — so both sides take the same branch. Ortho has no
   // 1/z singularity, so the whole test stays inert there.
-  bool bothFarInFront = (uIsOrtho == 1) || (farPx.z >= nearCull && selfFarDepth >= nearCull);
+  bool bothFarInFront = (luxarLineIsOrtho == 1) || (farPx.z >= nearCull && selfFarDepth >= nearCull);
   // A DEGENERATE partner is the one decline that must not fall back to the
   // code-implied default. The kernel matches endpoints by vertex index and
   // never looks at positions, so a zero-length interior segment still earns

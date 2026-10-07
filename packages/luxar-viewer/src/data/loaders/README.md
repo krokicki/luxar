@@ -234,9 +234,9 @@ Displayed dimensions always get `1e10` (effectively infinite).
 
 ## Worker Integration
 
-All components automatically use workers when enabled. Always go through
-`runWithTimeout()` — calling `getWorker()` directly bypasses the timeout
-guard and the hung-worker eviction logic. See
+All components automatically use workers when enabled, through
+`runWithTimeout()` — the pool's dispatch entry point, which carries the
+timeout guard and the hung-worker eviction logic. See
 `src/workers/README.md#runwithtimeout` for the full contract.
 
 ```typescript
@@ -274,11 +274,13 @@ try {
 
 ## Range Loading
 
-All three spatial index loaders use `RangeLoader`:
+All four geometry loaders use `RangeLoader`:
 
-- `point-spatial-index-loader.ts` uses RangeLoader for all encoding types.
+- `points-spatial-index-loader.ts` uses RangeLoader for all encoding types.
 - `lines-spatial-index-loader.ts` uses RangeLoader for vertex attribute loading.
 - `gsplats-spatial-index-loader.ts` uses RangeLoader for gsplat array loading.
+- `mesh-whole-node-loader.ts` uses RangeLoader for its colours (through
+  `loadColorRanges`, one whole-node `[0, V)` range).
 
 ```typescript
 import { RangeLoader } from './loaders';
@@ -367,9 +369,13 @@ narrowly-scoped helpers each spatial-index loader composes:
   duplicate-free and the strict-ascent guard would fail it closed.
 - **`spatial-query/prefetch-ranges.ts`** — `prefetchRangesIntoCache(arrays, ranges)`:
   shared cache-warming read for the three loaders' `prefetchChunks`.
-  Fires a `get()` per (array × range) and discards the result. Deliberately
-  separate from `RangeLoader.loadDirectTyped` — prefetch warms future frames,
-  so it allocates no typed output and carries no per-update abort signal.
+  Computes the distinct chunk coordinates each array's ranges touch and warms
+  each once via the L0 proxy's `warmChunk` (fetch + decode into L0; no zarr
+  `get()`, so no output selection is assembled). Deliberately separate from
+  `RangeLoader.loadDirectTyped` — prefetch warms future frames, so it never
+  reads the demand load's per-update abort signal nor records into its
+  residency probe; it takes its own optional signal and counts its decodes as
+  `decode.count.prefetch`.
 - **`extend-to-all-preflight.ts`** — `warnExtendToAllNoDimensions` (warns when
   `extend_to_all` is set but the view state has no resolved dimensions) +
   `announceExtendToAllOnce` (one-shot BROADCAST emoji log on first load).
@@ -385,11 +391,17 @@ narrowly-scoped helpers each spatial-index loader composes:
   offsets and exact byte range, retains open array handles per node, and keeps
   decoded labels in a shared bounded LRU.
 - **`environment/environment-loader.ts`** — `loadBakedEnvironment(rootLoc,
-rootContentHash)`: reads the root-level `environment/` sidecar group a
+rootContentHash, storeKey?, indexFresh?)`: reads the root-level `environment/` sidecar group a
   `luxar env bake` left (six half-float cube faces as `uint16` bits, named by
   digest) and hands it to the scene environment; a missing group is silent, a
   stale one (its `scene_content_hash` is not the root's) or a malformed one is
-  ignored with a warning rather than failing the load.
+  ignored with a warning rather than failing the load. When the root index came
+  from the network this load (`indexFresh`) it decides presence (`luxar env
+attach` re-consolidates), so a scene without the sidecar costs NO request. An
+  index served from the L2 cache may predate an attach (attach keeps
+  `content_hash`, the only thing L2 revalidates by), so that case — like an
+  index-less store — is probed once and a not-found is remembered per `storeKey`
+  for the session.
 - **`overlays/overlay-loader.ts`** — `loadOverlayConfigs(store, rootLoc)`:
   enumerates the `overlays/` group and parses each child's `.zattrs` into an
   `OverlayConfig` (text / image / html, with per-type fields). Results are
@@ -417,18 +429,35 @@ rootContentHash)`: reads the root-level `environment/` sidecar group a
   `loadSliceWithCache(ctx, viewState, loadInternal)` (the `loadX` template —
   S-cache restore → internal load → query close-out → S-cache store, with the
   abort-aware error branch), `recordLoadMetrics(ctx, arrayName, elements, output)`
-  (per-array load metrics + 'load' event), and
-  `runWithActiveSignal` / `runWithResidencyProbe` (the `updateView` /
-  `updateViewWithResidency` bodies: per-update abort-signal publication and
-  cache-residency probing). Each used to exist as three byte-identical
-  private methods.
+  (per-array load metrics + 'load' event). Each used to exist as three
+  byte-identical private methods.
+- **`loader-lifetime.ts`** — `LoaderLifetime`: one leaf loader's lifetime. A
+  disposed latch (disposal is terminal: work that started before it bails as an
+  `AbortError`, new work is refused), the lifetime abort signal, the one-shot
+  `ensureInitialized(what, init, discard, priority?)` (shared in-flight attempt,
+  retry on failure, a prioritised warm-up riding a tagged child of the lifetime
+  signal and raised to `demand` by a later plain call) and `calls`, the per-call
+  demand-load context below. The mesh whole-node loader, whose disposal is
+  state-clearing by design, replaces its lifetime on dispose instead.
+- **`active-load-context.ts`** — `ActiveLoadContext`: the per-call abort signals
+  and residency probes the L0 proxies read on every chunk read
+  (`runWithSignal` / `runWithProbe`, the `updateView` /
+  `updateViewWithResidency` bodies). Reentrant: each call withdraws exactly its
+  own entry; while calls overlap, a read is cancelled only once every call is
+  aborted and is recorded into every call's probe.
+- **`pass-directives.ts`** — `PassDirectives` (`frameBudgetMs`, `ladderDepth`)
+  and `withPassDirectives(viewState, directives)`: the per-pass playback
+  directives every node handler injects into its DERIVED view state (the same
+  object when the pass has none).
+- **`abortable-wait.ts`** — `abortableWait(shared, signal)`: join a single-flight
+  promise while giving up on the caller's own signal, without cancelling the
+  shared work for the other joiners.
 - **`monitor-events.ts`** — `LoaderEventEmitter`: owns the listener `Set` for
   a `LoaderMonitor` implementation. Per-listener try/catch isolates one bad
   listener from the rest; `clear()` is called on dispose.
 - **`once-init.ts`** — `OnceInit.ensure(initFn)`: concurrent callers await a
   shared in-flight promise; a rejected init clears the cache so the next call
-  can retry from scratch. Centralizes the pattern previously duplicated four
-  times across the three loaders.
+  can retry from scratch. Wrapped by `LoaderLifetime.ensureInitialized`.
 - **`aggregate-loader-metrics.ts`** — `aggregateLoaderMetrics(inner, path)`:
   pure roll-up of N per-LOD `LoaderMetrics` into one snapshot for a progressive
   node. Counters are summed; `avgQueryTime` / `avgLoadTime` are query/load-weighted
@@ -459,7 +488,11 @@ src/data/loaders/
 ├── color-loader.ts               # Shared color-range loader with native-dtype preservation
 ├── element-ids.ts                # Slot → on-disk element index map (picking label lookups)
 ├── loader-metrics.ts             # Pure helpers for load/query metric bookkeeping
-├── spatial-facade.ts             # Shared loadX/updateView/metrics facade orchestration
+├── spatial-facade.ts             # Shared loadX/metrics facade orchestration
+├── loader-lifetime.ts            # Disposed latch, lifetime signal, init, per-call context
+├── active-load-context.ts        # Reentrant per-call signal/probe for the L0 proxies
+├── abortable-wait.ts             # Per-caller abortable wait on a shared promise
+├── pass-directives.ts            # withPassDirectives — playback directives into a node view
 ├── monitor-events.ts             # LoaderEventEmitter — listener fan-out with error isolation
 ├── once-init.ts                  # One-shot async initializer with retry-on-failure
 ├── extend-to-all-preflight.ts    # Shared extend_to_all warning + one-time announce
@@ -490,7 +523,9 @@ src/data/loaders/
 │
 ├── progressive/                  # Shared helpers for additive-LOD progressive loaders
 │   ├── concat-helpers.ts         # Generic typed-array field concatenation across LOD parts
-│   ├── slice-cache-helper.ts     # Shared SliceCache key/snapshot/lookup helpers (S-cache)
+│   ├── lookahead-signal.ts       # 'lookahead'-tagged next-rung prefetch controller
+│   ├── slice-cache-helper.ts     # Shared SliceCache key/snapshot/lookup helpers (S-cache) +
+│   │                             # in-flight shadow-store handoff
 │   └── constants.ts              # CACHE_HIT_THRESHOLD_MS — shared streaming threshold
 │
 ├── environment/                  # Baked scene-environment loader

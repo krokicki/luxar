@@ -70,7 +70,7 @@ export interface MeshRefinementCtx {
   isActive?(): boolean;
   /**
    * Per-refinement-run abort signal. The orchestrator assigns the run's
-   * controller to the SceneLoader's `_updateAbortController`, so a superseding
+   * controller to the SceneLoader's live controller (`PassScheduler.controller`), so a superseding
    * `updateView` (or dispose) aborts in-flight refinement reads MID-PASS instead
    * of waiting out the whole pass. An `AbortError` in the per-loader catch is
    * cancellation, not failure.
@@ -95,7 +95,7 @@ export async function runMeshRefinement(ctx: MeshRefinementCtx): Promise<void> {
       // typed as plain `MeshDataLoader`: a non-progressive loader has no
       // ladder. `admitRefinementCandidate` gates on `hasMoreLODs`.
       const progressiveLoader = loader as MeshDataLoader & RefinableLoader;
-      const admission = admitRefinementCandidate(
+      const admission = await admitRefinementCandidate(
         path,
         progressiveLoader,
         ctx.residencyBudget,

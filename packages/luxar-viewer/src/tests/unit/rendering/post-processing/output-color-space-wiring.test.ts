@@ -36,6 +36,7 @@ function mockCaps(apiSurface: 'webgl2' | 'webgpu' = 'webgl2'): RendererCapabilit
   return {
     apiSurface,
     framebufferYDown: apiSurface === 'webgpu',
+    readbackYDown: false,
     hdr: {
       p3Gamut: false,
       rec2020Gamut: false,
@@ -50,7 +51,6 @@ function mockCaps(apiSurface: 'webgl2' | 'webgpu' = 'webgl2'): RendererCapabilit
     maxRenderbufferSize: 4096,
     maxMSAASamples: 4,
     pointSizeRange: [1, 1024],
-    readBackbufferPixels: () => Promise.resolve({ pixels: new Uint8Array(), width: 0, height: 0 }),
   };
 }
 
